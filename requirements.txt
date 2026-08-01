@@ -1,0 +1,13 @@
+# Core SmolVLA / LeRobot research stack.
+#
+# torch/torchvision are intentionally NOT pinned here: scripts/install.sh
+# installs them first with the correct CPU or CUDA wheel for the host, then
+# installs everything below on top. Installing this file alone on a fresh
+# environment will pull whatever default torch build pip resolves, which is
+# fine for CPU-only usage but not GPU-optimized.
+lerobot[smolvla]==0.4.4
+
+# Research / experimentation tooling
+jupyterlab==4.3.5
+ipykernel==6.29.5
+matplotlib==3.10.0
