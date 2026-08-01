@@ -119,6 +119,23 @@ python scripts/train_ard.py \
 직접 검증했고, import/인자 파싱도 확인했습니다. 실제 학습 루프 자체는 로컬 GPU 환경에서
 처음 돌려보실 때 검증해주세요.
 
+## 파라미터 구성 확인 (`scripts/count_params.py`)
+
+SmolVLA(+ARD) 전체 파라미터를 비전 인코더 / LLM(SmolLM2) / Action Expert / ARD head /
+나머지 shim 레이어로 나눠서 개수와 비중을 보여주고, 지정한 해상도별로 이미지가 실제로 몇 개의
+토큰이 되는지도 출력합니다. `load_vlm_weights=False`라 전체 가중치를 받지는 않지만, config는
+Hugging Face Hub에서 받아야 해서 이 샌드박스에서는 실행이 안 됩니다 (compile/import/CLI 파싱은
+확인했고, 실행하면 예상대로 네트워크 호출 단계에서 막히는 것까지 확인했습니다).
+
+```bash
+python scripts/count_params.py --resolutions 384 512 768
+```
+
+중요: SmolVLA는 SmolLM2-360M의 레이어를 전부 쓰지 않고 `config.num_vlm_layers`(기본값 16)개만
+물리적으로 잘라서 씁니다(`smolvlm_with_expert.py`의 `text_model.layers = ...[:num_vlm_layers]`).
+이 스크립트는 원본 레이어 수와 실제 사용하는 레이어 수를 둘 다 보여줘서 이 부분을 헷갈리지
+않게 합니다.
+
 ## Layout
 
 - `requirements.txt` — research tooling installed on top of lerobot (notebook/plotting deps). torch and lerobot itself are installed by `scripts/install.sh`, not listed here.
@@ -126,4 +143,5 @@ python scripts/train_ard.py \
 - `scripts/check_env.py` — import + CPU-fallback smoke test.
 - `scripts/test_ard.py` — offline unit tests for the ARD modification.
 - `scripts/train_ard.py` — SmolVLA(+ARD) 전용 최소 학습 스크립트 (lerobot의 범용 학습 CLI 대체).
+- `scripts/count_params.py` — 구성 요소별 파라미터 집계 + 해상도별 이미지 토큰 수 실측.
 - `third_party/lerobot/` — vendored, editable LeRobot/SmolVLA source.
