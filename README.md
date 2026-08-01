@@ -50,46 +50,48 @@ If you need to pull in upstream lerobot changes later, re-clone the desired tag/
 
 What's left (`configs/`, `datasets/`, `envs/configs.py` only, `optim/`, `policies/{smolvla,rtc,pretrained.py,utils.py}`, `processor/`, `robots/`+`teleoperators/` base classes, `motors/motors_bus.py`, `utils/`) is the actual dependency closure for building/training/running the SmolVLA policy against a `LeRobotDataset`. `scripts/check_env.py` and the trace above are re-run after any change to confirm nothing extra crept back in.
 
-## ARD: Asymmetric Role Decomposition
+## ARD: 비대칭 역할 분리 (Asymmetric Role Decomposition)
 
-Per the ARD-VLA research plan (bimanual tool-use fine-tuning: one arm stabilizes the workpiece,
-the other performs the precise manipulation), SmolVLA's action expert now supports an optional
-asymmetric dual-head mode. **The Actuator arm is fixed by config, always the right arm** — there's
-no per-instruction role switching; `ard_default_actuator_arm` names which arm plays that role, and
-it applies identically to every sample.
+ARD-VLA 연구계획서(양손 도구 조작 파인튜닝: 한 팔은 작업물을 고정하고, 다른 팔이 정밀한
+조작을 수행)에 따라, SmolVLA의 액션 전문가(action expert)가 선택적인 비대칭 듀얼 헤드 모드를
+지원하도록 확장했습니다. **Actuator 팔은 config로 고정되며, 항상 오른팔입니다** — 지시문마다
+역할이 바뀌지 않습니다. `ard_default_actuator_arm`이 그 역할을 맡을 팔을 지정하고, 모든
+샘플에 동일하게 적용됩니다.
 
-- `third_party/lerobot/src/lerobot/policies/smolvla/ard.py` (new file) — `AsymmetricResidualHeads`
-  (zero-init residual MLPs that specialize the Stabilizer/Actuator channels on top of the shared
-  flow-matching output), `resolve_actuator_is_first` (the fixed left/right routing), and
-  `compute_ard_losses` (`alpha * L_stab + beta * L_act`, with `L_stab = L_pos + λ·L_smooth` and
-  `L_act = L_pos + λ·L_force + λ·L_traj`, matching the plan's loss design — `L_pos` reuses the base
-  model's own flow-matching regression loss rather than recomputing a separate L1 term).
-- `configuration_smolvla.py` — new `use_ard`, `ard_arm_dim`, `ard_alpha`/`ard_beta`,
-  `ard_lambda_{smooth,force,traj}`, `ard_default_actuator_arm` (default `"right"`) fields, off by
-  default (`use_ard=False` reproduces upstream SmolVLA exactly — verified no code path changes
-  unless the flag is set).
-- `modeling_smolvla.py` — `VLAFlowMatching.forward` (training loss), `.sample_actions`/
-  `.denoise_step` (inference, including under RTC) all apply the same residual-head correction and
-  fixed role routing, so training and inference stay consistent.
-- Optional per-sample batch key, a no-op if absent: `ard_force_target` (contact-force/torque
-  supervision — no dataset in this repo provides it yet, so `L_force` is 0 until one does).
+- `third_party/lerobot/src/lerobot/policies/smolvla/ard.py` (신규 파일) — `AsymmetricResidualHeads`
+  (공유 flow-matching 출력 위에서 Stabilizer/Actuator 채널을 특화시키는 zero-init residual
+  MLP), `resolve_actuator_is_first`(고정된 왼팔/오른팔 라우팅), `compute_ard_losses`
+  (`alpha * L_stab + beta * L_act`, `L_stab = L_pos + λ·L_smooth`, `L_act = L_pos + λ·L_force +
+  λ·L_traj` — 연구계획서의 손실 설계를 그대로 따름. `L_pos`는 별도의 L1 항을 다시 계산하지
+  않고 베이스 모델 자체의 flow-matching 회귀 손실을 재사용합니다).
+- `configuration_smolvla.py` — 새 `use_ard`, `ard_arm_dim`, `ard_alpha`/`ard_beta`,
+  `ard_lambda_{smooth,force,traj}`, `ard_default_actuator_arm`(기본값 `"right"`) 필드 추가,
+  기본값은 전부 꺼짐 (`use_ard=False`이면 업스트림 SmolVLA와 완전히 동일하게 동작 — 플래그를
+  켜지 않는 한 코드 경로가 전혀 바뀌지 않음을 검증함).
+- `modeling_smolvla.py` — `VLAFlowMatching.forward`(학습 손실), `.sample_actions`/
+  `.denoise_step`(추론, RTC 포함) 모두 동일한 residual head 보정과 고정 역할 라우팅을
+  적용해서 학습과 추론이 서로 어긋나지 않도록 함.
+- 선택적 샘플별 배치 키, 없으면 아무 영향 없음: `ard_force_target` (접촉력/토크 supervision —
+  현재 이 레포의 어떤 데이터셋도 이 값을 제공하지 않아서, 데이터셋이 생기기 전까지 `L_force`는
+  항상 0).
 
-**Verification.** This sandbox's network policy blocks the Hugging Face Hub, and `SmolVLAPolicy`
-always needs to download the SmolVLM2 backbone's config even with `load_vlm_weights=False` — so it
-can't be instantiated end-to-end here. What *is* verified, offline, in `scripts/test_ard.py`:
-`SmolVLAConfig`'s new validation, that the fixed role routing always sends the right-arm channels
-to the Actuator head, the role split/combine round-trip, zero-init/gradient-flow of the residual
-heads, and `compute_ard_losses`'s numerics (including a real bug it caught: `L_force` broadcasting
-a per-sample target against a per-timestep prediction). `scripts/check_env.py` confirms the default
-(`use_ard=False`) path still imports and runs unchanged. Run both with:
+**검증.** 이 샌드박스의 네트워크 정책이 Hugging Face Hub를 막고 있고, `SmolVLAPolicy`는
+`load_vlm_weights=False`여도 SmolVLM2 백본 config를 항상 다운로드해야 해서 — 여기서는
+end-to-end로 생성해볼 수 없었습니다. 대신 `scripts/test_ard.py`에서 오프라인으로 검증한
+내용: `SmolVLAConfig`의 새 검증 로직, 고정 역할 라우팅이 항상 오른팔 채널을 Actuator head로
+보내는지, 역할 split/combine 라운드트립, residual head의 zero-init/gradient 흐름,
+`compute_ard_losses`의 수치 계산(이 과정에서 실제 버그도 하나 잡았습니다: `L_force`가
+샘플별 타겟을 타임스텝별 예측값과 브로드캐스팅하려던 문제). `scripts/check_env.py`로는
+기본(`use_ard=False`) 경로가 여전히 그대로 import/실행되는 것도 확인했습니다. 둘 다 아래로
+실행할 수 있습니다:
 
 ```bash
 python scripts/check_env.py
 python scripts/test_ard.py
 ```
 
-Exercising a real forward/backward pass through `SmolVLAPolicy` itself (with `use_ard=True`, tiny
-VLM dims) is the natural next verification step once this environment has Hub access.
+`SmolVLAPolicy` 자체로 실제 forward/backward pass를 돌려보는 것(`use_ard=True`, 작은 VLM
+차원으로)이 이 환경에 Hub 접근이 가능해지면 진행할 다음 검증 단계입니다.
 
 ## Layout
 

@@ -400,9 +400,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims.
-            # NOTE: ARD's asymmetric weighting (alpha/beta, smoothness/force/trajectory terms) is a
-            # batch-level combination and isn't applied here — RA-BC per-sample weighting falls back
-            # to the plain flow-matching loss even when `use_ard` is set.
+            # 참고: ARD의 비대칭 가중치(alpha/beta, smoothness/force/trajectory 항)는 배치 단위
+            # 결합이라 여기서는 적용되지 않는다 — RA-BC per-sample 가중치는 `use_ard`가 켜져
+            # 있어도 그냥 flow-matching 손실을 그대로 사용한다.
             per_sample_loss = losses.mean(dim=(1, 2))
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
@@ -629,7 +629,7 @@ class VLAFlowMatching(nn.Module):
         self.prefix_length = self.config.prefix_length
         self.rtc_processor = rtc_processor
 
-        # ARD: Asymmetric Role Decomposition (see lerobot.policies.smolvla.ard)
+        # ARD: 비대칭 역할 분리 (자세한 내용은 lerobot.policies.smolvla.ard 참고)
         self.ard_heads = None
         if self.config.use_ard:
             self.ard_heads = AsymmetricResidualHeads(
@@ -816,9 +816,9 @@ class VLAFlowMatching(nn.Module):
     ) -> tuple[Tensor, dict | None]:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors).
 
-        Returns (losses, ard_extras): `ard_extras` is None unless `config.use_ard`, in which case it
-        carries the role-routed predictions `compute_ard_losses` (see lerobot.policies.smolvla.ard)
-        needs to build the asymmetric Stabilizer/Actuator loss.
+        반환값 (losses, ard_extras): `config.use_ard`가 아니면 `ard_extras`는 None이고, 켜져
+        있으면 `compute_ard_losses`(lerobot.policies.smolvla.ard 참고)가 비대칭 Stabilizer/
+        Actuator 손실을 만드는 데 필요한, 역할별로 라우팅된 예측값들을 담고 있다.
         """
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -920,8 +920,8 @@ class VLAFlowMatching(nn.Module):
             fill_kv_cache=True,
         )
 
-        # ARD: resolve which arm is the Actuator once per chunk so every `denoise_step` call
-        # applies the matching residual head.
+        # ARD: chunk 하나당 어느 팔이 Actuator인지 한 번만 결정해서, 모든 `denoise_step` 호출이
+        # 동일한 residual head를 적용하도록 한다.
         actuator_is_first = None
         if self.config.use_ard:
             actuator_is_first = resolve_actuator_is_first(

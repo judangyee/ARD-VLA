@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Offline tests for the ARD (Asymmetric Role Decomposition) SmolVLA modification.
+"""ARD (Asymmetric Role Decomposition, 비대칭 역할 분리) SmolVLA 수정 사항에 대한 오프라인 테스트.
 
-Exercises lerobot.policies.smolvla.ard directly with synthetic tensors shaped like the real
-training/inference pipeline, plus SmolVLAConfig's ARD validation. Does not construct the full
-SmolVLAPolicy: that requires downloading the SmolVLM2 backbone config from the Hugging Face Hub,
-which this environment's network policy blocks. Safe to run on any machine, GPU or not.
+lerobot.policies.smolvla.ard를, 실제 학습/추론 파이프라인과 동일한 shape의 합성(synthetic)
+텐서로 직접 검증하고, SmolVLAConfig의 ARD 검증 로직도 함께 확인한다. SmolVLAPolicy 전체를
+생성하지는 않는다 — 그러려면 `load_vlm_weights=False`여도 Hugging Face Hub에서 SmolVLM2
+백본 config를 내려받아야 하는데, 이 환경의 네트워크 정책이 Hub 접근을 막아놓았기 때문이다.
+GPU 유무와 관계없이 어떤 머신에서든 안전하게 실행할 수 있다.
 
-The Actuator arm is fixed by config (`ard_default_actuator_arm`, "right" by default) — there is no
-per-sample or language-conditioned role switching.
+Actuator 팔은 config로 고정된다(`ard_default_actuator_arm`, 기본값 "right") — 샘플별로나
+언어 지시에 따라 역할이 바뀌지 않는다.
 """
 
 import sys
@@ -35,20 +36,20 @@ def check(name: str, condition: bool, detail: str = ""):
 
 def test_config_validation():
     cfg = SmolVLAConfig(use_ard=True, ard_arm_dim=7, max_action_dim=32)
-    check("SmolVLAConfig(use_ard=True) constructs with valid dims", cfg.use_ard is True)
-    check("ard_default_actuator_arm defaults to 'right'", cfg.ard_default_actuator_arm == "right")
+    check("SmolVLAConfig(use_ard=True)가 정상 dims로 생성된다", cfg.use_ard is True)
+    check("ard_default_actuator_arm 기본값은 'right'다", cfg.ard_default_actuator_arm == "right")
 
     try:
         SmolVLAConfig(use_ard=True, ard_arm_dim=20, max_action_dim=32)
-        check("rejects ard_arm_dim too large for max_action_dim", False)
+        check("max_action_dim보다 큰 ard_arm_dim을 거부한다", False)
     except ValueError:
-        check("rejects ard_arm_dim too large for max_action_dim", True)
+        check("max_action_dim보다 큰 ard_arm_dim을 거부한다", True)
 
     try:
         SmolVLAConfig(use_ard=True, ard_default_actuator_arm="both")
-        check("rejects invalid ard_default_actuator_arm", False)
+        check("잘못된 ard_default_actuator_arm 값을 거부한다", False)
     except ValueError:
-        check("rejects invalid ard_default_actuator_arm", True)
+        check("잘못된 ard_default_actuator_arm 값을 거부한다", True)
 
 
 def test_resolve_actuator_is_first_is_fixed():
@@ -56,32 +57,32 @@ def test_resolve_actuator_is_first_is_fixed():
 
     out = resolve_actuator_is_first("right", batch_size=5, device=device)
     check(
-        "actuator_is_first is False for every sample when the right arm is the Actuator",
+        "오른팔이 Actuator일 때 모든 샘플의 actuator_is_first가 False다",
         not out.any().item() and out.shape == (5,),
     )
 
     out = resolve_actuator_is_first("left", batch_size=5, device=device)
-    check("actuator_is_first is True for every sample when the left arm is the Actuator", bool(out.all()))
+    check("왼팔이 Actuator일 때 모든 샘플의 actuator_is_first가 True다", bool(out.all()))
 
 
 def test_split_combine_roundtrip():
     torch.manual_seed(0)
     batch, chunk, arm_dim = 4, 5, 7
     x = torch.randn(batch, chunk, 2 * arm_dim)
-    # Right arm is always the Actuator: actuator_is_first is False for every sample.
+    # 오른팔이 항상 Actuator이므로 모든 샘플에서 actuator_is_first는 False다.
     actuator_is_first = resolve_actuator_is_first("right", batch_size=batch, device=x.device)
 
     stab, act = split_by_role(x, arm_dim, actuator_is_first)
     check(
-        "split_by_role output shapes",
+        "split_by_role 출력 shape이 맞다",
         stab.shape == (batch, chunk, arm_dim) and act.shape == (batch, chunk, arm_dim),
     )
-    check("actuator = right-arm block when the right arm is fixed as Actuator", torch.allclose(act, x[..., arm_dim:]))
-    check("stabilizer = left-arm block when the right arm is fixed as Actuator", torch.allclose(stab, x[..., :arm_dim]))
+    check("오른팔이 고정 Actuator일 때 actuator = 오른팔 블록", torch.allclose(act, x[..., arm_dim:]))
+    check("오른팔이 고정 Actuator일 때 stabilizer = 왼팔 블록", torch.allclose(stab, x[..., :arm_dim]))
 
     left, right = combine_by_role(stab, act, actuator_is_first)
     recombined = torch.cat([left, right], dim=-1)
-    check("split_by_role -> combine_by_role round-trips to the original tensor", torch.allclose(recombined, x))
+    check("split_by_role -> combine_by_role이 원본 텐서로 정확히 되돌아온다", torch.allclose(recombined, x))
 
 
 def test_asymmetric_residual_heads_zero_init():
@@ -91,16 +92,16 @@ def test_asymmetric_residual_heads_zero_init():
     suffix_features = torch.randn(batch, chunk, expert_hidden)
     stab_res, act_res = heads(suffix_features)
     check(
-        "AsymmetricResidualHeads is a zero no-op at init (identity on top of pretrained output)",
+        "AsymmetricResidualHeads는 초기화 시 완전한 0(no-op) 상태다 (사전학습 출력 위에서 항등 시작)",
         torch.allclose(stab_res, torch.zeros_like(stab_res)) and torch.allclose(act_res, torch.zeros_like(act_res)),
     )
 
-    # After a gradient step the heads should move away from zero.
+    # 한 번 gradient step을 밟으면 head들이 0에서 벗어나야 한다.
     target = torch.randn(batch, chunk, arm_dim)
     loss = (stab_res - target).pow(2).mean() + (act_res - target).pow(2).mean()
     loss.backward()
     grad_norm = sum(p.grad.abs().sum().item() for p in heads.parameters() if p.grad is not None)
-    check("AsymmetricResidualHeads receives gradients", grad_norm > 0, detail=f"grad_norm={grad_norm}")
+    check("AsymmetricResidualHeads가 gradient를 정상적으로 받는다", grad_norm > 0, detail=f"grad_norm={grad_norm}")
 
 
 def test_compute_ard_losses():
@@ -123,12 +124,12 @@ def test_compute_ard_losses():
         lambda_force=1.0,
         lambda_traj=1.0,
     )
-    check("compute_ard_losses.total is a finite scalar", torch.isfinite(out.total).item() and out.total.ndim == 0)
+    check("compute_ard_losses.total은 유한한 스칼라값이다", torch.isfinite(out.total).item() and out.total.ndim == 0)
 
     out.total.backward()
-    check("compute_ard_losses.total is backprop-able", per_element_loss.grad is not None)
+    check("compute_ard_losses.total은 역전파가 가능하다", per_element_loss.grad is not None)
 
-    # alpha=1, beta=0 should reduce to (approximately) the stabilizer-only loss.
+    # alpha=1, beta=0이면 (근사적으로) stabilizer 손실만 남아야 한다.
     stab_only = compute_ard_losses(
         per_element_loss=per_element_loss.detach(),
         stabilizer_pred=stabilizer_pred.detach(),
@@ -142,12 +143,12 @@ def test_compute_ard_losses():
         lambda_traj=1.0,
     )
     check(
-        "alpha=1, beta=0 isolates the stabilizer loss",
+        "alpha=1, beta=0일 때 stabilizer 손실만 분리된다",
         torch.isclose(stab_only.total, stab_only.stabilizer_loss, atol=1e-5).item(),
     )
 
-    # Force loss should be exactly zero when no force_target is supplied.
-    check("force_loss defaults to zero without a force_target", stab_only.force_loss.item() == 0.0)
+    # force_target이 없으면 force_loss는 정확히 0이어야 한다.
+    check("force_target이 없으면 force_loss는 0이다", stab_only.force_loss.item() == 0.0)
 
     with_force = compute_ard_losses(
         per_element_loss=per_element_loss.detach(),
@@ -162,7 +163,7 @@ def test_compute_ard_losses():
         lambda_traj=1.0,
         force_target=torch.zeros(batch),
     )
-    check("force_loss becomes nonzero once a force_target is supplied", with_force.force_loss.item() > 0.0)
+    check("force_target을 주면 force_loss가 0이 아니게 된다", with_force.force_loss.item() > 0.0)
 
 
 def main():
@@ -174,14 +175,14 @@ def main():
 
     print()
     if FAILURES:
-        print(f"[FAIL] {len(FAILURES)} check(s) failed: {FAILURES}")
+        print(f"[FAIL] {len(FAILURES)}개 항목 실패: {FAILURES}")
         sys.exit(1)
-    print("[OK] All ARD unit tests passed.")
+    print("[OK] ARD 단위 테스트 전체 통과.")
     print(
-        "Note: this does not construct SmolVLAPolicy end-to-end — that requires downloading the "
-        "SmolVLM2 backbone config from the Hugging Face Hub, which this environment's network "
-        "policy blocks. The ard.py module and its wiring into modeling_smolvla.py's forward/"
-        "sample_actions/denoise_step are exercised directly with synthetic tensors instead."
+        "참고: SmolVLAPolicy 전체를 생성해서 테스트하지는 않았습니다 — 그러려면 Hugging Face "
+        "Hub에서 SmolVLM2 백본 config를 내려받아야 하는데, 이 환경의 네트워크 정책이 이를 막고 "
+        "있습니다. 대신 ard.py 모듈과 modeling_smolvla.py의 forward/sample_actions/"
+        "denoise_step에 연결된 로직을 합성 텐서로 직접 검증했습니다."
     )
 
 

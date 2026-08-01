@@ -109,21 +109,20 @@ class SmolVLAConfig(PreTrainedConfig):
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
 
-    # --- ARD: Asymmetric Role Decomposition (bimanual tool-use fine-tuning) ---
-    # See ARD-VLA research plan. Splits the leading `2 * ard_arm_dim` action channels into a
-    # Stabilizer arm (holds/fixes the workpiece) and an Actuator arm (performs the precise tool
-    # manipulation), each refined by its own residual head and trained with its own loss terms,
-    # combined asymmetrically. Convention: within those `2 * ard_arm_dim` channels, the first
-    # `ard_arm_dim` belong to the left arm and the next `ard_arm_dim` to the right arm. The
-    # Actuator is always `ard_default_actuator_arm` — fixed for the whole setup, not per-sample.
+    # --- ARD: Asymmetric Role Decomposition (비대칭 역할 분리, 양손 도구 조작 파인튜닝용) ---
+    # ARD-VLA 연구계획서 참고. 선두 `2 * ard_arm_dim`개 액션 채널을 Stabilizer 팔(작업물을
+    # 붙잡아 고정)과 Actuator 팔(정밀한 도구 조작 수행)로 나누고, 각각 전용 residual head로
+    # 보정한 뒤 서로 다른 손실 항으로 비대칭 학습한다. 규칙: 이 `2 * ard_arm_dim`개 채널 중
+    # 앞쪽 `ard_arm_dim`개는 왼팔, 다음 `ard_arm_dim`개는 오른팔이다. Actuator는 항상
+    # `ard_default_actuator_arm`으로 고정되며(샘플별로 바뀌지 않음), 전체 설정에 동일하게 적용된다.
     use_ard: bool = False
-    ard_arm_dim: int = 7  # DoF per arm (e.g. 6 joints + 1 gripper)
-    ard_default_actuator_arm: str = "right"  # "left" or "right"; always this arm plays the Actuator
-    ard_alpha: float = 0.3  # Stabilizer loss weight
-    ard_beta: float = 0.7  # Actuator loss weight
-    ard_lambda_smooth: float = 1.0  # Stabilizer smoothness penalty weight
-    ard_lambda_force: float = 1.0  # Actuator force-tracking penalty weight
-    ard_lambda_traj: float = 1.0  # Actuator trajectory-smoothness penalty weight
+    ard_arm_dim: int = 7  # 팔 하나당 자유도 (예: 관절 6 + 그리퍼 1)
+    ard_default_actuator_arm: str = "right"  # "left" 또는 "right"; 이 팔이 항상 Actuator 역할
+    ard_alpha: float = 0.3  # Stabilizer 손실 가중치
+    ard_beta: float = 0.7  # Actuator 손실 가중치
+    ard_lambda_smooth: float = 1.0  # Stabilizer 흔들림(smoothness) 페널티 가중치
+    ard_lambda_force: float = 1.0  # Actuator 힘 추적(force-tracking) 페널티 가중치
+    ard_lambda_traj: float = 1.0  # Actuator 궤적 스무딩(trajectory-smoothness) 페널티 가중치
 
     def __post_init__(self):
         super().__post_init__()
@@ -140,15 +139,16 @@ class SmolVLAConfig(PreTrainedConfig):
             )
         if self.use_ard:
             if self.ard_arm_dim <= 0:
-                raise ValueError(f"`ard_arm_dim` must be positive, got {self.ard_arm_dim}.")
+                raise ValueError(f"`ard_arm_dim`은 양수여야 합니다. 현재 값: {self.ard_arm_dim}")
             if 2 * self.ard_arm_dim > self.max_action_dim:
                 raise ValueError(
-                    f"ARD needs `2 * ard_arm_dim` ({2 * self.ard_arm_dim}) channels but `max_action_dim` is "
-                    f"only {self.max_action_dim}."
+                    f"ARD는 `2 * ard_arm_dim`({2 * self.ard_arm_dim})개 채널이 필요하지만 "
+                    f"`max_action_dim`이 {self.max_action_dim}밖에 되지 않습니다."
                 )
             if self.ard_default_actuator_arm not in ("left", "right"):
                 raise ValueError(
-                    f"`ard_default_actuator_arm` must be 'left' or 'right', got {self.ard_default_actuator_arm!r}."
+                    f"`ard_default_actuator_arm`은 'left' 또는 'right'여야 합니다. "
+                    f"현재 값: {self.ard_default_actuator_arm!r}"
                 )
 
     def validate_features(self) -> None:
@@ -164,9 +164,9 @@ class SmolVLAConfig(PreTrainedConfig):
             real_action_dim = self.action_feature.shape[0]
             if real_action_dim < 2 * self.ard_arm_dim:
                 raise ValueError(
-                    f"ARD needs the dataset's real action dimensionality (got {real_action_dim}) to be at "
-                    f"least `2 * ard_arm_dim` ({2 * self.ard_arm_dim}) so the leading channels split evenly "
-                    "into a left-arm and a right-arm block."
+                    f"ARD를 사용하려면 데이터셋의 실제 액션 차원(현재 {real_action_dim})이 최소한 "
+                    f"`2 * ard_arm_dim`({2 * self.ard_arm_dim}) 이상이어야, 선두 채널이 왼팔/오른팔 "
+                    "블록으로 균등하게 나뉩니다."
                 )
 
     def get_optimizer_preset(self) -> AdamWConfig:
