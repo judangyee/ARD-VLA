@@ -7,12 +7,15 @@
 # - Detects whether a CUDA GPU is available and installs the matching torch
 #   build (CPU-only wheels when no GPU is present, avoiding a multi-GB CUDA
 #   download on machines that can't use it).
-# - Installs the rest of requirements.txt (lerobot[smolvla] + research
-#   tooling) on top.
+# - Installs lerobot editable from the vendored source at third_party/lerobot
+#   (not from PyPI), so SmolVLA's model code can be modified directly here
+#   and the changes are tracked by this repo's git history.
+# - Installs the rest of requirements.txt (research tooling) on top.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="${REPO_ROOT}/.venv"
+LEROBOT_SRC="${REPO_ROOT}/third_party/lerobot"
 USE_VENV=1
 TORCH_VERSION="2.7.1"
 TORCHVISION_VERSION="0.22.1"
@@ -61,7 +64,16 @@ else
   fi
 fi
 
-echo "==> Installing lerobot[smolvla] and research dependencies"
+if [ ! -f "${LEROBOT_SRC}/pyproject.toml" ]; then
+  echo "Vendored lerobot source not found at ${LEROBOT_SRC}" >&2
+  echo "(expected third_party/lerobot to contain the lerobot package source)" >&2
+  exit 1
+fi
+
+echo "==> Installing lerobot[smolvla] editable from ${LEROBOT_SRC}"
+"$PYTHON_BIN" -m pip install -e "${LEROBOT_SRC}[smolvla]"
+
+echo "==> Installing research dependencies"
 "$PYTHON_BIN" -m pip install -r "${REPO_ROOT}/requirements.txt"
 
 echo "==> Verifying the environment imports cleanly"
