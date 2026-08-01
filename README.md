@@ -54,33 +54,33 @@ What's left (`configs/`, `datasets/`, `envs/configs.py` only, `optim/`, `policie
 
 Per the ARD-VLA research plan (bimanual tool-use fine-tuning: one arm stabilizes the workpiece,
 the other performs the precise manipulation), SmolVLA's action expert now supports an optional
-asymmetric dual-head mode:
+asymmetric dual-head mode. **The Actuator arm is fixed by config, always the right arm** — there's
+no per-instruction role switching; `ard_default_actuator_arm` names which arm plays that role, and
+it applies identically to every sample.
 
-- `third_party/lerobot/src/lerobot/policies/smolvla/ard.py` (new file) — `RoleClassifier` (predicts
-  which arm is the Actuator from the pooled language instruction), `AsymmetricResidualHeads`
+- `third_party/lerobot/src/lerobot/policies/smolvla/ard.py` (new file) — `AsymmetricResidualHeads`
   (zero-init residual MLPs that specialize the Stabilizer/Actuator channels on top of the shared
-  flow-matching output), and `compute_ard_losses` (`alpha * L_stab + beta * L_act`, with
-  `L_stab = L_pos + λ·L_smooth` and `L_act = L_pos + λ·L_force + λ·L_traj`, matching the plan's
-  loss design — `L_pos` reuses the base model's own flow-matching regression loss rather than
-  recomputing a separate L1 term).
+  flow-matching output), `resolve_actuator_is_first` (the fixed left/right routing), and
+  `compute_ard_losses` (`alpha * L_stab + beta * L_act`, with `L_stab = L_pos + λ·L_smooth` and
+  `L_act = L_pos + λ·L_force + λ·L_traj`, matching the plan's loss design — `L_pos` reuses the base
+  model's own flow-matching regression loss rather than recomputing a separate L1 term).
 - `configuration_smolvla.py` — new `use_ard`, `ard_arm_dim`, `ard_alpha`/`ard_beta`,
-  `ard_lambda_{smooth,force,traj}`, `ard_default_actuator_arm`, `ard_use_role_classifier`,
-  `ard_role_loss_weight` fields, off by default (`use_ard=False` reproduces upstream SmolVLA
-  exactly — verified no code path changes unless the flag is set).
+  `ard_lambda_{smooth,force,traj}`, `ard_default_actuator_arm` (default `"right"`) fields, off by
+  default (`use_ard=False` reproduces upstream SmolVLA exactly — verified no code path changes
+  unless the flag is set).
 - `modeling_smolvla.py` — `VLAFlowMatching.forward` (training loss), `.sample_actions`/
   `.denoise_step` (inference, including under RTC) all apply the same residual-head correction and
-  role resolution, so training and inference stay consistent.
-- Optional per-sample batch keys, both no-ops if absent: `ard_actuator_is_first` (ground-truth role
-  label, e.g. from a scripted Isaac Sim episode) and `ard_force_target` (contact-force/torque
+  fixed role routing, so training and inference stay consistent.
+- Optional per-sample batch key, a no-op if absent: `ard_force_target` (contact-force/torque
   supervision — no dataset in this repo provides it yet, so `L_force` is 0 until one does).
 
 **Verification.** This sandbox's network policy blocks the Hugging Face Hub, and `SmolVLAPolicy`
 always needs to download the SmolVLM2 backbone's config even with `load_vlm_weights=False` — so it
 can't be instantiated end-to-end here. What *is* verified, offline, in `scripts/test_ard.py`:
-`SmolVLAConfig`'s new validation, the role split/combine round-trip, role-resolution priority
-(label > classifier > static default), zero-init/gradient-flow of the residual heads, and
-`compute_ard_losses`'s numerics (including a real bug it caught: `L_force` broadcasting a
-per-sample target against a per-timestep prediction). `scripts/check_env.py` confirms the default
+`SmolVLAConfig`'s new validation, that the fixed role routing always sends the right-arm channels
+to the Actuator head, the role split/combine round-trip, zero-init/gradient-flow of the residual
+heads, and `compute_ard_losses`'s numerics (including a real bug it caught: `L_force` broadcasting
+a per-sample target against a per-timestep prediction). `scripts/check_env.py` confirms the default
 (`use_ard=False`) path still imports and runs unchanged. Run both with:
 
 ```bash

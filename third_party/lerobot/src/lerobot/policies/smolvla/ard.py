@@ -22,49 +22,17 @@ them with different loss terms combined asymmetrically (alpha * L_stab + beta * 
 
 Convention: within those `2 * ard_arm_dim` channels, the first `ard_arm_dim` belong to the left
 arm and the next `ard_arm_dim` to the right arm — this matches LeRobot's usual bimanual action
-layout (e.g. bi_so_follower). Which physical arm plays the Actuator role for a given sample is
-resolved by `resolve_actuator_is_first`, in priority order: an explicit per-sample dataset label,
-then a learned `RoleClassifier` prediction from the language instruction, then the config's
-static default.
+layout (e.g. bi_so_follower). Which physical arm plays the Actuator role is fixed by
+`config.ard_default_actuator_arm` (the right arm, always — see `resolve_actuator_is_first`).
 """
 
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
 
-# Optional per-sample batch keys a dataset/environment may provide.
-ARD_ROLE_LABEL = "ard_actuator_is_first"  # bool/float, shape (batch,): True if the left arm is the Actuator
+# Optional per-sample batch key a dataset/environment may provide.
 ARD_FORCE_TARGET = "ard_force_target"  # float, shape (batch,) or (batch, chunk_size): target contact force/torque
-
-
-class RoleClassifier(nn.Module):
-    """Predicts, from a pooled language-instruction embedding, whether the left arm (first
-    `ard_arm_dim` action channels) is the Actuator for this instruction."""
-
-    def __init__(self, hidden_size: int, classifier_hidden_dim: int = 128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(hidden_size, classifier_hidden_dim),
-            nn.GELU(),
-            nn.Linear(classifier_hidden_dim, 1),
-        )
-
-    def forward(self, pooled_lang_emb: Tensor) -> Tensor:
-        """pooled_lang_emb: (batch, hidden_size). Returns logits of shape (batch,);
-        positive => left arm predicted as Actuator."""
-        return self.net(pooled_lang_emb).squeeze(-1)
-
-
-def pool_language_embedding(lang_emb: Tensor, lang_masks: Tensor) -> Tensor:
-    """Mean-pool token embeddings over valid (non-padding) language positions.
-
-    lang_emb: (batch, seq_len, hidden_size). lang_masks: (batch, seq_len) bool/int, True/1 = valid token.
-    """
-    mask = lang_masks.to(dtype=lang_emb.dtype).unsqueeze(-1)
-    counts = mask.sum(dim=1).clamp(min=1.0)
-    return (lang_emb * mask).sum(dim=1) / counts
 
 
 class AsymmetricResidualHeads(nn.Module):
@@ -103,20 +71,11 @@ class AsymmetricResidualHeads(nn.Module):
         return self.stabilizer_head(suffix_features), self.actuator_head(suffix_features)
 
 
-def resolve_actuator_is_first(
-    default_actuator_arm: str,
-    batch_size: int,
-    device: torch.device,
-    role_label: Tensor | None = None,
-    role_logits: Tensor | None = None,
-) -> Tensor:
-    """Decide, per sample, whether the left arm (first `ard_arm_dim` action channels) is the
-    Actuator. Priority: explicit dataset role label > learned role-classifier prediction > the
-    config's static default. Returns a bool tensor of shape (batch_size,)."""
-    if role_label is not None:
-        return role_label.to(device=device).bool()
-    if role_logits is not None:
-        return role_logits > 0
+def resolve_actuator_is_first(default_actuator_arm: str, batch_size: int, device: torch.device) -> Tensor:
+    """The Actuator arm is fixed by config (always the right arm in this setup, i.e.
+    `default_actuator_arm == "right"`), the same for every sample. Returns a constant bool tensor
+    of shape (batch_size,) — True only if the left arm (first `ard_arm_dim` channels) is the
+    Actuator."""
     default_is_left = default_actuator_arm == "left"
     return torch.full((batch_size,), default_is_left, dtype=torch.bool, device=device)
 
@@ -154,7 +113,6 @@ class ARDLossOutput:
     smooth_loss: Tensor
     force_loss: Tensor
     traj_loss: Tensor
-    role_loss: Tensor | None
 
 
 def compute_ard_losses(
@@ -169,9 +127,6 @@ def compute_ard_losses(
     lambda_force: float,
     lambda_traj: float,
     force_target: Tensor | None = None,
-    role_logits: Tensor | None = None,
-    role_label: Tensor | None = None,
-    role_loss_weight: float = 0.0,
 ) -> ARDLossOutput:
     """Combine the base flow-matching regression loss with ARD's role-specific regularizers.
 
@@ -224,11 +179,6 @@ def compute_ard_losses(
     act_loss = act_pos_loss + lambda_force * force_loss + lambda_traj * traj_loss
     total = alpha * stab_loss + beta * act_loss
 
-    role_loss = None
-    if role_logits is not None and role_label is not None and role_loss_weight > 0:
-        role_loss = F.binary_cross_entropy_with_logits(role_logits, role_label.to(role_logits.dtype))
-        total = total + role_loss_weight * role_loss
-
     return ARDLossOutput(
         total=total,
         stabilizer_loss=stab_loss.detach(),
@@ -237,5 +187,4 @@ def compute_ard_losses(
         smooth_loss=smooth_loss.detach(),
         force_loss=force_loss.detach(),
         traj_loss=traj_loss.detach(),
-        role_loss=role_loss.detach() if role_loss is not None else None,
     )

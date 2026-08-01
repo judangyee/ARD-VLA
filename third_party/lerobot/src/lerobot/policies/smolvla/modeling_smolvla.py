@@ -65,12 +65,9 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.smolvla.ard import (
     ARD_FORCE_TARGET,
-    ARD_ROLE_LABEL,
     AsymmetricResidualHeads,
-    RoleClassifier,
     combine_by_role,
     compute_ard_losses,
-    pool_language_embedding,
     resolve_actuator_is_first,
     split_by_role,
 )
@@ -387,12 +384,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("actions_id_pad")
-        role_label = batch.get(ARD_ROLE_LABEL)
         force_target = batch.get(ARD_FORCE_TARGET)
         loss_dict = {}
-        losses, ard_extras = self.model.forward(
-            images, img_masks, lang_tokens, lang_masks, state, actions, noise, time, role_label=role_label
-        )
+        losses, ard_extras = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
 
         if actions_is_pad is not None:
@@ -426,9 +420,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 lambda_force=self.config.ard_lambda_force,
                 lambda_traj=self.config.ard_lambda_traj,
                 force_target=force_target,
-                role_logits=ard_extras["role_logits"],
-                role_label=role_label,
-                role_loss_weight=self.config.ard_role_loss_weight,
             )
             loss = ard_out.total
             loss_dict["loss"] = loss.item()
@@ -438,8 +429,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
             loss_dict["ard_smooth_loss"] = ard_out.smooth_loss.item()
             loss_dict["ard_force_loss"] = ard_out.force_loss.item()
             loss_dict["ard_traj_loss"] = ard_out.traj_loss.item()
-            if ard_out.role_loss is not None:
-                loss_dict["ard_role_loss"] = ard_out.role_loss.item()
             return loss, loss_dict
 
         # Default: return scalar mean loss
@@ -641,14 +630,8 @@ class VLAFlowMatching(nn.Module):
         self.rtc_processor = rtc_processor
 
         # ARD: Asymmetric Role Decomposition (see lerobot.policies.smolvla.ard)
-        self.role_classifier = None
         self.ard_heads = None
         if self.config.use_ard:
-            if self.config.ard_use_role_classifier:
-                self.role_classifier = RoleClassifier(
-                    hidden_size=self.vlm_with_expert.config.text_config.hidden_size,
-                    classifier_hidden_dim=self.config.ard_role_classifier_hidden_dim,
-                )
             self.ard_heads = AsymmetricResidualHeads(
                 expert_hidden_size=self.vlm_with_expert.expert_hidden_size,
                 arm_dim=self.config.ard_arm_dim,
@@ -830,7 +813,6 @@ class VLAFlowMatching(nn.Module):
         actions,
         noise=None,
         time=None,
-        role_label: Tensor | None = None,
     ) -> tuple[Tensor, dict | None]:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors).
 
@@ -873,18 +855,8 @@ class VLAFlowMatching(nn.Module):
         ard_extras = None
         if self.config.use_ard:
             arm_dim = self.config.ard_arm_dim
-            role_logits = None
-            if self.role_classifier is not None:
-                lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
-                pooled_lang_emb = pool_language_embedding(lang_emb, lang_masks).to(dtype=torch.float32)
-                role_logits = self.role_classifier(pooled_lang_emb)
-
             actuator_is_first = resolve_actuator_is_first(
-                self.config.ard_default_actuator_arm,
-                batch_size=v_t.shape[0],
-                device=v_t.device,
-                role_label=role_label,
-                role_logits=role_logits,
+                self.config.ard_default_actuator_arm, batch_size=v_t.shape[0], device=v_t.device
             )
 
             stabilizer_residual, actuator_residual = self.ard_heads(suffix_out)
@@ -908,7 +880,6 @@ class VLAFlowMatching(nn.Module):
             )
             ard_extras = {
                 "actuator_is_first": actuator_is_first,
-                "role_logits": role_logits,
                 "stabilizer_pred": stabilizer_pred,
                 "actuator_pred": actuator_pred,
                 "per_element_loss": losses[..., : 2 * arm_dim],
@@ -949,21 +920,12 @@ class VLAFlowMatching(nn.Module):
             fill_kv_cache=True,
         )
 
-        # ARD: resolve which arm is the Actuator once per chunk (language doesn't change across
-        # denoising steps) so every `denoise_step` call applies the matching residual head.
+        # ARD: resolve which arm is the Actuator once per chunk so every `denoise_step` call
+        # applies the matching residual head.
         actuator_is_first = None
         if self.config.use_ard:
-            role_logits = None
-            if self.role_classifier is not None:
-                lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
-                pooled_lang_emb = pool_language_embedding(lang_emb, lang_masks).to(dtype=torch.float32)
-                role_logits = self.role_classifier(pooled_lang_emb)
             actuator_is_first = resolve_actuator_is_first(
-                self.config.ard_default_actuator_arm,
-                batch_size=bsize,
-                device=device,
-                role_label=None,  # no ground-truth role label available at inference
-                role_logits=role_logits,
+                self.config.ard_default_actuator_arm, batch_size=bsize, device=device
             )
 
         num_steps = self.config.num_steps

@@ -114,18 +114,16 @@ class SmolVLAConfig(PreTrainedConfig):
     # Stabilizer arm (holds/fixes the workpiece) and an Actuator arm (performs the precise tool
     # manipulation), each refined by its own residual head and trained with its own loss terms,
     # combined asymmetrically. Convention: within those `2 * ard_arm_dim` channels, the first
-    # `ard_arm_dim` belong to the left arm and the next `ard_arm_dim` to the right arm.
+    # `ard_arm_dim` belong to the left arm and the next `ard_arm_dim` to the right arm. The
+    # Actuator is always `ard_default_actuator_arm` — fixed for the whole setup, not per-sample.
     use_ard: bool = False
     ard_arm_dim: int = 7  # DoF per arm (e.g. 6 joints + 1 gripper)
-    ard_default_actuator_arm: str = "right"  # "left" or "right"; fallback when no role label/classifier is used
+    ard_default_actuator_arm: str = "right"  # "left" or "right"; always this arm plays the Actuator
     ard_alpha: float = 0.3  # Stabilizer loss weight
     ard_beta: float = 0.7  # Actuator loss weight
     ard_lambda_smooth: float = 1.0  # Stabilizer smoothness penalty weight
     ard_lambda_force: float = 1.0  # Actuator force-tracking penalty weight
     ard_lambda_traj: float = 1.0  # Actuator trajectory-smoothness penalty weight
-    ard_role_classifier_hidden_dim: int = 128
-    ard_use_role_classifier: bool = True  # Predict actuator arm from language instead of the static default
-    ard_role_loss_weight: float = 0.1  # Auxiliary BCE weight, only applied when a role label is in the batch
 
     def __post_init__(self):
         super().__post_init__()
