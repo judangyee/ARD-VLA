@@ -50,9 +50,51 @@ If you need to pull in upstream lerobot changes later, re-clone the desired tag/
 
 What's left (`configs/`, `datasets/`, `envs/configs.py` only, `optim/`, `policies/{smolvla,rtc,pretrained.py,utils.py}`, `processor/`, `robots/`+`teleoperators/` base classes, `motors/motors_bus.py`, `utils/`) is the actual dependency closure for building/training/running the SmolVLA policy against a `LeRobotDataset`. `scripts/check_env.py` and the trace above are re-run after any change to confirm nothing extra crept back in.
 
+## ARD: Asymmetric Role Decomposition
+
+Per the ARD-VLA research plan (bimanual tool-use fine-tuning: one arm stabilizes the workpiece,
+the other performs the precise manipulation), SmolVLA's action expert now supports an optional
+asymmetric dual-head mode:
+
+- `third_party/lerobot/src/lerobot/policies/smolvla/ard.py` (new file) — `RoleClassifier` (predicts
+  which arm is the Actuator from the pooled language instruction), `AsymmetricResidualHeads`
+  (zero-init residual MLPs that specialize the Stabilizer/Actuator channels on top of the shared
+  flow-matching output), and `compute_ard_losses` (`alpha * L_stab + beta * L_act`, with
+  `L_stab = L_pos + λ·L_smooth` and `L_act = L_pos + λ·L_force + λ·L_traj`, matching the plan's
+  loss design — `L_pos` reuses the base model's own flow-matching regression loss rather than
+  recomputing a separate L1 term).
+- `configuration_smolvla.py` — new `use_ard`, `ard_arm_dim`, `ard_alpha`/`ard_beta`,
+  `ard_lambda_{smooth,force,traj}`, `ard_default_actuator_arm`, `ard_use_role_classifier`,
+  `ard_role_loss_weight` fields, off by default (`use_ard=False` reproduces upstream SmolVLA
+  exactly — verified no code path changes unless the flag is set).
+- `modeling_smolvla.py` — `VLAFlowMatching.forward` (training loss), `.sample_actions`/
+  `.denoise_step` (inference, including under RTC) all apply the same residual-head correction and
+  role resolution, so training and inference stay consistent.
+- Optional per-sample batch keys, both no-ops if absent: `ard_actuator_is_first` (ground-truth role
+  label, e.g. from a scripted Isaac Sim episode) and `ard_force_target` (contact-force/torque
+  supervision — no dataset in this repo provides it yet, so `L_force` is 0 until one does).
+
+**Verification.** This sandbox's network policy blocks the Hugging Face Hub, and `SmolVLAPolicy`
+always needs to download the SmolVLM2 backbone's config even with `load_vlm_weights=False` — so it
+can't be instantiated end-to-end here. What *is* verified, offline, in `scripts/test_ard.py`:
+`SmolVLAConfig`'s new validation, the role split/combine round-trip, role-resolution priority
+(label > classifier > static default), zero-init/gradient-flow of the residual heads, and
+`compute_ard_losses`'s numerics (including a real bug it caught: `L_force` broadcasting a
+per-sample target against a per-timestep prediction). `scripts/check_env.py` confirms the default
+(`use_ard=False`) path still imports and runs unchanged. Run both with:
+
+```bash
+python scripts/check_env.py
+python scripts/test_ard.py
+```
+
+Exercising a real forward/backward pass through `SmolVLAPolicy` itself (with `use_ard=True`, tiny
+VLM dims) is the natural next verification step once this environment has Hub access.
+
 ## Layout
 
 - `requirements.txt` — research tooling installed on top of lerobot (notebook/plotting deps). torch and lerobot itself are installed by `scripts/install.sh`, not listed here.
 - `scripts/install.sh` — environment setup: CPU/GPU-aware torch install, editable `lerobot[smolvla]` install from `third_party/lerobot`, then `requirements.txt`.
 - `scripts/check_env.py` — import + CPU-fallback smoke test.
+- `scripts/test_ard.py` — offline unit tests for the ARD modification.
 - `third_party/lerobot/` — vendored, editable LeRobot/SmolVLA source.

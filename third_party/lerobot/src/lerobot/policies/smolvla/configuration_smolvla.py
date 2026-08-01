@@ -109,6 +109,24 @@ class SmolVLAConfig(PreTrainedConfig):
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
 
+    # --- ARD: Asymmetric Role Decomposition (bimanual tool-use fine-tuning) ---
+    # See ARD-VLA research plan. Splits the leading `2 * ard_arm_dim` action channels into a
+    # Stabilizer arm (holds/fixes the workpiece) and an Actuator arm (performs the precise tool
+    # manipulation), each refined by its own residual head and trained with its own loss terms,
+    # combined asymmetrically. Convention: within those `2 * ard_arm_dim` channels, the first
+    # `ard_arm_dim` belong to the left arm and the next `ard_arm_dim` to the right arm.
+    use_ard: bool = False
+    ard_arm_dim: int = 7  # DoF per arm (e.g. 6 joints + 1 gripper)
+    ard_default_actuator_arm: str = "right"  # "left" or "right"; fallback when no role label/classifier is used
+    ard_alpha: float = 0.3  # Stabilizer loss weight
+    ard_beta: float = 0.7  # Actuator loss weight
+    ard_lambda_smooth: float = 1.0  # Stabilizer smoothness penalty weight
+    ard_lambda_force: float = 1.0  # Actuator force-tracking penalty weight
+    ard_lambda_traj: float = 1.0  # Actuator trajectory-smoothness penalty weight
+    ard_role_classifier_hidden_dim: int = 128
+    ard_use_role_classifier: bool = True  # Predict actuator arm from language instead of the static default
+    ard_role_loss_weight: float = 0.1  # Auxiliary BCE weight, only applied when a role label is in the batch
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -122,6 +140,18 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+        if self.use_ard:
+            if self.ard_arm_dim <= 0:
+                raise ValueError(f"`ard_arm_dim` must be positive, got {self.ard_arm_dim}.")
+            if 2 * self.ard_arm_dim > self.max_action_dim:
+                raise ValueError(
+                    f"ARD needs `2 * ard_arm_dim` ({2 * self.ard_arm_dim}) channels but `max_action_dim` is "
+                    f"only {self.max_action_dim}."
+                )
+            if self.ard_default_actuator_arm not in ("left", "right"):
+                raise ValueError(
+                    f"`ard_default_actuator_arm` must be 'left' or 'right', got {self.ard_default_actuator_arm!r}."
+                )
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):
@@ -131,6 +161,15 @@ class SmolVLAConfig(PreTrainedConfig):
                 shape=(3, 480, 640),
             )
             self.input_features[key] = empty_camera
+
+        if self.use_ard and self.action_feature is not None:
+            real_action_dim = self.action_feature.shape[0]
+            if real_action_dim < 2 * self.ard_arm_dim:
+                raise ValueError(
+                    f"ARD needs the dataset's real action dimensionality (got {real_action_dim}) to be at "
+                    f"least `2 * ard_arm_dim` ({2 * self.ard_arm_dim}) so the leading channels split evenly "
+                    "into a left-arm and a right-arm block."
+                )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
