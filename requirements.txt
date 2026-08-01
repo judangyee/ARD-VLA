@@ -1,0 +1,10 @@
+# Research / experimentation tooling on top of SmolVLA / LeRobot.
+#
+# torch/torchvision and lerobot itself are intentionally NOT listed here:
+# scripts/install.sh installs torch first with the correct CPU or CUDA wheel
+# for the host, then installs lerobot editable from the vendored source at
+# third_party/lerobot (so SmolVLA's model code can be modified directly and
+# tracked in this repo), then installs everything below on top.
+jupyterlab==4.3.5
+ipykernel==6.29.5
+matplotlib==3.10.0
