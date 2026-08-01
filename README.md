@@ -93,10 +93,37 @@ python scripts/test_ard.py
 `SmolVLAPolicy` 자체로 실제 forward/backward pass를 돌려보는 것(`use_ard=True`, 작은 VLM
 차원으로)이 이 환경에 Hub 접근이 가능해지면 진행할 다음 검증 단계입니다.
 
+## 학습 (로컬 GPU 환경)
+
+lerobot의 범용 학습 CLI(`lerobot_train.py`)는 모든 정책을 알아야 하는 `policies/factory.py`에
+의존해서 트림할 때 같이 지웠습니다. 대신 `scripts/train_ard.py`가 SmolVLA 하나만 아는 최소
+학습 루프입니다: `LeRobotDataset` 로드 → `SmolVLAConfig`/`SmolVLAPolicy` 생성 → optimizer/
+scheduler 빌드 → 학습 루프 → 주기적 체크포인트 저장. `use_ard=True`일 때는 `ard_stabilizer_loss`
+등 손실 breakdown도 함께 로깅됩니다.
+
+```bash
+python scripts/train_ard.py \
+    --dataset-repo-id <HF_USER>/<DATASET> \
+    --output-dir outputs/ard_run1 \
+    --steps 20000 \
+    --batch-size 32
+```
+
+`--no-use-ard`를 주면 ARD 없이 베이스라인 SmolVLA만 학습합니다. 시작할 때 액션 채널의
+왼팔/오른팔 예상 순서를 출력해주니, 실제 로봇 배선과 맞는지 눈으로 한 번 확인하세요 (ARD는
+"앞 `ard_arm_dim`개=왼팔, 다음 `ard_arm_dim`개=오른팔"이라는 관례를 가정할 뿐, 데이터셋이
+실제로 그 순서인지는 검증하지 않습니다).
+
+이 스크립트도 이 샌드박스에서는 end-to-end로 돌려보지 못했습니다(Hub 접근 차단) — 대신
+헬퍼 함수들(`split_policy_features`, `warn_if_action_layout_looks_wrong`)은 합성 데이터로
+직접 검증했고, import/인자 파싱도 확인했습니다. 실제 학습 루프 자체는 로컬 GPU 환경에서
+처음 돌려보실 때 검증해주세요.
+
 ## Layout
 
 - `requirements.txt` — research tooling installed on top of lerobot (notebook/plotting deps). torch and lerobot itself are installed by `scripts/install.sh`, not listed here.
 - `scripts/install.sh` — environment setup: CPU/GPU-aware torch install, editable `lerobot[smolvla]` install from `third_party/lerobot`, then `requirements.txt`.
 - `scripts/check_env.py` — import + CPU-fallback smoke test.
 - `scripts/test_ard.py` — offline unit tests for the ARD modification.
+- `scripts/train_ard.py` — SmolVLA(+ARD) 전용 최소 학습 스크립트 (lerobot의 범용 학습 CLI 대체).
 - `third_party/lerobot/` — vendored, editable LeRobot/SmolVLA source.
