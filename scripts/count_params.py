@@ -105,6 +105,24 @@ def main() -> None:
         f"num_key_value_heads={vlm_expert.num_key_value_heads}"
     )
 
+    # 3분류 요약: SigLIP 비전 인코더 / SmolLM2 언어모델 / action expert(액션 헤드).
+    # 커넥터(vision->LLM projection)는 비전 쪽에, shim projection들과 ARD head는 액션 쪽에 묶었다.
+    vision_total = count_params(vision_model) + count_params(connector)
+    llm_total = count_params(text_model)
+    action_total = count_params(lm_expert) + sum(count_params(m) for m in shim_layers) + count_params(ard_heads)
+    grand_total = vision_total + llm_total + action_total
+
+    print(f"\n{'3분류 요약':60s} {'파라미터 수':>14s} {'비중':>8s}")
+    print("-" * 88)
+    print(f"{'SigLIP 비전 인코더 (vision_model + connector)':60s} {vision_total:14,d} {vision_total / grand_total * 100:7.2f}%")
+    print(f"{'SmolLM2 언어모델 (text_model)':60s} {llm_total:14,d} {llm_total / grand_total * 100:7.2f}%")
+    print(
+        f"{'action expert (lm_expert + projection shim + ARD head)':60s} "
+        f"{action_total:14,d} {action_total / grand_total * 100:7.2f}%"
+    )
+    print("-" * 88)
+    print(f"{'합계':60s} {grand_total:14,d} {100.0:7.2f}%")
+
     print("\n해상도별 이미지 패치/토큰 수 (vision_model + connector 통과 후, 실측):")
     with torch.no_grad():
         for res in args.resolutions:
