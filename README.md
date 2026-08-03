@@ -164,7 +164,7 @@ KV 캐시 사용)에는 영향이 없습니다.
 
 LoRA + bf16 autocast + gradient checkpointing을 모두 켠 상태에서, bimanual 액션
 (14 DoF, `chunk_size=50`) 더미 배치로 forward+backward를 한 번 돌려 배치 사이즈별
-(`1, 2, 4, 8` 기본값) `torch.cuda.max_memory_allocated()` 최대 메모리를 표로 출력하는
+(`1, 2, 4, 8, 16, 32` 기본값) `torch.cuda.max_memory_allocated()` 최대 메모리를 표로 출력하는
 스크립트입니다. Colab/Kaggle 노트북에서 GPU 런타임으로 바로 돌릴 수 있게 단일 파일로
 작성했습니다:
 

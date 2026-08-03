@@ -43,7 +43,7 @@ from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LAN
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8])
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32])
     parser.add_argument("--chunk-size", type=int, default=50, help="action chunk length (horizon)")
     parser.add_argument("--action-dim", type=int, default=14, help="bimanual: 7 left + 7 right")
     parser.add_argument("--state-dim", type=int, default=14)
