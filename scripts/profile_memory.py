@@ -79,6 +79,7 @@ def build_policy(args) -> SmolVLAPolicy:
         n_action_steps=args.chunk_size,
         vlm_model_name=args.vlm_model_name,
         load_vlm_weights=True,  # 실제 사전학습 백본 — 메모리 프로파일링은 실제 가중치 기준이어야 의미 있음
+        pretrained_path=args.vlm_model_name if args.use_lora else None,  # PEFT의 "from-scratch 경고" 통과용 — VLM 백본은 실제로 사전학습 가중치를 받으므로 사실과 부합
         use_ard=args.use_ard,
         ard_arm_dim=args.ard_arm_dim,
         tokenizer_max_length=args.lang_seq_len,
