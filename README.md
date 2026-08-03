@@ -136,6 +136,59 @@ python scripts/count_params.py --resolutions 384 512 768
 이 스크립트는 원본 레이어 수와 실제 사용하는 레이어 수를 둘 다 보여줘서 이 부분을 헷갈리지
 않게 합니다.
 
+## Gradient checkpointing (`SmolVLMWithExpertModel.gradient_checkpointing_enable()`)
+
+`SmolVLMWithExpertModel.forward()`는 VLM과 action expert를 레이어 단위로 번갈아 호출하는
+커스텀 루프라서, transformers의 표준 `model.gradient_checkpointing_enable()` 훅이 걸리지
+않습니다 (그 훅은 서브모듈의 표준 `forward()` 호출 경로를 가로채는데, 이 루프는 그 경로를
+쓰지 않습니다). 그래서 이번에 별도로 추가했습니다:
+
+```python
+vlm_expert = policy.model.vlm_with_expert
+vlm_expert.gradient_checkpointing_enable()   # 켜기
+vlm_expert.gradient_checkpointing_disable()  # 끄기
+```
+
+내부적으로 레이어 하나의 본문을 `_run_layer()`로 뽑아내고, 학습 중(`self.training`)이면서
+KV 캐시를 안 쓰는 forward 경로(`use_cache=False`, `fill_kv_cache=False` — 즉 학습 시
+`VLAFlowMatching.forward`가 실제로 쓰는 경로)에서만 `torch.utils.checkpoint.checkpoint(
+self._run_layer, ..., use_reentrant=False)`로 감쌉니다. 추론(`sample_actions`/`denoise_step`,
+KV 캐시 사용)에는 영향이 없습니다.
+
+이 기능은 실제 SmolVLM2 모델로 검증하지 못했습니다(Hub 접근 차단, GPU 없음) — 대신 동일한
+호출 시그니처(텐서 리스트 + `None` + non-tensor 인자가 섞인 형태)를 흉내 낸 가짜 레이어로
+체크포인팅 유무에 따라 forward 출력과 gradient가 정확히 일치하는지 별도로 검증했습니다.
+`check_env.py`/`test_ard.py`는 이 플래그가 기본 `False`라 회귀 없이 통과합니다.
+
+## 메모리 프로파일링 (`scripts/profile_memory.py`)
+
+LoRA + bf16 autocast + gradient checkpointing을 모두 켠 상태에서, bimanual 액션
+(14 DoF, `chunk_size=50`) 더미 배치로 forward+backward를 한 번 돌려 배치 사이즈별
+(`1, 2, 4, 8` 기본값) `torch.cuda.max_memory_allocated()` 최대 메모리를 표로 출력하는
+스크립트입니다. Colab/Kaggle 노트북에서 GPU 런타임으로 바로 돌릴 수 있게 단일 파일로
+작성했습니다:
+
+```bash
+!pip install -e "third_party/lerobot[smolvla,peft]"
+!python scripts/profile_memory.py
+```
+
+`--no-lora`, `--no-bf16`, `--no-grad-checkpoint`, `--no-ard`로 각 기법을 개별적으로
+끄고 비교할 수 있고, 배치 사이즈 도중 OOM이 나도 스크립트가 죽지 않고 해당 칸을 "OOM"으로
+표시한 뒤 나머지 배치 사이즈를 계속 시도합니다.
+
+LoRA는 기존에 있던 `PreTrainedPolicy.wrap_with_peft()`를 그대로 사용합니다 — 다만
+SmolVLA의 기본 LoRA 타겟(`lm_expert`의 attention projection들)에는 ARD의
+`stabilizer_head`/`actuator_head`가 포함되지 않아서, `wrap_with_peft()`가 나머지 전부를
+얼린 뒤 ARD head를 명시적으로 다시 `requires_grad_(True)`로 풀어줍니다 (그렇지 않으면
+ARD head가 통째로 학습에서 빠집니다).
+
+이 스크립트도 이 샌드박스에서는 GPU와 Hub 접근이 둘 다 없어서 실행해보지 못했습니다 — 대신
+`py_compile`로 컴파일을 확인했고, `policy.forward(batch)`가 `(loss, loss_dict)`를 반환하는
+실제 시그니처(`modeling_smolvla.py`)와 배치 딕셔너리 키(`OBS_STATE`, `ACTION`,
+`OBS_LANGUAGE_TOKENS`, `OBS_LANGUAGE_ATTENTION_MASK`)를 코드에서 직접 확인해서 맞췄습니다.
+실제 GPU에서 처음 돌릴 때 배치 사이즈 1부터 통과하는지 먼저 확인하는 걸 권장합니다.
+
 ## Layout
 
 - `requirements.txt` — research tooling installed on top of lerobot (notebook/plotting deps). torch and lerobot itself are installed by `scripts/install.sh`, not listed here.

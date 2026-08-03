@@ -15,6 +15,7 @@
 import copy
 
 import torch
+import torch.utils.checkpoint
 from torch import nn
 from transformers import (
     AutoConfig,
@@ -130,7 +131,21 @@ class SmolVLMWithExpertModel(nn.Module):
         self.train_expert_only = train_expert_only
         self.attention_mode = attention_mode
         self.expert_hidden_size = lm_expert_config.hidden_size
+        self.gradient_checkpointing = False
         self.set_requires_grad()
+
+    def gradient_checkpointing_enable(self) -> None:
+        """Recompute each interleaved VLM/expert layer's activations during backward instead of
+        keeping them all in memory. Only takes effect during training (`self.training`) forward passes
+        without KV-caching (`use_cache=False`, `fill_kv_cache=False`) — i.e. the path `VLAFlowMatching.forward`
+        actually uses. Note this is independent of `self.vlm.gradient_checkpointing_enable()`: this class's
+        `forward()` bypasses the VLM's own per-layer `forward()` calls with a custom interleaved loop, so
+        the standard transformers gradient checkpointing hook never fires for it.
+        """
+        self.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self) -> None:
+        self.gradient_checkpointing = False
 
     def get_vlm_model(self):
         return self.vlm.model
@@ -400,6 +415,86 @@ class SmolVLMWithExpertModel(nn.Module):
             expert_layers.append(expert_layer)
         return [vlm_layers, expert_layers]
 
+    def _run_layer(
+        self,
+        layer_idx,
+        inputs_embeds,
+        past_key_values,
+        position_ids,
+        attention_mask,
+        batch_size,
+        head_dim,
+        use_cache,
+        fill_kv_cache,
+        model_layers,
+    ):
+        """One interleaved VLM/expert layer: attention (self- or cross-, per
+        `self_attn_every_n_layers`) then o_proj + residual + MLP + residual for each stream in
+        `inputs_embeds`. Pulled out of `forward()`'s loop body (unchanged logic, just parameterized)
+        so it can be wrapped in `torch.utils.checkpoint.checkpoint` when `gradient_checkpointing` is on.
+        """
+        if (
+            fill_kv_cache
+            or "cross" not in self.attention_mode
+            or (self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0)
+        ):
+            att_outputs, past_key_values = self.forward_attn_layer(
+                model_layers,
+                inputs_embeds,
+                layer_idx,
+                position_ids,
+                attention_mask,
+                batch_size,
+                head_dim,
+                use_cache=use_cache,
+                fill_kv_cache=fill_kv_cache,
+                past_key_values=past_key_values,
+            )
+        else:
+            att_outputs, past_key_values = self.forward_cross_attn_layer(
+                model_layers,
+                inputs_embeds,
+                layer_idx,
+                position_ids,
+                attention_mask,
+                batch_size,
+                head_dim,
+                use_cache=use_cache,
+                fill_kv_cache=fill_kv_cache,
+                past_key_values=past_key_values,
+            )
+        outputs_embeds = []
+        start = 0
+        for i, hidden_states in enumerate(inputs_embeds):
+            layer = model_layers[i][layer_idx]
+            att_output = att_outputs[i] if i < len(att_outputs) else att_outputs[0]  # in case of self_attn
+            if hidden_states is not None:
+                if layer is None:
+                    outputs_embeds.append(hidden_states)
+                    continue
+                end = start + hidden_states.shape[1]
+
+                if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+                    att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+                att_out = att_output[:, start:end]
+                out_emb = layer.self_attn.o_proj(att_out)
+
+                out_emb += hidden_states
+                after_first_residual = out_emb.clone()
+
+                out_emb = layer.post_attention_layernorm(out_emb)
+                out_emb = layer.mlp(out_emb)
+
+                out_emb += after_first_residual
+
+                outputs_embeds.append(out_emb)
+
+                start = end if len(att_outputs) == 1 else 0
+            else:
+                outputs_embeds.append(None)
+
+        return outputs_embeds, past_key_values
+
     def forward(
         self,
         attention_mask: torch.Tensor | None = None,
@@ -422,70 +517,32 @@ class SmolVLMWithExpertModel(nn.Module):
         # RMSNorm
         num_layers = self.num_vlm_layers
         head_dim = self.vlm.config.text_config.head_dim
+        use_checkpoint = (
+            self.gradient_checkpointing
+            and self.training
+            and not use_cache
+            and not fill_kv_cache
+            and torch.is_grad_enabled()
+        )
         for layer_idx in range(num_layers):
-            if (
-                fill_kv_cache
-                or "cross" not in self.attention_mode
-                or (self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0)
-            ):
-                att_outputs, past_key_values = self.forward_attn_layer(
-                    model_layers,
-                    inputs_embeds,
-                    layer_idx,
-                    position_ids,
-                    attention_mask,
-                    batch_size,
-                    head_dim,
-                    use_cache=use_cache,
-                    fill_kv_cache=fill_kv_cache,
-                    past_key_values=past_key_values,
+            layer_args = (
+                layer_idx,
+                inputs_embeds,
+                past_key_values,
+                position_ids,
+                attention_mask,
+                batch_size,
+                head_dim,
+                use_cache,
+                fill_kv_cache,
+                model_layers,
+            )
+            if use_checkpoint:
+                inputs_embeds, past_key_values = torch.utils.checkpoint.checkpoint(
+                    self._run_layer, *layer_args, use_reentrant=False
                 )
             else:
-                att_outputs, past_key_values = self.forward_cross_attn_layer(
-                    model_layers,
-                    inputs_embeds,
-                    layer_idx,
-                    position_ids,
-                    attention_mask,
-                    batch_size,
-                    head_dim,
-                    use_cache=use_cache,
-                    fill_kv_cache=fill_kv_cache,
-                    past_key_values=past_key_values,
-                )
-            outputs_embeds = []
-            start = 0
-            for i, hidden_states in enumerate(inputs_embeds):
-                layer = model_layers[i][layer_idx]
-                att_output = (
-                    att_outputs[i] if i < len(att_outputs) else att_outputs[0]
-                )  # in case of self_attn
-                if hidden_states is not None:
-                    if layer is None:
-                        outputs_embeds.append(hidden_states)
-                        continue
-                    end = start + hidden_states.shape[1]
-
-                    if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
-                        att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
-                    att_out = att_output[:, start:end]
-                    out_emb = layer.self_attn.o_proj(att_out)
-
-                    out_emb += hidden_states
-                    after_first_residual = out_emb.clone()
-
-                    out_emb = layer.post_attention_layernorm(out_emb)
-                    out_emb = layer.mlp(out_emb)
-
-                    out_emb += after_first_residual
-
-                    outputs_embeds.append(out_emb)
-
-                    start = end if len(att_outputs) == 1 else 0
-                else:
-                    outputs_embeds.append(None)
-
-            inputs_embeds = outputs_embeds
+                inputs_embeds, past_key_values = self._run_layer(*layer_args)
 
         # final norm
         outputs_embeds = []
