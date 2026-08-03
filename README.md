@@ -183,11 +183,23 @@ SmolVLA의 기본 LoRA 타겟(`lm_expert`의 attention projection들)에는 ARD�
 얼린 뒤 ARD head를 명시적으로 다시 `requires_grad_(True)`로 풀어줍니다 (그렇지 않으면
 ARD head가 통째로 학습에서 빠집니다).
 
-이 스크립트도 이 샌드박스에서는 GPU와 Hub 접근이 둘 다 없어서 실행해보지 못했습니다 — 대신
-`py_compile`로 컴파일을 확인했고, `policy.forward(batch)`가 `(loss, loss_dict)`를 반환하는
-실제 시그니처(`modeling_smolvla.py`)와 배치 딕셔너리 키(`OBS_STATE`, `ACTION`,
-`OBS_LANGUAGE_TOKENS`, `OBS_LANGUAGE_ATTENTION_MASK`)를 코드에서 직접 확인해서 맞췄습니다.
-실제 GPU에서 처음 돌릴 때 배치 사이즈 1부터 통과하는지 먼저 확인하는 걸 권장합니다.
+기본 실행은 SmolVLA의 레이어 프루닝(`num_vlm_layers`로 SmolLM2를 앞쪽 몇 개 레이어만 쓰도록
+자르는 것) 적용 여부를 **둘 다** 프로파일링해서 표를 두 개 냅니다 — "적용 O"는
+`--num-vlm-layers`(기본 16)로 자른 기본 SmolVLA 설정, "적용 X"는 원본 SmolLM2 레이어 수를
+그대로 쓰는 모델입니다. 원본 레이어 수 쪽은 `num_expert_layers`가 기본 `-1`이라 action
+expert도 VLM 레이어 수를 따라가며 같이 커지므로 메모리를 훨씬 많이 쓰고 더 빨리 OOM이 날 수
+있습니다. `--layer-pruning-mode pruned` 또는 `unpruned`를 주면 그중 하나만 돌려서 시간을
+아낄 수 있습니다.
+
+이 스크립트는 실제 Colab GPU 런타임에서 검증했습니다. 처음 실행할 때 두 가지 문제가
+나올 수 있는데(둘 다 이 레포/스크립트 버그는 아니고 Colab 환경 특성입니다):
+- `pip install -e ...`가 torch/torchvision을 재설치하면서 "You must restart the runtime"
+  경고가 뜨면, 재시작 후 새 셀에서 `%cd`부터 다시 하고 스크립트만 실행하세요 (설치를 다시 할
+  필요는 없습니다).
+- `wrap_with_peft()`가 peft의 `dispatch_torchao` 단계에서 `ImportError: Found an
+  incompatible version of torchao`를 던지면, Colab에 미리 깔린 `torchao`가 peft 요구
+  버전과 안 맞아서입니다 — 저희는 양자화를 안 쓰니 `!pip uninstall -y torchao`로 지우고
+  다시 실행하면 됩니다.
 
 ## Layout
 

@@ -7,6 +7,13 @@ Colab/Kaggle 노트북 셀에 그대로 실행할 수 있도록 단일 파일로
 실제 데이터셋 없이 바로 돌아가지만, 그만큼 "숫자가 맞다"가 아니라 "메모리가 얼마나 드는지"만
 알려준다.
 
+기본 실행은 SmolVLA의 레이어 프루닝(`num_vlm_layers`로 SmolLM2를 앞쪽 몇 개 레이어만 쓰도록
+자르는 것) 적용 여부를 둘 다 프로파일링해서 표를 두 개 낸다 — "적용 O"는 기본 설정
+(`--num-vlm-layers`, 기본 16)대로 자른 모델, "적용 X"는 원본 SmolLM2 레이어 수를 그대로 쓰는
+모델이다. 원본 레이어 수 쪽은 action expert도 같이 커지기 때문에(`num_expert_layers`가 기본
+`-1`이라 VLM 레이어 수를 따라감) 훨씬 무겁고 OOM이 더 빨리 날 수 있다. `--layer-pruning-mode
+pruned`나 `unpruned`를 주면 그중 하나만 돌려서 시간을 아낄 수 있다.
+
 Colab/Kaggle 셀 예시:
     !git clone <이 레포 URL> ARD-VLA
     %cd ARD-VLA
@@ -58,11 +65,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-bf16", dest="use_bf16", action="store_false", help="bf16 autocast 끄기")
     parser.add_argument("--no-grad-checkpoint", dest="use_grad_checkpoint", action="store_false")
     parser.add_argument("--no-ard", dest="use_ard", action="store_false", help="ARD 없이 베이스 SmolVLA만 프로파일링")
+    parser.add_argument(
+        "--num-vlm-layers",
+        type=int,
+        default=16,
+        help="레이어 프루닝 적용 시 사용할 num_vlm_layers 값 (SmolVLAConfig 기본값과 동일)",
+    )
+    parser.add_argument(
+        "--layer-pruning-mode",
+        choices=["both", "pruned", "unpruned"],
+        default="both",
+        help=(
+            "'both'(기본)면 --num-vlm-layers로 자른 모델과 원본 레이어 수 그대로인 모델을 "
+            "둘 다 프로파일링해서 표를 두 개 출력한다. 'pruned'/'unpruned'면 그 중 하나만 실행한다."
+        ),
+    )
     parser.set_defaults(use_lora=True, use_bf16=True, use_grad_checkpoint=True, use_ard=True)
     return parser.parse_args()
 
 
-def build_policy(args) -> SmolVLAPolicy:
+def build_policy(args, layer_pruning: bool) -> SmolVLAPolicy:
     input_features = {
         "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(args.state_dim,)),
     }
@@ -80,6 +102,10 @@ def build_policy(args) -> SmolVLAPolicy:
         vlm_model_name=args.vlm_model_name,
         load_vlm_weights=True,  # 실제 사전학습 백본 — 메모리 프로파일링은 실제 가중치 기준이어야 의미 있음
         pretrained_path=args.vlm_model_name if args.use_lora else None,  # PEFT의 "from-scratch 경고" 통과용 — VLM 백본은 실제로 사전학습 가중치를 받으므로 사실과 부합
+        # num_vlm_layers <= 0이면 smolvlm_with_expert.py의 트림 로직(`if num_vlm_layers > 0`)이
+        # 아예 건너뛰어져서 원본 SmolLM2 레이어 수를 그대로 쓴다 — action expert도
+        # num_expert_layers=-1(기본)이라 VLM과 같은 레이어 수를 따라가므로 함께 커진다.
+        num_vlm_layers=args.num_vlm_layers if layer_pruning else 0,
         use_ard=args.use_ard,
         ard_arm_dim=args.ard_arm_dim,
         tokenizer_max_length=args.lang_seq_len,
@@ -143,24 +169,21 @@ def profile_one_batch_size(policy, run_forward_backward, batch_size: int) -> flo
     return peak_bytes / (1024**3)
 
 
-def main() -> None:
-    args = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+def run_layer_pruning_sweep(args, layer_pruning: bool) -> tuple[str, list[tuple[int, float | None, str | None]]]:
+    """레이어 프루닝 적용 여부 하나에 대해 정책을 새로 만들고 배치 사이즈 스윕을 전부 돈다.
 
-    if not torch.cuda.is_available():
-        raise SystemExit(
-            "CUDA GPU가 없습니다 — 이 스크립트는 torch.cuda.max_memory_allocated 기반이라 GPU가 필수입니다. "
-            "Colab/Kaggle에서 런타임을 GPU로 설정했는지 확인하세요."
-        )
+    두 모드(적용 O/X)는 모델 구조 자체가 다르므로(action expert 레이어 수까지 달라짐) 정책을
+    공유할 수 없어 매번 새로 빌드한다 — 끝나면 다음 모드를 위해 GPU 메모리를 명시적으로 비운다.
+    """
     device = torch.device("cuda")
-
-    logging.info(
-        "설정: LoRA=%s(r=%d) bf16=%s grad_checkpoint=%s ARD=%s chunk_size=%d action_dim=%d cameras=%d",
-        args.use_lora, args.lora_r, args.use_bf16, args.use_grad_checkpoint, args.use_ard,
-        args.chunk_size, args.action_dim, args.cameras,
+    policy = build_policy(args, layer_pruning=layer_pruning)
+    actual_num_vlm_layers = policy.model.vlm_with_expert.num_vlm_layers
+    label = (
+        f"레이어 프루닝 적용 O (num_vlm_layers={actual_num_vlm_layers})"
+        if layer_pruning
+        else f"레이어 프루닝 적용 X / 원본 레이어 수 그대로 (num_vlm_layers={actual_num_vlm_layers})"
     )
-
-    policy = build_policy(args)
+    logging.info("=== %s ===", label)
 
     if args.use_grad_checkpoint:
         # LoRA를 씌우기 전에 켠다 — gradient_checkpointing은 vlm_with_expert 자체의 플래그라
@@ -202,12 +225,49 @@ def main() -> None:
             logging.warning("batch_size=%d -> OOM (%s)", batch_size, str(e).splitlines()[0])
             torch.cuda.empty_cache()
 
+    del policy
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return label, results
+
+
+def print_results_table(label: str, results: list[tuple[int, float | None, str | None]]) -> None:
     print()
+    print(f"=== {label} ===")
     print(f"{'batch_size':>10} | {'peak memory (GB)':>16}")
     print("-" * 30)
     for batch_size, peak_gb, note in results:
         value = f"{peak_gb:.2f}" if peak_gb is not None else (note or "-")
         print(f"{batch_size:>10} | {value:>16}")
+
+
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    if not torch.cuda.is_available():
+        raise SystemExit(
+            "CUDA GPU가 없습니다 — 이 스크립트는 torch.cuda.max_memory_allocated 기반이라 GPU가 필수입니다. "
+            "Colab/Kaggle에서 런타임을 GPU로 설정했는지 확인하세요."
+        )
+
+    logging.info(
+        "설정: LoRA=%s(r=%d) bf16=%s grad_checkpoint=%s ARD=%s chunk_size=%d action_dim=%d cameras=%d layer_pruning_mode=%s",
+        args.use_lora, args.lora_r, args.use_bf16, args.use_grad_checkpoint, args.use_ard,
+        args.chunk_size, args.action_dim, args.cameras, args.layer_pruning_mode,
+    )
+
+    modes_to_run = []
+    if args.layer_pruning_mode in ("both", "pruned"):
+        modes_to_run.append(True)
+    if args.layer_pruning_mode in ("both", "unpruned"):
+        modes_to_run.append(False)
+
+    all_results = [run_layer_pruning_sweep(args, layer_pruning=mode) for mode in modes_to_run]
+
+    for label, results in all_results:
+        print_results_table(label, results)
 
 
 if __name__ == "__main__":
