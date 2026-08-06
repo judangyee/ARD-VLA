@@ -114,6 +114,19 @@ python scripts/train_ard.py \
 "앞 `ard_arm_dim`개=왼팔, 다음 `ard_arm_dim`개=오른팔"이라는 관례를 가정할 뿐, 데이터셋이
 실제로 그 순서인지는 검증하지 않습니다).
 
+`--vlm-layer-indices`로 VLM 레이어를 "앞쪽 N개"가 아니라 특정 인덱스 조합으로 구성해서 학습할
+수도 있습니다 — `scripts/layer_importance.py`가 코사인 유사도 기준으로 골라준 레이어들을 그대로
+넣는 식입니다:
+
+```bash
+python scripts/train_ard.py --dataset-repo-id <...> \
+    --vlm-layer-indices 2 3 4 7 8 9 10 11 12 14 15 16 20 21 25 26
+```
+
+먼저 `scripts/profile_memory.py --vlm-layer-indices ...`로 같은 조합이 메모리/빌드 문제없이
+도는지 확인해보는 걸 권장합니다 (이미 Colab GPU에서 검증된 경로입니다 — "메모리 프로파일링"
+절 참고).
+
 이 스크립트도 이 샌드박스에서는 end-to-end로 돌려보지 못했습니다(Hub 접근 차단) — 대신
 헬퍼 함수들(`split_policy_features`, `warn_if_action_layout_looks_wrong`)은 합성 데이터로
 직접 검증했고, import/인자 파싱도 확인했습니다. 실제 학습 루프 자체는 로컬 GPU 환경에서

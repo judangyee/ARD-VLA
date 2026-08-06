@@ -17,6 +17,13 @@
         --batch-size 32
 
 ARD를 끄고 베이스라인 SmolVLA만 학습하려면 --no-use-ard 를 추가한다.
+
+VLM 레이어를 "앞쪽 N개"가 아니라 특정 인덱스 조합으로 구성하려면(예: scripts/layer_importance.py가
+코사인 유사도 기준으로 골라준 레이어들) --vlm-layer-indices를 준다:
+    python scripts/train_ard.py --dataset-repo-id <...> \
+        --vlm-layer-indices 2 3 4 7 8 9 10 11 12 14 15 16 20 21 25 26
+먼저 scripts/profile_memory.py --vlm-layer-indices ...로 같은 조합이 메모리/빌드 문제없이
+도는지 확인해보는 걸 권장한다.
 """
 
 import argparse
@@ -53,6 +60,24 @@ def parse_args() -> argparse.Namespace:
         help="SmolVLM2 백본을 사전학습 가중치로 로드할지 여부 (False면 구조만 가져와서 처음부터 학습)",
     )
     parser.add_argument("--vlm-model-name", default="HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
+    parser.add_argument(
+        "--num-vlm-layers",
+        type=int,
+        default=16,
+        help="SmolLM2에서 앞쪽 몇 개 레이어만 쓸지 (기본 16, SmolVLAConfig 기본값과 동일). --vlm-layer-indices가 주어지면 무시된다.",
+    )
+    parser.add_argument(
+        "--vlm-layer-indices",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "'앞에서부터 --num-vlm-layers개'라는 기본 규칙 대신, 이 원본 레이어 인덱스 조합을 "
+            "그대로 써서 VLM을 구성한다 (예: scripts/layer_importance.py가 코사인 유사도 기준으로 "
+            "골라준 레이어들 — scripts/profile_memory.py --vlm-layer-indices ...로 먼저 메모리/빌드"
+            "가 정상인지 확인해보는 걸 권장한다). 주어지면 --num-vlm-layers는 무시된다."
+        ),
+    )
 
     ard_group = parser.add_argument_group("ARD")
     ard_group.add_argument("--use-ard", action=argparse.BooleanOptionalAction, default=True)
@@ -117,6 +142,8 @@ def main() -> None:
         device=args.device,
         vlm_model_name=args.vlm_model_name,
         load_vlm_weights=args.load_vlm_weights,
+        num_vlm_layers=args.num_vlm_layers,
+        vlm_layer_indices=args.vlm_layer_indices,
         use_ard=args.use_ard,
         ard_arm_dim=args.ard_arm_dim,
         ard_default_actuator_arm=args.ard_actuator_arm,
@@ -134,6 +161,11 @@ def main() -> None:
     policy = SmolVLAPolicy(config)
     policy.to(device)
     policy.train()
+
+    if args.vlm_layer_indices is not None:
+        logging.info("VLM 레이어 구성: 사용자 지정 인덱스 %s (n=%d)", sorted(args.vlm_layer_indices), policy.model.vlm_with_expert.num_vlm_layers)
+    else:
+        logging.info("VLM 레이어 구성: 앞쪽 %d개", policy.model.vlm_with_expert.num_vlm_layers)
 
     optimizer = config.get_optimizer_preset().build(policy.get_optim_params())
     scheduler = config.get_scheduler_preset().build(optimizer, args.steps)
