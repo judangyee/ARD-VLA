@@ -14,6 +14,12 @@ Colab/Kaggle 노트북 셀에 그대로 실행할 수 있도록 단일 파일로
 `-1`이라 VLM 레이어 수를 따라감) 훨씬 무겁고 OOM이 더 빨리 날 수 있다. `--layer-pruning-mode
 pruned`나 `unpruned`를 주면 그중 하나만 돌려서 시간을 아낄 수 있다.
 
+`--vlm-layer-indices`를 주면 "앞쪽 N개"라는 기본 규칙 대신 임의의 원본 레이어 인덱스 조합을
+그대로 써서 ARD-VLA를 빌드하고, "기본(pruned)" vs "사용자 지정(custom)" 두 표를 비교
+출력한다 (예: `scripts/layer_importance.py`가 코사인 유사도 기준으로 골라준 레이어들 —
+레이어 개수가 같으면 메모리 자체는 거의 그대로 나올 것으로 예상되지만, 그 구성으로 실제로
+문제없이 빌드/학습되는지 확인하는 용도다). 이때는 `--layer-pruning-mode`가 무시된다.
+
 Colab/Kaggle 셀 예시:
     !git clone <이 레포 URL> ARD-VLA
     %cd ARD-VLA
@@ -77,14 +83,27 @@ def parse_args() -> argparse.Namespace:
         default="both",
         help=(
             "'both'(기본)면 --num-vlm-layers로 자른 모델과 원본 레이어 수 그대로인 모델을 "
-            "둘 다 프로파일링해서 표를 두 개 출력한다. 'pruned'/'unpruned'면 그 중 하나만 실행한다."
+            "둘 다 프로파일링해서 표를 두 개 출력한다. 'pruned'/'unpruned'면 그 중 하나만 실행한다. "
+            "--vlm-layer-indices가 주어지면 이 옵션은 무시된다."
+        ),
+    )
+    parser.add_argument(
+        "--vlm-layer-indices",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "'앞에서부터 --num-vlm-layers개'라는 기본 규칙 대신, 이 원본 레이어 인덱스 조합을 "
+            "그대로 써서 ARD-VLA를 빌드한다 (예: scripts/layer_importance.py가 코사인 유사도 "
+            "기준으로 골라준 레이어들). 주어지면 --layer-pruning-mode 대신 '기본(pruned)' vs "
+            "'사용자 지정(custom)' 두 표를 비교해서 출력한다."
         ),
     )
     parser.set_defaults(use_lora=True, use_bf16=True, use_grad_checkpoint=True, use_ard=True)
     return parser.parse_args()
 
 
-def build_policy(args, layer_pruning: bool) -> SmolVLAPolicy:
+def build_policy(args, mode: str) -> SmolVLAPolicy:
     input_features = {
         "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(args.state_dim,)),
     }
@@ -94,6 +113,21 @@ def build_policy(args, layer_pruning: bool) -> SmolVLAPolicy:
         )
     output_features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(args.action_dim,))}
 
+    # mode="pruned": 기본 규칙(앞에서부터 num_vlm_layers개). mode="unpruned": 트림 없이 원본
+    # 레이어 수 그대로(num_vlm_layers<=0이면 smolvlm_with_expert.py의 트림 로직이 아예
+    # 건너뛰어짐 — action expert도 num_expert_layers=-1(기본)이라 VLM 레이어 수를 따라가며
+    # 함께 커진다). mode="custom": --vlm-layer-indices로 받은 임의의 레이어 인덱스 조합을
+    # 그대로 사용 (예: scripts/layer_importance.py의 중요도 기준 선택 결과).
+    if mode == "custom":
+        num_vlm_layers = args.num_vlm_layers
+        vlm_layer_indices = args.vlm_layer_indices
+    elif mode == "pruned":
+        num_vlm_layers = args.num_vlm_layers
+        vlm_layer_indices = None
+    else:
+        num_vlm_layers = 0
+        vlm_layer_indices = None
+
     config = SmolVLAConfig(
         input_features=input_features,
         output_features=output_features,
@@ -102,10 +136,8 @@ def build_policy(args, layer_pruning: bool) -> SmolVLAPolicy:
         vlm_model_name=args.vlm_model_name,
         load_vlm_weights=True,  # 실제 사전학습 백본 — 메모리 프로파일링은 실제 가중치 기준이어야 의미 있음
         pretrained_path=args.vlm_model_name if args.use_lora else None,  # PEFT의 "from-scratch 경고" 통과용 — VLM 백본은 실제로 사전학습 가중치를 받으므로 사실과 부합
-        # num_vlm_layers <= 0이면 smolvlm_with_expert.py의 트림 로직(`if num_vlm_layers > 0`)이
-        # 아예 건너뛰어져서 원본 SmolLM2 레이어 수를 그대로 쓴다 — action expert도
-        # num_expert_layers=-1(기본)이라 VLM과 같은 레이어 수를 따라가므로 함께 커진다.
-        num_vlm_layers=args.num_vlm_layers if layer_pruning else 0,
+        num_vlm_layers=num_vlm_layers,
+        vlm_layer_indices=vlm_layer_indices,
         use_ard=args.use_ard,
         ard_arm_dim=args.ard_arm_dim,
         tokenizer_max_length=args.lang_seq_len,
@@ -169,20 +201,21 @@ def profile_one_batch_size(policy, run_forward_backward, batch_size: int) -> flo
     return peak_bytes / (1024**3)
 
 
-def run_layer_pruning_sweep(args, layer_pruning: bool) -> tuple[str, list[tuple[int, float | None, str | None]]]:
-    """레이어 프루닝 적용 여부 하나에 대해 정책을 새로 만들고 배치 사이즈 스윕을 전부 돈다.
+def run_layer_pruning_sweep(args, mode: str) -> tuple[str, list[tuple[int, float | None, str | None]]]:
+    """레이어 선택 모드 하나에 대해 정책을 새로 만들고 배치 사이즈 스윕을 전부 돈다.
 
-    두 모드(적용 O/X)는 모델 구조 자체가 다르므로(action expert 레이어 수까지 달라짐) 정책을
-    공유할 수 없어 매번 새로 빌드한다 — 끝나면 다음 모드를 위해 GPU 메모리를 명시적으로 비운다.
+    mode마다 모델 구조 자체가 다르므로(action expert 레이어 수까지 달라짐) 정책을 공유할 수
+    없어 매번 새로 빌드한다 — 끝나면 다음 모드를 위해 GPU 메모리를 명시적으로 비운다.
     """
     device = torch.device("cuda")
-    policy = build_policy(args, layer_pruning=layer_pruning)
+    policy = build_policy(args, mode=mode)
     actual_num_vlm_layers = policy.model.vlm_with_expert.num_vlm_layers
-    label = (
-        f"레이어 프루닝 적용 O (num_vlm_layers={actual_num_vlm_layers})"
-        if layer_pruning
-        else f"레이어 프루닝 적용 X / 원본 레이어 수 그대로 (num_vlm_layers={actual_num_vlm_layers})"
-    )
+    if mode == "pruned":
+        label = f"기본 규칙: 앞쪽 num_vlm_layers={actual_num_vlm_layers}개"
+    elif mode == "unpruned":
+        label = f"레이어 프루닝 적용 X / 원본 레이어 수 그대로 (num_vlm_layers={actual_num_vlm_layers})"
+    else:
+        label = f"사용자 지정 레이어 인덱스 (n={actual_num_vlm_layers}): {sorted(args.vlm_layer_indices)}"
     logging.info("=== %s ===", label)
 
     if args.use_grad_checkpoint:
@@ -253,18 +286,24 @@ def main() -> None:
         )
 
     logging.info(
-        "설정: LoRA=%s(r=%d) bf16=%s grad_checkpoint=%s ARD=%s chunk_size=%d action_dim=%d cameras=%d layer_pruning_mode=%s",
+        "설정: LoRA=%s(r=%d) bf16=%s grad_checkpoint=%s ARD=%s chunk_size=%d action_dim=%d cameras=%d "
+        "layer_pruning_mode=%s vlm_layer_indices=%s",
         args.use_lora, args.lora_r, args.use_bf16, args.use_grad_checkpoint, args.use_ard,
-        args.chunk_size, args.action_dim, args.cameras, args.layer_pruning_mode,
+        args.chunk_size, args.action_dim, args.cameras, args.layer_pruning_mode, args.vlm_layer_indices,
     )
 
-    modes_to_run = []
-    if args.layer_pruning_mode in ("both", "pruned"):
-        modes_to_run.append(True)
-    if args.layer_pruning_mode in ("both", "unpruned"):
-        modes_to_run.append(False)
+    if args.vlm_layer_indices is not None:
+        # 사용자 지정 레이어 인덱스가 주어지면, --layer-pruning-mode는 무시하고 항상
+        # "기본(앞쪽 num_vlm_layers개)" vs "사용자 지정 인덱스"를 비교한다.
+        modes_to_run = ["pruned", "custom"]
+    else:
+        modes_to_run = []
+        if args.layer_pruning_mode in ("both", "pruned"):
+            modes_to_run.append("pruned")
+        if args.layer_pruning_mode in ("both", "unpruned"):
+            modes_to_run.append("unpruned")
 
-    all_results = [run_layer_pruning_sweep(args, layer_pruning=mode) for mode in modes_to_run]
+    all_results = [run_layer_pruning_sweep(args, mode=mode) for mode in modes_to_run]
 
     for label, results in all_results:
         print_results_table(label, results)

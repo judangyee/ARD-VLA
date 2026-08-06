@@ -69,6 +69,7 @@ class SmolVLMWithExpertModel(nn.Module):
         attention_mode: str = "self_attn",
         num_expert_layers: int = -1,
         num_vlm_layers: int = -1,
+        vlm_layer_indices: list[int] | None = None,
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
         device: str = "auto",
@@ -86,7 +87,24 @@ class SmolVLMWithExpertModel(nn.Module):
             config = AutoConfig.from_pretrained(model_id)
             self.vlm = SmolVLMForConditionalGeneration(config=config)
         self.processor = AutoProcessor.from_pretrained(model_id)
-        if num_vlm_layers > 0:
+        if vlm_layer_indices is not None:
+            # 기본 "앞에서부터 num_vlm_layers개" 대신, 임의의 원본 레이어 인덱스 조합을 그대로
+            # 골라 쓴다 (예: scripts/layer_importance.py의 코사인 유사도 기준 중요도 순위로
+            # 고른 레이어 집합). 상대적 깊이 순서를 보존하기 위해 오름차순으로 정렬해서 쓴다 —
+            # 원본 레이어가 학습된 깊이 순서를 벗어나면 위치별로 기대하는 표현 수준이 달라질 수
+            # 있기 때문이다.
+            original_layers = self.get_vlm_model().text_model.layers
+            sorted_indices = sorted(vlm_layer_indices)
+            if sorted_indices and (sorted_indices[0] < 0 or sorted_indices[-1] >= len(original_layers)):
+                raise ValueError(
+                    f"`vlm_layer_indices`는 0 이상 {len(original_layers) - 1} 이하여야 합니다 "
+                    f"(원본 VLM 레이어 수: {len(original_layers)}). 받은 값: {vlm_layer_indices}"
+                )
+            print(f"VLM 레이어를 사용자 지정 인덱스로 선택합니다: {sorted_indices} ...")
+            self.get_vlm_model().text_model.layers = nn.ModuleList(
+                [original_layers[i] for i in sorted_indices]
+            )
+        elif num_vlm_layers > 0:
             print(f"Reducing the number of VLM layers to {num_vlm_layers} ...")
             self.get_vlm_model().text_model.layers = self.get_vlm_model().text_model.layers[:num_vlm_layers]
         self.num_vlm_layers = len(self.get_vlm_model().text_model.layers)

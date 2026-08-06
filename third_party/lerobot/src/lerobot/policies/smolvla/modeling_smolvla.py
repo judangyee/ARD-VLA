@@ -600,6 +600,7 @@ class VLAFlowMatching(nn.Module):
             attention_mode=self.config.attention_mode,
             num_expert_layers=self.config.num_expert_layers,
             num_vlm_layers=self.config.num_vlm_layers,
+            vlm_layer_indices=self.config.vlm_layer_indices,
             self_attn_every_n_layers=self.config.self_attn_every_n_layers,
             expert_width_multiplier=self.config.expert_width_multiplier,
             device=self.config.device if self.config.device is not None else "auto",

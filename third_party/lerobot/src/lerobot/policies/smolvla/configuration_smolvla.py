@@ -97,6 +97,10 @@ class SmolVLAConfig(PreTrainedConfig):
 
     num_expert_layers: int = -1  # Less or equal to 0 is the default where the action expert has the same number of layers of VLM. Otherwise the expert have less layers.
     num_vlm_layers: int = 16  # Number of layers used in the VLM (first num_vlm_layers layers)
+    # `vlm_layer_indices`가 주어지면 "앞에서부터 num_vlm_layers개"라는 기본 규칙 대신 이 원본
+    # 레이어 인덱스 조합을 그대로 쓴다 (예: scripts/layer_importance.py의 코사인 유사도 기준
+    # 중요도 순위로 고른 레이어들). None이면 기존처럼 num_vlm_layers가 그대로 적용된다.
+    vlm_layer_indices: list[int] | None = None
     self_attn_every_n_layers: int = 2  # Interleave SA layers each self_attn_every_n_layers
     expert_width_multiplier: float = 0.75  # The action expert hidden size (wrt to the VLM)
 
@@ -137,6 +141,16 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+        if self.vlm_layer_indices is not None:
+            if len(self.vlm_layer_indices) == 0:
+                raise ValueError("`vlm_layer_indices`가 비어 있습니다 — 최소 1개 이상의 레이어 인덱스가 필요합니다.")
+            if len(set(self.vlm_layer_indices)) != len(self.vlm_layer_indices):
+                raise ValueError(f"`vlm_layer_indices`에 중복된 인덱스가 있습니다: {self.vlm_layer_indices}")
+            if any(i < 0 for i in self.vlm_layer_indices):
+                raise ValueError(f"`vlm_layer_indices`는 음수를 포함할 수 없습니다: {self.vlm_layer_indices}")
+            # 원본 VLM 레이어 수(예: 32)를 넘는 인덱스인지는 실제 모델을 로드해야 알 수 있어서
+            # (config 단계에선 Hub 접근 없이 알 수 없음) 여기서는 형식만 검증하고, 상한 체크는
+            # smolvlm_with_expert.py의 SmolVLMWithExpertModel.__init__에서 한다.
         if self.use_ard:
             if self.ard_arm_dim <= 0:
                 raise ValueError(f"`ard_arm_dim`은 양수여야 합니다. 현재 값: {self.ard_arm_dim}")
