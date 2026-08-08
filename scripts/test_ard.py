@@ -17,6 +17,7 @@ import torch
 
 from lerobot.policies.smolvla.ard import (
     AsymmetricResidualHeads,
+    GradNormLambdas,
     combine_by_role,
     compute_ard_losses,
     resolve_actuator_is_first,
@@ -166,12 +167,90 @@ def test_compute_ard_losses():
     check("force_target을 주면 force_loss가 0이 아니게 된다", with_force.force_loss.item() > 0.0)
 
 
+def test_gradnorm_lambdas():
+    torch.manual_seed(0)
+    gradnorm = GradNormLambdas(alpha=1.5, init_value=1.0)
+    check(
+        "GradNormLambdas 초기 weights는 [1,1,1]이고 합은 3이다",
+        torch.allclose(gradnorm.weights, torch.ones(3)) and gradnorm.weights.sum().item() == 3.0,
+    )
+
+    batch, chunk, arm_dim, hidden = 4, 10, 7, 16
+    actuator_is_first = resolve_actuator_is_first("right", batch_size=batch, device="cpu")
+    gradnorm_optimizer = torch.optim.Adam([gradnorm.weights], lr=0.05)
+
+    weights_before = gradnorm.weights.clone()
+    for _ in range(5):
+        shared = torch.randn(batch, chunk, hidden, requires_grad=True)
+        per_element_loss = shared[..., : 2 * arm_dim] ** 2
+        # 일부러 스케일을 다르게 줘서(스무스=크게, 궤적=작게) lambda가 실제로 움직이는지 확인한다.
+        stabilizer_pred = shared[..., :arm_dim] * 3.0
+        actuator_pred = shared[..., arm_dim : 2 * arm_dim] * 0.1
+
+        out = compute_ard_losses(
+            per_element_loss=per_element_loss,
+            stabilizer_pred=stabilizer_pred,
+            actuator_pred=actuator_pred,
+            actuator_is_first=actuator_is_first,
+            arm_dim=arm_dim,
+            alpha=0.3,
+            beta=0.7,
+            lambda_smooth=1.0,
+            lambda_force=1.0,
+            lambda_traj=1.0,
+            force_target=None,  # GradNorm이 force처럼 shared와 연결 안 된(상수 0) task도 안 죽고 버텨야 함
+            gradnorm=gradnorm,
+            shared_activation=shared,
+        )
+
+        # 순서 중요: 두 backward를 먼저 끝내고 나서(그래프가 아직 안 바뀐 상태), 옵티마이저 step을 밟는다.
+        gradnorm_optimizer.zero_grad()
+        out.grad_loss.backward(inputs=[gradnorm.weights], retain_graph=True)
+        out.total.backward()
+
+        gradnorm_optimizer.step()
+        gradnorm.renormalize()
+
+    check("gradnorm=... 을 주면 compute_ard_losses가 grad_loss를 반환한다", out.grad_loss is not None)
+    check("grad_loss는 유한한 스칼라값이다", torch.isfinite(out.grad_loss).item() and out.grad_loss.ndim == 0)
+    check(
+        "5스텝 뒤 GradNorm weights가 초기값(1,1,1)에서 실제로 움직인다",
+        not torch.allclose(gradnorm.weights, weights_before),
+        detail=f"weights={gradnorm.weights.tolist()}",
+    )
+    check(
+        "renormalize() 이후에도 weights 합은 항상 3(task 개수)으로 유지된다",
+        abs(gradnorm.weights.sum().item() - 3.0) < 1e-4,
+        detail=f"sum={gradnorm.weights.sum().item()}",
+    )
+    check(
+        "force_loss가 shared_activation과 연결 안 된(상수 0) 경우에도 crash 없이 동작한다",
+        out.force_loss.item() == 0.0,
+    )
+
+    # gradnorm이 아예 None이면(기존 고정 lambda 경로) grad_loss는 여전히 None이어야 한다 (하위호환).
+    fixed = compute_ard_losses(
+        per_element_loss=per_element_loss.detach(),
+        stabilizer_pred=stabilizer_pred.detach(),
+        actuator_pred=actuator_pred.detach(),
+        actuator_is_first=actuator_is_first,
+        arm_dim=arm_dim,
+        alpha=0.3,
+        beta=0.7,
+        lambda_smooth=1.0,
+        lambda_force=1.0,
+        lambda_traj=1.0,
+    )
+    check("gradnorm을 안 주면(기존 고정 lambda 방식) grad_loss는 None이다", fixed.grad_loss is None)
+
+
 def main():
     test_config_validation()
     test_resolve_actuator_is_first_is_fixed()
     test_split_combine_roundtrip()
     test_asymmetric_residual_heads_zero_init()
     test_compute_ard_losses()
+    test_gradnorm_lambdas()
 
     print()
     if FAILURES:

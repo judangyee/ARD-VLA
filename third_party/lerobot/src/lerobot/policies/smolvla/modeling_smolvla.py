@@ -66,6 +66,7 @@ from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.smolvla.ard import (
     ARD_FORCE_TARGET,
     AsymmetricResidualHeads,
+    GradNormLambdas,
     combine_by_role,
     compute_ard_losses,
     resolve_actuator_is_first,
@@ -277,6 +278,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 model_value.rtc_processor = self.rtc_processor
 
     def get_optim_params(self) -> dict:
+        if self.model.ard_gradnorm is not None:
+            # GradNorm의 lambda 파라미터는 메인 옵티마이저가 아니라 학습 루프가 별도로 관리하는
+            # 전용 옵티마이저로만 업데이트되어야 한다 (lerobot.policies.smolvla.ard.GradNormLambdas
+            # 참고) — 메인 total loss의 backward가 직접 건드리면 lambda가 그냥 0으로 수렴해버린다.
+            gradnorm_param_ids = {id(p) for p in self.model.ard_gradnorm.parameters()}
+            return (p for p in self.parameters() if id(p) not in gradnorm_param_ids)
         return self.parameters()
 
     def _get_action_chunk(
@@ -420,6 +427,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 lambda_force=self.config.ard_lambda_force,
                 lambda_traj=self.config.ard_lambda_traj,
                 force_target=force_target,
+                gradnorm=self.model.ard_gradnorm,
+                shared_activation=ard_extras["shared_activation"] if self.model.ard_gradnorm is not None else None,
             )
             loss = ard_out.total
             loss_dict["loss"] = loss.item()
@@ -429,6 +438,15 @@ class SmolVLAPolicy(PreTrainedPolicy):
             loss_dict["ard_smooth_loss"] = ard_out.smooth_loss.item()
             loss_dict["ard_force_loss"] = ard_out.force_loss.item()
             loss_dict["ard_traj_loss"] = ard_out.traj_loss.item()
+            if ard_out.grad_loss is not None:
+                # ard_grad_loss는 로깅용 float, ard_grad_loss_tensor는 학습 루프가 lambda 전용
+                # 옵티마이저로 별도 backward할 때 쓰는 살아있는(그래프 연결된) 텐서다 — 다른
+                # loss_dict 값들과 달리 .item()이 아니다. train_ard.py 참고.
+                loss_dict["ard_grad_loss"] = ard_out.grad_loss.item()
+                loss_dict["ard_grad_loss_tensor"] = ard_out.grad_loss
+                loss_dict["ard_lambda_smooth"] = self.model.ard_gradnorm.lambda_smooth.item()
+                loss_dict["ard_lambda_force"] = self.model.ard_gradnorm.lambda_force.item()
+                loss_dict["ard_lambda_traj"] = self.model.ard_gradnorm.lambda_traj.item()
             return loss, loss_dict
 
         # Default: return scalar mean loss
@@ -632,11 +650,14 @@ class VLAFlowMatching(nn.Module):
 
         # ARD: 비대칭 역할 분리 (자세한 내용은 lerobot.policies.smolvla.ard 참고)
         self.ard_heads = None
+        self.ard_gradnorm = None
         if self.config.use_ard:
             self.ard_heads = AsymmetricResidualHeads(
                 expert_hidden_size=self.vlm_with_expert.expert_hidden_size,
                 arm_dim=self.config.ard_arm_dim,
             )
+            if self.config.use_gradnorm:
+                self.ard_gradnorm = GradNormLambdas(alpha=self.config.gradnorm_alpha)
 
         # Compile model if requested
         if config.compile_model:
@@ -883,6 +904,9 @@ class VLAFlowMatching(nn.Module):
                 "actuator_is_first": actuator_is_first,
                 "stabilizer_pred": stabilizer_pred,
                 "actuator_pred": actuator_pred,
+                # GradNorm 전용: actuator/stabilizer head 바로 직전의 공유 표현 — action_out_proj와
+                # ard_heads가 둘 다 이 텐서를 입력으로 받는다. use_gradnorm=False면 안 쓰인다.
+                "shared_activation": suffix_out,
                 "per_element_loss": losses[..., : 2 * arm_dim],
             }
 

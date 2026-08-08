@@ -124,9 +124,17 @@ class SmolVLAConfig(PreTrainedConfig):
     ard_default_actuator_arm: str = "right"  # "left" 또는 "right"; 이 팔이 항상 Actuator 역할
     ard_alpha: float = 0.3  # Stabilizer 손실 가중치
     ard_beta: float = 0.7  # Actuator 손실 가중치
-    ard_lambda_smooth: float = 1.0  # Stabilizer 흔들림(smoothness) 페널티 가중치
-    ard_lambda_force: float = 1.0  # Actuator 힘 추적(force-tracking) 페널티 가중치
-    ard_lambda_traj: float = 1.0  # Actuator 궤적 스무딩(trajectory-smoothness) 페널티 가중치
+    ard_lambda_smooth: float = 1.0  # Stabilizer 흔들림(smoothness) 페널티 가중치 (use_gradnorm=True면 무시됨 — GradNorm은 항상 1.0에서 시작)
+    ard_lambda_force: float = 1.0  # Actuator 힘 추적(force-tracking) 페널티 가중치 (use_gradnorm=True면 무시됨 — GradNorm은 항상 1.0에서 시작)
+    ard_lambda_traj: float = 1.0  # Actuator 궤적 스무딩(trajectory-smoothness) 페널티 가중치 (use_gradnorm=True면 무시됨 — GradNorm은 항상 1.0에서 시작)
+
+    # --- GradNorm (Chen et al., 2018) — lambda_smooth/force/traj를 고정값 대신 자동 조정 ---
+    # 켜면 세 lambda가 nn.Parameter가 되어 매 스텝, "공유 표현"(actuator/stabilizer head
+    # 바로 직전의 suffix_out)에 각 정규화 항이 만드는 그래디언트 norm이 서로 균형 잡히도록
+    # 학습 루프가 별도로 업데이트한다 (lerobot.policies.smolvla.ard.GradNormLambdas 참고).
+    use_gradnorm: bool = False
+    gradnorm_alpha: float = 1.5  # GradNorm의 asymmetry 하이퍼파라미터 (논문 기본값)
+    gradnorm_lr: float = 0.025  # lambda 전용 옵티마이저 학습률 (메인 옵티마이저와 별개)
 
     def __post_init__(self):
         super().__post_init__()
@@ -164,6 +172,8 @@ class SmolVLAConfig(PreTrainedConfig):
                     f"`ard_default_actuator_arm`은 'left' 또는 'right'여야 합니다. "
                     f"현재 값: {self.ard_default_actuator_arm!r}"
                 )
+        if self.use_gradnorm and not self.use_ard:
+            raise ValueError("`use_gradnorm`은 `use_ard=True`일 때만 의미가 있습니다.")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

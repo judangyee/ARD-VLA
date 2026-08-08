@@ -24,6 +24,12 @@ VLM 레이어를 "앞쪽 N개"가 아니라 특정 인덱스 조합으로 구성
         --vlm-layer-indices 2 3 4 7 8 9 10 11 12 14 15 16 20 21 25 26
 먼저 scripts/profile_memory.py --vlm-layer-indices ...로 같은 조합이 메모리/빌드 문제없이
 도는지 확인해보는 걸 권장한다.
+
+lambda_smooth/force/traj를 고정값(기본 1.0) 대신 GradNorm(Chen et al., 2018)으로 매 스텝
+자동 조정하려면 --use-gradnorm을 준다:
+    python scripts/train_ard.py --dataset-repo-id <...> --use-gradnorm --gradnorm-alpha 1.5
+자세한 구현은 lerobot.policies.smolvla.ard.GradNormLambdas 참고. --ard-lambda-* 값은 이
+모드에서는 무시된다(항상 1.0에서 시작).
 """
 
 import argparse
@@ -85,9 +91,17 @@ def parse_args() -> argparse.Namespace:
     ard_group.add_argument("--ard-actuator-arm", default="right", choices=["left", "right"])
     ard_group.add_argument("--ard-alpha", type=float, default=0.3, help="Stabilizer 손실 가중치")
     ard_group.add_argument("--ard-beta", type=float, default=0.7, help="Actuator 손실 가중치")
-    ard_group.add_argument("--ard-lambda-smooth", type=float, default=1.0)
-    ard_group.add_argument("--ard-lambda-force", type=float, default=1.0)
-    ard_group.add_argument("--ard-lambda-traj", type=float, default=1.0)
+    ard_group.add_argument("--ard-lambda-smooth", type=float, default=1.0, help="--use-gradnorm이면 무시됨 (GradNorm은 항상 1.0에서 시작)")
+    ard_group.add_argument("--ard-lambda-force", type=float, default=1.0, help="--use-gradnorm이면 무시됨 (GradNorm은 항상 1.0에서 시작)")
+    ard_group.add_argument("--ard-lambda-traj", type=float, default=1.0, help="--use-gradnorm이면 무시됨 (GradNorm은 항상 1.0에서 시작)")
+    ard_group.add_argument(
+        "--use-gradnorm",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="lambda_smooth/force/traj를 고정값 대신 GradNorm(Chen et al., 2018)으로 매 스텝 자동 조정한다.",
+    )
+    ard_group.add_argument("--gradnorm-alpha", type=float, default=1.5, help="GradNorm asymmetry 하이퍼파라미터 (논문 기본값)")
+    ard_group.add_argument("--gradnorm-lr", type=float, default=0.025, help="lambda 전용 옵티마이저 학습률")
 
     return parser.parse_args()
 
@@ -152,6 +166,9 @@ def main() -> None:
         ard_lambda_smooth=args.ard_lambda_smooth,
         ard_lambda_force=args.ard_lambda_force,
         ard_lambda_traj=args.ard_lambda_traj,
+        use_gradnorm=args.use_gradnorm,
+        gradnorm_alpha=args.gradnorm_alpha,
+        gradnorm_lr=args.gradnorm_lr,
     )
     device = torch.device(config.device)
     logging.info("device=%s use_ard=%s", device, config.use_ard)
@@ -169,6 +186,18 @@ def main() -> None:
 
     optimizer = config.get_optimizer_preset().build(policy.get_optim_params())
     scheduler = config.get_scheduler_preset().build(optimizer, args.steps)
+
+    gradnorm_optimizer = None
+    if config.use_gradnorm:
+        # 반드시 policy.to(device) 이후에 만든다 — GradNormLambdas는 일부러 자기 옵티마이저를
+        # 갖지 않는다(모듈 생성 시점에 옵티마이저를 만들면 .to(device)가 파라미터 텐서를
+        # 바꿔치기했을 때 옵티마이저가 옛 텐서를 참조하는 채로 남는 문제가 생긴다).
+        gradnorm_optimizer = torch.optim.Adam([policy.model.ard_gradnorm.weights], lr=config.gradnorm_lr)
+        logging.info(
+            "GradNorm 활성화: alpha=%.2f lr=%.4f (lambda_smooth/force/traj 전부 1.0에서 시작해 자동 조정됨 — "
+            "--ard-lambda-* 값은 무시됨)",
+            config.gradnorm_alpha, config.gradnorm_lr,
+        )
 
     dataloader = DataLoader(
         dataset,
@@ -192,12 +221,26 @@ def main() -> None:
         batch = preprocessor(batch)
         loss, loss_dict = policy.forward(batch)
 
+        grad_loss = loss_dict.pop("ard_grad_loss_tensor", None)  # 살아있는 텐서라 로깅 전에 빼둔다
+
+        # 순서가 중요하다: GradNorm의 grad_loss.backward()와 메인 loss.backward()를 *둘 다*
+        # 먼저 끝낸 뒤에야 옵티마이저 step을 밟는다. gradnorm_optimizer.step()/renormalize()가
+        # lambda 파라미터를 in-place로 바꾸는데, 그게 먼저 일어나면 메인 loss의 그래프가
+        # (그 안에서 lambda를 detach해서 참조하고 있으므로) "in-place로 바뀐 값" 에러를 낸다.
+        if gradnorm_optimizer is not None and grad_loss is not None:
+            gradnorm_optimizer.zero_grad()
+            grad_loss.backward(inputs=[policy.model.ard_gradnorm.weights], retain_graph=True)
+
         optimizer.zero_grad()
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), config.optimizer_grad_clip_norm)
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
+
+        if gradnorm_optimizer is not None and grad_loss is not None:
+            gradnorm_optimizer.step()
+            policy.model.ard_gradnorm.renormalize()
 
         if step == 1 or step % args.log_every == 0:
             msg = f"step {step}/{args.steps}  loss={loss_dict['loss']:.4f}  grad_norm={float(grad_norm):.3f}"
@@ -208,6 +251,12 @@ def main() -> None:
                     f"  smooth={loss_dict['ard_smooth_loss']:.4f}"
                     f"  force={loss_dict['ard_force_loss']:.4f}"
                     f"  traj={loss_dict['ard_traj_loss']:.4f}"
+                )
+            if config.use_gradnorm:
+                msg += (
+                    f"  grad_loss={loss_dict['ard_grad_loss']:.4f}"
+                    f"  lambda(s/f/t)={loss_dict['ard_lambda_smooth']:.3f}/"
+                    f"{loss_dict['ard_lambda_force']:.3f}/{loss_dict['ard_lambda_traj']:.3f}"
                 )
             logging.info(msg)
 

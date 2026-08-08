@@ -103,6 +103,99 @@ def combine_by_role(stabilizer: Tensor, actuator: Tensor, actuator_is_first: Ten
     return left, right
 
 
+class GradNormLambdas(nn.Module):
+    """GradNorm(Chen et al., 2018)으로 lambda_smooth/force/traj를 학습 중에 자동 조정한다.
+
+    핵심 아이디어: 세 정규화 항(smooth/force/traj)이 "공유 표현"(actuator/stabilizer head
+    바로 직전의 `suffix_out` — 액션 전문가 트랜스포머 출력, action_out_proj와 ard_heads가
+    둘 다 이 텐서를 입력으로 받는다)에 만드는 그래디언트의 크기(norm)를 서로 균형 잡히게
+    맞춘다. 학습 초반보다 유난히 느리게 줄어드는(=상대적으로 여전히 큰) 항일수록 그래디언트
+    norm 목표치를 더 크게 잡아서, 해당 lambda가 커지도록 유도한다.
+
+    중요: lambda(`self.weights`)는 반드시 이 클래스가 만드는 `compute_grad_loss()`의 반환값
+    (L_grad)으로만 업데이트되어야 한다 — 메인 total loss의 backward로 직접 업데이트되게 두면
+    lambda는 그냥 0으로 수렴해버린다(그래야 해당 항의 기여가 사라져서 total이 작아지므로).
+    그래서 `compute_ard_losses()`는 total loss를 만들 때 `gradnorm.lambda_*`를 항상
+    `.detach()`해서 쓴다 — 실제 파라미터 업데이트는 학습 루프가 별도 옵티마이저로
+    `compute_grad_loss()`의 결과를 가지고 수행한다 (train_ard.py 참고). 이 클래스 자체는
+    옵티마이저를 갖지 않는다 — `nn.Module.to(device)`가 파라미터의 실제 텐서를 바꿔치기하는데,
+    모듈 안에서 미리 만든 옵티마이저는 그 변화를 모르고 옛 텐서를 계속 참조하게 되는 흔한
+    버그를 피하기 위함이다.
+    """
+
+    def __init__(self, alpha: float = 1.5, init_value: float = 1.0):
+        super().__init__()
+        self.alpha = alpha
+        self.task_names = ("smooth", "force", "traj")
+        self.weights = nn.Parameter(torch.full((len(self.task_names),), float(init_value)))
+        self.register_buffer("initial_losses", torch.zeros(len(self.task_names)))
+        self.register_buffer("initialized", torch.tensor(False))
+
+    @property
+    def lambda_smooth(self) -> Tensor:
+        return self.weights[0]
+
+    @property
+    def lambda_force(self) -> Tensor:
+        return self.weights[1]
+
+    @property
+    def lambda_traj(self) -> Tensor:
+        return self.weights[2]
+
+    def compute_grad_loss(self, task_losses: list[Tensor], shared_activation: Tensor) -> Tensor:
+        """GradNorm 손실(L_grad)을 계산한다 — `self.weights`에 대해서만 미분 가능하도록 만들어졌다
+        (학습 루프에서 `grad_loss.backward(inputs=[self.weights], ...)`로 다른 파라미터는 건드리지
+        않고 lambda만 업데이트한다).
+
+        task_losses: [smooth_loss, force_loss, traj_loss] — 그래프가 살아있는(detach 안 된) 값.
+        shared_activation: 공유 표현(예: suffix_out). requires_grad=True여야 하고, 이 텐서까지
+            거슬러 올라가는 계산 그래프가 아직 free되지 않은 상태여야 한다(즉 이 함수를 호출하는
+            시점의 forward pass 도중 — retain_graph로 나중에 메인 loss.backward()도 그래프를
+            재사용할 수 있게 해줘야 한다).
+        """
+        task_losses = list(task_losses)
+        if len(task_losses) != len(self.weights):
+            raise ValueError(
+                f"task_losses는 {len(self.weights)}개(smooth/force/traj)여야 합니다. 받은 개수: {len(task_losses)}"
+            )
+
+        if not bool(self.initialized):
+            self.initial_losses = torch.stack([loss.detach() for loss in task_losses])
+            self.initialized.fill_(True)
+
+        grad_norms = []
+        for weight, loss in zip(self.weights, task_losses, strict=True):
+            weighted = weight * loss
+            # allow_unused=True: force_target이 없으면 force_loss는 shared_activation과 연결되지
+            # 않은 상수 0(actuator_pred.new_zeros(()))이라 그래프에 아예 안 잡힌다 — 그럴 때
+            # autograd.grad는 기본적으로 에러를 내므로, "그 항은 그래디언트가 0"으로 명시적으로
+            # 처리한다 (실제로 그 항이 shared_activation에 아무 영향을 안 준다는 뜻이므로 맞는 처리).
+            (grad,) = torch.autograd.grad(
+                weighted, shared_activation, retain_graph=True, create_graph=True, allow_unused=True
+            )
+            if grad is None:
+                grad = torch.zeros_like(shared_activation)
+            grad_norms.append(grad.norm(2))
+        grad_norms = torch.stack(grad_norms)  # self.weights에 대해 미분 가능
+
+        with torch.no_grad():
+            current_losses = torch.stack([loss.detach() for loss in task_losses])
+            loss_ratios = current_losses / self.initial_losses.clamp_min(1e-8)
+            inverse_train_rates = loss_ratios / loss_ratios.mean().clamp_min(1e-8)
+            target_grad_norms = grad_norms.mean().detach() * inverse_train_rates.pow(self.alpha)
+
+        return (grad_norms - target_grad_norms).abs().sum()
+
+    def renormalize(self) -> None:
+        """GradNorm 논문의 표준 스텝: lambda 업데이트 뒤 합이 항상 태스크 개수(=3)가 되도록
+        재정규화한다 — 안 그러면 옵티마이저가 그냥 전부 줄여버려서 L_grad를 트리비얼하게
+        낮출 수 있다. `torch.optim.Optimizer.step()` 직후 학습 루프에서 호출해야 한다."""
+        with torch.no_grad():
+            self.weights.clamp_(min=1e-3)
+            self.weights.mul_(len(self.weights) / self.weights.sum())
+
+
 @dataclass
 class ARDLossOutput:
     total: Tensor
@@ -112,6 +205,7 @@ class ARDLossOutput:
     smooth_loss: Tensor
     force_loss: Tensor
     traj_loss: Tensor
+    grad_loss: Tensor | None = None  # GradNorm 활성화 시에만 채워짐 (ARD-VLA 학습 루프가 별도로 backward)
 
 
 def compute_ard_losses(
@@ -126,6 +220,8 @@ def compute_ard_losses(
     lambda_force: float,
     lambda_traj: float,
     force_target: Tensor | None = None,
+    gradnorm: GradNormLambdas | None = None,
+    shared_activation: Tensor | None = None,
 ) -> ARDLossOutput:
     """베이스 flow-matching 회귀 손실에 ARD의 역할별 정규화 항들을 결합한다.
 
@@ -143,7 +239,12 @@ def compute_ard_losses(
         대용값(proxy)이다.
     actuator_is_first: (batch,) bool, `resolve_actuator_is_first`가 반환한 값 — `per_element_loss`를
         `stabilizer_pred`/`actuator_pred`와 동일한 방식으로 라우팅하기 위해 필요하다.
+    gradnorm / shared_activation: 둘 다 주어지면 `lambda_smooth`/`lambda_force`/`lambda_traj`
+        인자 대신 `gradnorm.lambda_*`(GradNorm으로 학습되는 값)를 쓴다. `gradnorm`만 주고
+        `shared_activation`을 안 주면 에러 — GradNorm 그래디언트 norm 계산에 반드시 필요하다.
     """
+    if gradnorm is not None and shared_activation is None:
+        raise ValueError("gradnorm을 쓰려면 shared_activation(예: suffix_out)도 같이 넘겨야 합니다.")
     stab_pos_per_elem, act_pos_per_elem = split_by_role(per_element_loss, arm_dim, actuator_is_first)
     stab_pos_loss = stab_pos_per_elem.mean()
     act_pos_loss = act_pos_per_elem.mean()
@@ -174,8 +275,22 @@ def compute_ard_losses(
     else:
         force_loss = actuator_pred.new_zeros(())
 
-    stab_loss = stab_pos_loss + lambda_smooth * smooth_loss
-    act_loss = act_pos_loss + lambda_force * force_loss + lambda_traj * traj_loss
+    grad_loss = None
+    if gradnorm is not None:
+        # GradNorm이 학습한 lambda로 total loss를 만든다 — 반드시 detach해서 쓴다: 안 그러면
+        # total.backward()가 lambda 파라미터에도 직접 그래디언트를 흘려서(해당 항의 손실을
+        # 줄이려고 lambda를 그냥 0으로 밀어버리는 방향), GradNorm의 "그래디언트 norm을
+        # 맞춘다"는 목적과 별개로 lambda가 오염된다. 진짜 업데이트는 아래 compute_grad_loss()가
+        # 만드는 grad_loss로만 (학습 루프가 별도 옵티마이저로) 수행되어야 한다.
+        used_lambda_smooth = gradnorm.lambda_smooth.detach()
+        used_lambda_force = gradnorm.lambda_force.detach()
+        used_lambda_traj = gradnorm.lambda_traj.detach()
+        grad_loss = gradnorm.compute_grad_loss([smooth_loss, force_loss, traj_loss], shared_activation)
+    else:
+        used_lambda_smooth, used_lambda_force, used_lambda_traj = lambda_smooth, lambda_force, lambda_traj
+
+    stab_loss = stab_pos_loss + used_lambda_smooth * smooth_loss
+    act_loss = act_pos_loss + used_lambda_force * force_loss + used_lambda_traj * traj_loss
     total = alpha * stab_loss + beta * act_loss
 
     return ARDLossOutput(
@@ -186,4 +301,5 @@ def compute_ard_losses(
         smooth_loss=smooth_loss.detach(),
         force_loss=force_loss.detach(),
         traj_loss=traj_loss.detach(),
+        grad_loss=grad_loss,
     )
