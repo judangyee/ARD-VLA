@@ -528,13 +528,20 @@ class SmolVLMWithExpertModel(nn.Module):
                 att_out = att_output[:, start:end]
                 out_emb = layer.self_attn.o_proj(att_out)
 
-                out_emb += hidden_states
+                # in-place(+=)가 아니라 새 텐서를 만드는 +를 쓴다: o_proj가 bitsandbytes로
+                # 양자화된 레이어(Linear4bit/Linear8bitLt)일 때, 그 출력은 커스텀 autograd
+                # Function이 만든 텐서라서 in-place 덧셈을 하면 (1) dtype이 uint8/byte로 잡혀
+                # "result type Float can't be cast to the desired output type Byte"가 나거나,
+                # (2) gradient checkpointing과 겹치면 "A view was created in no_grad mode and is
+                # being modified inplace..." 에러가 난다 (실제 GPU에서 재현/확인함). out-of-place
+                # 덧셈은 매번 새 텐서를 만들어서 이 문제를 피한다 — 값은 수학적으로 동일하다.
+                out_emb = out_emb + hidden_states
                 after_first_residual = out_emb.clone()
 
                 out_emb = layer.post_attention_layernorm(out_emb)
                 out_emb = layer.mlp(out_emb)
 
-                out_emb += after_first_residual
+                out_emb = out_emb + after_first_residual
 
                 outputs_embeds.append(out_emb)
 

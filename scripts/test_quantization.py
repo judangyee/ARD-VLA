@@ -136,8 +136,8 @@ def test_lora_target_regex_includes_quantized_backbone():
 
 def test_known_cpu_limitations():
     """bitsandbytes 4bit/8bit이 CPU에서 실제로 어떻게 동작(실패/애매하게 동작)하는지 직접
-    재현해서 기록해둔다. bitsandbytes가 설치돼 있지 않으면 건너뛴다 (기본 requirements에는
-    없는 무거운 선택적 의존성)."""
+    재현해서 기록해둔다 — 레이어를 일부러 어떤 device로도 옮기지 않고 그대로 쓴다 (기본
+    device가 CPU이므로). bitsandbytes가 설치돼 있지 않으면 건너뛴다."""
     try:
         import bitsandbytes as bnb
     except ImportError:
@@ -191,23 +191,76 @@ def test_known_cpu_limitations():
     )
 
 
+def test_real_gpu_behavior():
+    """CUDA가 실제로 있으면(이 샌드박스에서는 항상 없음, GPU 환경에서만 의미가 있다) 레이어를
+    진짜 .cuda()로 옮겨서 bitsandbytes의 실제 목적지 경로를 확인한다 — 위 CPU 테스트와 대구를
+    이룬다: 거기서 "안 되거나 애매했던" 것들이 진짜 GPU에서는 실제로 되는지 직접 확인."""
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        print("[SKIP] bitsandbytes가 설치돼 있지 않아 GPU 동작 테스트를 건너뜁니다.")
+        return
+    if not torch.cuda.is_available():
+        print("[SKIP] CUDA GPU가 없어 GPU 동작 테스트를 건너뜁니다.")
+        return
+
+    device = torch.device("cuda")
+
+    # 1) Linear4bit: GPU에서는 forward가 실제로 성공하고, gradient도 입력까지 흘러야 한다
+    #    (LoRA 어댑터가 옆에 붙어서 학습되는 실제 QLoRA 상황을 흉내).
+    layer4 = bnb.nn.Linear4bit(16, 8, bias=False, compute_dtype=torch.float16).to(device)
+    x4 = torch.randn(2, 16, device=device, requires_grad=True)
+    out4 = layer4(x4)
+    check(
+        "GPU: Linear4bit forward가 실제로 성공한다 (CPU에서는 AssertionError였음)",
+        out4.shape == (2, 8) and torch.isfinite(out4).all().item(),
+    )
+    out4.sum().backward()
+    check(
+        "GPU: Linear4bit을 통과해 입력까지 gradient가 흐른다",
+        x4.grad is not None and x4.grad.abs().sum().item() > 0,
+    )
+
+    # 2) Linear8bitLt: GPU에서는 SCB(양자화 스케일)가 실제로 채워지는지 (CPU에서는 계속 None이었음).
+    #    순서 중요: 원하는 가중치를 먼저 CPU에서 채워 넣고, 그 다음에 .to(device)해야
+    #    quantize가 그 값 기준으로 일어난다 (반대로 하면 무작위 초기값이 양자화돼버림).
+    torch.manual_seed(0)
+    ref = torch.nn.Linear(16, 8, bias=False)
+    layer8 = bnb.nn.Linear8bitLt(16, 8, bias=False, has_fp16_weights=False)
+    with torch.no_grad():
+        layer8.weight.data.copy_(ref.weight.data)
+    layer8 = layer8.to(device)
+
+    check(
+        "GPU: Linear8bitLt는 .to(device) 시점에 바로 양자화된다 (SCB가 채워짐)",
+        layer8.weight.SCB is not None,
+    )
+    out8 = layer8(torch.randn(4, 16, device=device))
+    check("GPU: Linear8bitLt forward가 정상적으로 돈다", out8.shape == (4, 8) and torch.isfinite(out8).all().item())
+
+
 def main():
     test_build_bnb_config()
     test_config_validation()
     test_memory_estimation()
     test_lora_target_regex_includes_quantized_backbone()
     test_known_cpu_limitations()
+    test_real_gpu_behavior()
 
     print()
     if FAILURES:
         print(f"[FAIL] {len(FAILURES)}개 항목 실패: {FAILURES}")
         sys.exit(1)
     print("[OK] 양자화(QLoRA) 단위 테스트 전체 통과.")
-    print(
-        "참고: 실제 4bit/8bit forward/backward 자체(진짜 양자화된 행렬곱)는 bitsandbytes가 CUDA "
-        "커널에 의존해서 이 환경(GPU 없음)에서는 검증할 수 없습니다 — test_known_cpu_limitations()가 "
-        "그 한계 자체를 재현해서 기록해뒀습니다. 실제 GPU 환경에서 처음 돌릴 때 검증이 필요합니다."
-    )
+    if torch.cuda.is_available():
+        print("CUDA GPU가 감지되어 test_real_gpu_behavior()가 실제로 4bit/8bit forward/backward를 실행했습니다.")
+    else:
+        print(
+            "참고: 실제 4bit/8bit forward/backward 자체(진짜 양자화된 행렬곱)는 bitsandbytes가 CUDA "
+            "커널에 의존해서 GPU가 없는 이 환경에서는 검증할 수 없습니다 — test_known_cpu_limitations()가 "
+            "그 한계 자체를 재현해서 기록해뒀습니다. GPU가 있는 환경에서 돌리면 test_real_gpu_behavior()가 "
+            "자동으로 실제 검증까지 수행합니다."
+        )
 
 
 if __name__ == "__main__":
