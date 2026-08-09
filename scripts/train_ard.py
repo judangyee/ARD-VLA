@@ -30,6 +30,19 @@ lambda_smooth/force/traj를 고정값(기본 1.0) 대신 GradNorm(Chen et al., 2
     python scripts/train_ard.py --dataset-repo-id <...> --use-gradnorm --gradnorm-alpha 1.5
 자세한 구현은 lerobot.policies.smolvla.ard.GradNormLambdas 참고. --ard-lambda-* 값은 이
 모드에서는 무시된다(항상 1.0에서 시작).
+
+기본적으로 QLoRA 스타일 4bit 양자화(--quantization 기본값 "4bit")로 VLM 백본을 얼려서
+로드하고 LoRA 어댑터(--use-lora 기본 켜짐)만 학습한다 — bitsandbytes로 GPU 메모리를
+아끼면서 파인튜닝하려는 게 기본 시나리오이기 때문이다. 필요하면 껄 수 있다:
+    python scripts/train_ard.py --dataset-repo-id <...> --quantization none --no-lora
+`pip install`할 때 `quantization` extra가 필요하다: `pip install -e "third_party/lerobot[quantization]"`.
+
+**실측(Colab GPU, 이 레포에서 확인함) 주의**: 4bit/8bit 양자화는 배치 사이즈가 작을 때만
+peak memory를 뚜렷하게 줄인다(배치=1에서 4bit 약 -17~26%). 배치가 커질수록(활성화 메모리가
+지배적이 되면서) 절감 효과가 줄어들다가, 8bit은 배치 32에서 오히려 bf16보다 최대 +23% 더
+많은 메모리를 쓴다(README의 "QLoRA 스타일 백본 양자화" 절 참고). VRAM이 빠듯해서 배치를
+작게 잡아야 하는 상황에서 가장 효과적이고, 배치를 크게 돌릴 수 있는 GPU라면 굳이 켤 이유가
+없을 수 있다.
 """
 
 import argparse
@@ -103,6 +116,35 @@ def parse_args() -> argparse.Namespace:
     ard_group.add_argument("--gradnorm-alpha", type=float, default=1.5, help="GradNorm asymmetry 하이퍼파라미터 (논문 기본값)")
     ard_group.add_argument("--gradnorm-lr", type=float, default=0.025, help="lambda 전용 옵티마이저 학습률")
 
+    qlora_group = parser.add_argument_group("QLoRA (bitsandbytes 백본 양자화 + LoRA)")
+    qlora_group.add_argument(
+        "--quantization",
+        choices=["none", "4bit", "8bit"],
+        default="4bit",
+        help=(
+            "기본값 '4bit': bitsandbytes로 VLM 백본을 양자화해서 얼리고 LoRA만 학습하는 QLoRA "
+            "스타일로 빌드한다. 'none'이면 양자화 없이 bf16 그대로 전체(또는 --use-lora면 "
+            "action expert만) 학습한다."
+        ),
+    )
+    qlora_group.add_argument("--bnb-4bit-quant-type", default="nf4", choices=["nf4", "fp4"])
+    qlora_group.add_argument(
+        "--no-bnb-4bit-double-quant", dest="bnb_4bit_use_double_quant", action="store_false"
+    )
+    qlora_group.add_argument(
+        "--use-lora",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "기본 켜짐: policy.wrap_with_peft()로 LoRA 어댑터를 붙인다. --quantization이 "
+            "'none'이 아니면 이게 꺼져 있으면 얼려진 백본이 아예 학습에 안 낀다(QLoRA 취지에 "
+            "안 맞음 — 정상 동작이지만 권장하지 않음)."
+        ),
+    )
+    qlora_group.add_argument("--lora-r", type=int, default=8)
+    qlora_group.add_argument("--lora-alpha", type=int, default=16)
+    parser.set_defaults(bnb_4bit_use_double_quant=True)
+
     return parser.parse_args()
 
 
@@ -150,12 +192,16 @@ def main() -> None:
     if args.use_ard:
         warn_if_action_layout_looks_wrong(dataset, args.ard_arm_dim)
 
+    quantization = None if args.quantization == "none" else args.quantization
     config = SmolVLAConfig(
         input_features=input_features,
         output_features=output_features,
         device=args.device,
         vlm_model_name=args.vlm_model_name,
         load_vlm_weights=args.load_vlm_weights,
+        # wrap_with_peft()의 "from-scratch 경고"를 통과시키는 용도 — LoRA를 쓸 땐 실제로
+        # 사전학습 가중치 위에서 파인튜닝하는 것이므로 사실과 부합한다.
+        pretrained_path=args.vlm_model_name if args.use_lora else None,
         num_vlm_layers=args.num_vlm_layers,
         vlm_layer_indices=args.vlm_layer_indices,
         use_ard=args.use_ard,
@@ -169,15 +215,38 @@ def main() -> None:
         use_gradnorm=args.use_gradnorm,
         gradnorm_alpha=args.gradnorm_alpha,
         gradnorm_lr=args.gradnorm_lr,
+        quantization=quantization,
+        bnb_4bit_quant_type=args.bnb_4bit_quant_type,
+        bnb_4bit_use_double_quant=args.bnb_4bit_use_double_quant,
     )
     device = torch.device(config.device)
-    logging.info("device=%s use_ard=%s", device, config.use_ard)
+    logging.info(
+        "device=%s use_ard=%s quantization=%s use_lora=%s", device, config.use_ard, quantization, args.use_lora
+    )
 
     preprocessor, postprocessor = make_smolvla_pre_post_processors(config, dataset_stats=dataset.meta.stats)
 
     policy = SmolVLAPolicy(config)
     policy.to(device)
     policy.train()
+
+    if args.use_lora:
+        # peft.get_peft_model()이 대상 서브모듈을 in-place로 교체하므로(peft 표준 동작),
+        # 반환값(peft_model)을 따로 안 쓰고 이후에도 `policy` 참조를 그대로 forward/backward에
+        # 쓸 수 있다. 양자화가 켜져 있으면 _get_default_peft_targets()가 VLM 백본의 q/v_proj도
+        # LoRA 타겟에 자동으로 포함시킨다 (modeling_smolvla.py 참고).
+        peft_model = policy.wrap_with_peft(peft_cli_overrides={"r": args.lora_r, "lora_alpha": args.lora_alpha})
+        if hasattr(peft_model, "print_trainable_parameters"):
+            peft_model.print_trainable_parameters()
+
+        if args.use_ard:
+            # 기본 LoRA 타겟에는 ARD의 stabilizer_head/actuator_head가 없어서, wrap_with_peft()가
+            # 전체를 얼린 뒤 이 head들도 같이 얼어붙는다 — 다시 학습 가능하게 풀어준다.
+            n = 0
+            for p in policy.model.ard_heads.parameters():
+                p.requires_grad_(True)
+                n += p.numel()
+            logging.info("LoRA 적용 후 AsymmetricResidualHeads %d개 파라미터를 다시 학습 가능하게 풀었습니다.", n)
 
     if args.vlm_layer_indices is not None:
         logging.info("VLM 레이어 구성: 사용자 지정 인덱스 %s (n=%d)", sorted(args.vlm_layer_indices), policy.model.vlm_with_expert.num_vlm_layers)
