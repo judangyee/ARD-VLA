@@ -136,6 +136,15 @@ class SmolVLAConfig(PreTrainedConfig):
     gradnorm_alpha: float = 1.5  # GradNorm의 asymmetry 하이퍼파라미터 (논문 기본값)
     gradnorm_lr: float = 0.025  # lambda 전용 옵티마이저 학습률 (메인 옵티마이저와 별개)
 
+    # --- EfficientVLA(Yang et al., 2025)식 Task-Relevance/Diversity 비전 토큰 프루닝 ---
+    # 켜면 프레임당 비전 토큰(pixel shuffle 직후, 보통 64개)을 언어 지시문과의 cross-attention
+    # 관련성 점수 기준으로 token_pruning_k_final개까지 줄인다 — 상위 token_pruning_k_key개는
+    # 무조건 남기고(핵심 세트), 나머지는 절반 관련성/절반 다양성(코사인 거리 최대)으로 채운다.
+    # lerobot.policies.smolvla.token_pruning 참고.
+    use_token_pruning: bool = False
+    token_pruning_k_final: int = 32  # 프레임당 최종 비전 토큰 수 (실험용 — 32/48/64 등으로 바꿔가며 비교)
+    token_pruning_k_key: int = 6  # 무조건 남기는 핵심(최고 관련성) 토큰 수, 논문 권장 4~8
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -174,6 +183,11 @@ class SmolVLAConfig(PreTrainedConfig):
                 )
         if self.use_gradnorm and not self.use_ard:
             raise ValueError("`use_gradnorm`은 `use_ard=True`일 때만 의미가 있습니다.")
+        if self.use_token_pruning:
+            if self.token_pruning_k_final <= 0:
+                raise ValueError(f"`token_pruning_k_final`은 양수여야 합니다. 현재 값: {self.token_pruning_k_final}")
+            if self.token_pruning_k_key <= 0:
+                raise ValueError(f"`token_pruning_k_key`는 양수여야 합니다. 현재 값: {self.token_pruning_k_key}")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

@@ -74,6 +74,7 @@ from lerobot.policies.smolvla.ard import (
 )
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
+from lerobot.policies.smolvla.token_pruning import compute_task_relevance_scores, select_tokens
 from lerobot.policies.utils import (
     populate_queues,
 )
@@ -697,6 +698,13 @@ class VLAFlowMatching(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
+
+        # 비전 토큰 프루닝(EfficientVLA식)을 쓰려면 이미지별로 관련성을 매길 때 언어 임베딩이
+        # 필요하므로, 원래 이 루프 다음에 하던 embed_language_tokens() 호출을 여기로 당겨온다 —
+        # 순수 함수라 호출 위치만 바뀔 뿐 결과는 같고, 아래쪽 lang_emb 정규화/append 순서는
+        # 그대로 유지해서 프리픽스 시퀀스 레이아웃(이미지... -> 언어 -> state)이 안 바뀌게 한다.
+        lang_emb_raw = self.vlm_with_expert.embed_language_tokens(lang_tokens)
+
         for _img_idx, (
             img,
             img_mask,
@@ -717,7 +725,15 @@ class VLAFlowMatching(nn.Module):
                 pad_masks.append(image_start_mask)
 
             img_emb = self.vlm_with_expert.embed_image(img)
-            img_emb = img_emb
+
+            if self.config.use_token_pruning:
+                relevance = compute_task_relevance_scores(img_emb, lang_emb_raw, lang_masks)
+                img_emb, _ = select_tokens(
+                    img_emb,
+                    relevance,
+                    k_final=self.config.token_pruning_k_final,
+                    k_key=self.config.token_pruning_k_key,
+                )
 
             # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]
@@ -744,10 +760,9 @@ class VLAFlowMatching(nn.Module):
                 embs.append(image_end_token)
                 pad_masks.append(image_end_mask)
                 att_masks += [0] * (image_end_mask.shape[1])
-        lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
-        # Normalize language embeddings
-        lang_emb_dim = lang_emb.shape[-1]
-        lang_emb = lang_emb * math.sqrt(lang_emb_dim)
+        # Normalize language embeddings (lang_emb_raw는 루프 시작 전에 이미 계산해둔 값 재사용)
+        lang_emb_dim = lang_emb_raw.shape[-1]
+        lang_emb = lang_emb_raw * math.sqrt(lang_emb_dim)
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
