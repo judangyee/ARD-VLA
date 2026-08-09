@@ -61,6 +61,24 @@ def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
     return hidden_dim
 
 
+def _resolve_linear_input_dtype(current_dtype: torch.dtype, linear: nn.Module) -> torch.dtype:
+    """linear의 weight dtype에 안전하게 맞출 수 있으면 그 dtype을, 아니면(weight가 uint8/int8로
+    양자화된 저장 형식이면) 원래 dtype을 그대로 반환한다.
+
+    bitsandbytes로 양자화된 레이어(Linear4bit/Linear8bitLt, peft로 LoRA를 씌운 것 포함)의
+    `.weight.dtype`은 실제 행렬곱에 쓰는 dtype이 아니라 압축 저장 형식이다 (4bit는 uint8에
+    두 개씩 packing, 8bit는 int8). 이걸 그대로 활성화(activation) 텐서에 캐스팅하면 그 값이
+    attention 행렬곱까지 전파되어 "baddbmm_cuda not implemented for Byte/Char"로 깨진다.
+    이 레이어들은 forward 시 입력을 알아서 자기 compute_dtype으로 캐스팅하므로(bitsandbytes가
+    자체적으로 "inputs will be cast from ... during quantization" 경고를 남기는 것으로 확인함),
+    그런 경우엔 원래 dtype을 그대로 유지해서 레이어에게 맡긴다.
+    """
+    weight_dtype = linear.weight.dtype
+    if weight_dtype in (torch.uint8, torch.int8):
+        return current_dtype
+    return weight_dtype
+
+
 class SmolVLMWithExpertModel(nn.Module):
     def __init__(
         self,
@@ -283,7 +301,9 @@ class SmolVLMWithExpertModel(nn.Module):
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
 
-            hidden_states = hidden_states.to(dtype=layer.self_attn.q_proj.weight.dtype)
+            hidden_states = hidden_states.to(
+                dtype=_resolve_linear_input_dtype(hidden_states.dtype, layer.self_attn.q_proj)
+            )
             query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
             key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
             value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
@@ -368,7 +388,9 @@ class SmolVLMWithExpertModel(nn.Module):
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
 
-            hidden_states = hidden_states.to(dtype=layer.self_attn.q_proj.weight.dtype)
+            hidden_states = hidden_states.to(
+                dtype=_resolve_linear_input_dtype(hidden_states.dtype, layer.self_attn.q_proj)
+            )
             query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
             key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
             value_states = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
@@ -409,19 +431,21 @@ class SmolVLMWithExpertModel(nn.Module):
             expert_input_shape = expert_hidden_states.shape[:-1]
             expert_hidden_shape = (*expert_input_shape, -1, expert_layer.self_attn.head_dim)
 
-            expert_hidden_states = expert_hidden_states.to(dtype=expert_layer.self_attn.q_proj.weight.dtype)
+            expert_hidden_states = expert_hidden_states.to(
+                dtype=_resolve_linear_input_dtype(expert_hidden_states.dtype, expert_layer.self_attn.q_proj)
+            )
             expert_query_state = expert_layer.self_attn.q_proj(expert_hidden_states).view(expert_hidden_shape)
 
-            _key_states = key_states.to(dtype=expert_layer.self_attn.k_proj.weight.dtype).view(
-                *key_states.shape[:2], -1
-            )
+            _key_states = key_states.to(
+                dtype=_resolve_linear_input_dtype(key_states.dtype, expert_layer.self_attn.k_proj)
+            ).view(*key_states.shape[:2], -1)
             expert_key_states = expert_layer.self_attn.k_proj(_key_states).view(
                 *_key_states.shape[:-1], -1, expert_layer.self_attn.head_dim
             )  # k_proj should have same dim as kv
 
-            _value_states = value_states.to(dtype=expert_layer.self_attn.v_proj.weight.dtype).view(
-                *value_states.shape[:2], -1
-            )
+            _value_states = value_states.to(
+                dtype=_resolve_linear_input_dtype(value_states.dtype, expert_layer.self_attn.v_proj)
+            ).view(*value_states.shape[:2], -1)
             expert_value_states = expert_layer.self_attn.v_proj(_value_states).view(
                 *_value_states.shape[:-1], -1, expert_layer.self_attn.head_dim
             )
@@ -523,8 +547,9 @@ class SmolVLMWithExpertModel(nn.Module):
                     continue
                 end = start + hidden_states.shape[1]
 
-                if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
-                    att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+                _o_proj_input_dtype = _resolve_linear_input_dtype(att_output.dtype, layer.self_attn.o_proj)
+                if att_output.dtype != _o_proj_input_dtype:
+                    att_output = att_output.to(_o_proj_input_dtype)
                 att_out = att_output[:, start:end]
                 out_emb = layer.self_attn.o_proj(att_out)
 
