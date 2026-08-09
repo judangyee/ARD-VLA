@@ -442,7 +442,10 @@ implemented for Byte/Char`로 crash — 양자화된 레이어는 어차피 입�
 CPU에서는 애초에 재현이 안 돼서(4bit는 CPU에서 아예 안 돌고, 8bit도 CPU에선 검증 불가 회색
 지대라서) 실제 GPU 실행으로만 드러났습니다.
 
-레이어 프루닝 적용(`num_vlm_layers=16`) 기준:
+![QLoRA 백본 양자화 Colab GPU 실측 메모리 비교표 — 레이어 프루닝 적용/미적용, 배치 1~32에서 bf16/4bit/8bit peak GPU memory와 bf16 대비 변화율](docs/images/quant_memory_table.png)
+
+아래는 위 이미지와 동일한 내용을 텍스트 표로 옮긴 것입니다 (레이어 프루닝 적용,
+`num_vlm_layers=16` 기준):
 
 | batch | bf16(양자화 없음) | 4bit | 4bit 변화율 | 8bit | 8bit 변화율 |
 |---|---|---|---|---|---|
