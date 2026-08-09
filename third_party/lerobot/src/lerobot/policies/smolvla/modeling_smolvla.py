@@ -541,6 +541,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
             "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
         )
         target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
+        if self.config.quantization is not None:
+            # QLoRA 스타일: 실제로 양자화되어 얼려지는 건 VLM 백본(text_model)이지 action expert가
+            # 아니다 — 기본 타겟에 text_model의 attention projection도 추가하지 않으면, 양자화해서
+            # 얼린 백본은 이 정책에서 아예 학습에 참여하지 못하게 된다(action expert만 미세조정됨).
+            target_modules = (
+                target_modules[:-1] + r"|model\.vlm_with_expert\.vlm\.model\.text_model\.layers\.\d+\.self_attn\.(q|v)_proj)"
+            )
         return {
             "target_modules": target_modules,
             "modules_to_save": [],
@@ -622,6 +629,10 @@ class VLAFlowMatching(nn.Module):
             vlm_layer_indices=self.config.vlm_layer_indices,
             self_attn_every_n_layers=self.config.self_attn_every_n_layers,
             expert_width_multiplier=self.config.expert_width_multiplier,
+            quantization=self.config.quantization,
+            bnb_4bit_quant_type=self.config.bnb_4bit_quant_type,
+            bnb_4bit_use_double_quant=self.config.bnb_4bit_use_double_quant,
+            bnb_4bit_compute_dtype=self.config.bnb_4bit_compute_dtype,
             device=self.config.device if self.config.device is not None else "auto",
         )
         self.state_proj = nn.Linear(

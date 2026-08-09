@@ -380,6 +380,58 @@ K_final=32/48/64 각각 5스텝 돌려 확인했습니다 — 전부 정상 종�
 작동한다**는 것만 증명하며, "실제로 태스크 관련 토큰을 골라내는지"는 사전학습된 진짜 SmolVLM2
 가중치로만 확인할 수 있습니다 — GPU/Hub 접근이 생기면 재확인이 필요합니다.
 
+## QLoRA 스타일 백본 양자화 (`quantization="4bit"/"8bit"`, bitsandbytes)
+
+VLM 백본을 4bit/8bit로 양자화해서 얼리고 LoRA 어댑터만 원래 정밀도로 학습하는 QLoRA
+(Dettmers et al., 2023) 패턴입니다. `SmolVLAConfig(quantization="4bit", load_vlm_weights=True)`
+로 켜면 `SmolVLMWithExpertModel.__init__`이 `transformers.BitsAndBytesConfig`를 만들어
+`AutoModelForImageTextToText.from_pretrained(..., quantization_config=...)`에 넘기고,
+`peft.prepare_model_for_kbit_training()`으로 QLoRA 표준 준비 단계(LayerNorm fp32 캐스팅,
+입력에 requires_grad 훅)를 거칩니다. `wrap_with_peft()`의 기본 LoRA 타겟도 양자화가 켜지면
+VLM 백본(`vlm_with_expert.vlm.model.text_model.layers.*.self_attn.(q|v)_proj`)까지 포함하도록
+넓어집니다 — 안 그러면 얼려진 백본은 이 정책에서 아예 학습에 참여하지 못합니다
+(`lerobot/policies/smolvla/quantization.py`, `configuration_smolvla.py`의
+`quantization`/`bnb_4bit_*` 필드, `modeling_smolvla.py` 참고).
+
+**중요한 제약, 이 샌드박스에서 직접 확인함**: bitsandbytes의 4bit/8bit은 CUDA 커널에 의존합니다.
+- `bnb.nn.Linear4bit`은 CPU에서 forward 자체가 `AssertionError`로 실패합니다 — 확실하고
+  재현 가능한 제약입니다. QLoRA는 정확히는 4bit(NF4)를 가리키므로 이게 가장 중요합니다.
+- `bnb.nn.Linear8bitLt`는 CPU에서 forward가 에러 없이 돌고 weight도 실제로 `int8`로
+  바뀌지만, GPU 경로의 표준 양자화 검증 속성(`weight.SCB`/`weight.CB`)이 CPU에서는 계속
+  `None`이라 "제대로 양자화됐다"고 확신할 수 없는 회색지대입니다 — "확실히 된다"도 "확실히
+  안 된다"도 아닙니다.
+
+그래서 `scripts/test_quantization.py`(오프라인, bitsandbytes 설치 여부와 무관하게 30개
+통과)는 GPU 없이도 검증 가능한 부분만 실제로 실행해서 확인합니다: `BitsAndBytesConfig` 구성,
+config 검증, 메모리 이론값 계산, 그리고 **위 두 CPU 한계 현상 자체를 재현하는 테스트**.
+추가로 소형 합성 SmolVLM 백본(`AutoModelForImageTextToText.from_pretrained`까지 몽키패치—
+실제 압축은 못 하지만 `quantization_config`가 실제로 거기까지 전달되는지, LoRA가 진짜로
+백본에 붙는지는 확인 가능)으로 `quantization="8bit"` + `wrap_with_peft()`를 실제
+`SmolVLAPolicy.forward()` 경로로 5스텝 돌려서, 백본 파라미터는 전부 얼려진 채(학습 가능한
+백본 파라미터 0개) LoRA 파라미터만 학습되고 loss가 유한하게 나오는 것까지 확인했습니다 —
+이 과정에서 처음 작성한 LoRA 타겟 정규식에 경로 오타(`vlm_with_expert.vlm.text_model`이어야
+하는데 실제로는 `vlm_with_expert.vlm.model.text_model`, 중간에 `.model.`이 하나 더 있음)가
+있어서 백본이 전혀 LoRA 적용을 못 받던 실제 버그를 이 검증 과정에서 잡아 고쳤습니다.
+
+**450M 파라미터(SmolVLM2 백본) 기준 이론적 메모리 절감 추정치** (활성화/옵티마이저 상태/LoRA
+어댑터 자체는 제외, 정지된 백본 가중치 저장 용량만):
+
+| dtype | bytes/param (bits/param) | 총 크기 | bf16 대비 절감률 |
+|---|---|---|---|
+| fp32 | 4.0 (32) | 1.68 GB | (기준 아님, 참고용) |
+| bf16/fp16 (현재 기본값) | 2.0 (16) | 0.84 GB | 0% (기준) |
+| 8bit (LLM.int8()) | 1.0 (8) | 0.42 GB | **50.0%** |
+| 4bit NF4 (double quant 없이) | 0.5625 (4.5) | 0.24 GB | **71.9%** |
+| 4bit NF4 + double quant | ~0.516 (~4.127) | 0.22 GB | **74.2%** |
+
+8bit/4bit 수치는 텐서/행 단위 스케일 오버헤드를 무시한 근사(8bit)와 QLoRA 논문(Dettmers et
+al., 2023)이 보고한 block_size=64 기준 실측 bits/param(4bit)을 그대로 쓴 것입니다 —
+`lerobot/policies/smolvla/quantization.py`의 `summarize_quantization_savings()`로 재현
+가능합니다. **주의**: 이건 백본 가중치 저장 용량만의 절감이고, 활성화 메모리(배치/시퀀스
+길이에 비례, `profile_memory.py`에서 이미 확인했듯 실제로 큰 비중을 차지함)나 action
+expert의 메모리는 전혀 줄지 않습니다 — 실측은 실제 GPU 환경에서 `profile_memory.py`류
+스크립트로 확인이 필요합니다.
+
 ## Layout
 
 - `requirements.txt` — research tooling installed on top of lerobot (notebook/plotting deps). torch and lerobot itself are installed by `scripts/install.sh`, not listed here.

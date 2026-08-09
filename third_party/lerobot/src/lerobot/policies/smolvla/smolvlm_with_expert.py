@@ -25,6 +25,8 @@ from transformers import (
     SmolVLMForConditionalGeneration,
 )
 
+from lerobot.policies.smolvla.quantization import build_bnb_config
+
 
 def apply_rope(x, positions, max_wavelength=10_000):
     """
@@ -72,18 +74,47 @@ class SmolVLMWithExpertModel(nn.Module):
         vlm_layer_indices: list[int] | None = None,
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
+        quantization: str | None = None,
+        bnb_4bit_quant_type: str = "nf4",
+        bnb_4bit_use_double_quant: bool = True,
+        bnb_4bit_compute_dtype: str = "bfloat16",
         device: str = "auto",
     ):
         super().__init__()
+        quantization_config = build_bnb_config(
+            quantization,
+            bnb_4bit_quant_type=bnb_4bit_quant_type,
+            bnb_4bit_use_double_quant=bnb_4bit_use_double_quant,
+            bnb_4bit_compute_dtype=bnb_4bit_compute_dtype,
+        )
         if load_vlm_weights:
             print(f"Loading  {model_id} weights ...")
             self.vlm = AutoModelForImageTextToText.from_pretrained(
                 model_id,
-                torch_dtype="bfloat16",
+                # 양자화 로드일 땐 torch_dtype을 강제하지 않는다 — bnb_4bit_compute_dtype이
+                # 실제 행렬곱 시 역양자화 dtype을 따로 통제하고, 양자화 안 되는 나머지 부분
+                # (LayerNorm 등)은 transformers가 알아서 적절히 처리한다 (QLoRA 표준 로드 방식).
+                torch_dtype=None if quantization_config is not None else "bfloat16",
                 low_cpu_mem_usage=True,
+                quantization_config=quantization_config,
             )
+            if quantization_config is not None:
+                # QLoRA 표준 준비 단계: LayerNorm을 fp32로 캐스팅, 입력 임베딩에
+                # requires_grad 훅을 걸어 얼려진(양자화된) 앞쪽 레이어를 통과해도 그래디언트가
+                # 끊기지 않게 한다. use_gradient_checkpointing=False인 이유: 이 클래스의
+                # forward()는 표준 per-layer 호출을 우회하는 커스텀 인터리브 루프라
+                # gradient_checkpointing_enable()(smolvlm_with_expert.py에 이미 별도로 구현됨)로
+                # 따로 켜야 하고, 여기서 peft가 vlm 자체에 거는 체크포인팅과 중복/충돌하면 안 된다.
+                from peft import prepare_model_for_kbit_training
+
+                self.vlm = prepare_model_for_kbit_training(self.vlm, use_gradient_checkpointing=False)
             config = self.vlm.config
         else:
+            if quantization_config is not None:
+                raise ValueError(
+                    "`quantization`은 `load_vlm_weights=True`일 때만 의미가 있습니다 (SmolVLAConfig가 "
+                    "이미 이걸 검증하지만, 이 클래스를 직접 쓰는 스크립트를 위해 여기서도 한 번 더 막는다)."
+                )
             config = AutoConfig.from_pretrained(model_id)
             self.vlm = SmolVLMForConditionalGeneration(config=config)
         self.processor = AutoProcessor.from_pretrained(model_id)
