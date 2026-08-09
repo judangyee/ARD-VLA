@@ -20,19 +20,11 @@ pruned`나 `unpruned`를 주면 그중 하나만 돌려서 시간을 아낄 수 
 레이어 개수가 같으면 메모리 자체는 거의 그대로 나올 것으로 예상되지만, 그 구성으로 실제로
 문제없이 빌드/학습되는지 확인하는 용도다). 이때는 `--layer-pruning-mode`가 무시된다.
 
-`--quantization 4bit`(또는 `8bit`)를 주면 bitsandbytes로 백본을 양자화해서 얼리고 LoRA만
-학습하는 QLoRA 스타일로 빌드한다 — 이 스크립트는 GPU가 필수라서, 실제 CUDA 커널로 4bit/8bit이
-검증되는 유일한 곳이다(`lerobot.policies.smolvla.quantization` 참고. CPU에서는 4bit는 아예
-안 돌고 8bit도 검증 불가능한 회색지대였다 — README의 "QLoRA 스타일 백본 양자화" 절 참고).
-`pip install`할 때 `quantization` extra가 추가로 필요하다.
-
 Colab/Kaggle 셀 예시:
     !git clone <이 레포 URL> ARD-VLA
     %cd ARD-VLA
-    !pip install -e "third_party/lerobot[smolvla,peft,quantization]"
+    !pip install -e "third_party/lerobot[smolvla,peft]"
     !python scripts/profile_memory.py
-    !python scripts/profile_memory.py --quantization 4bit
-    !python scripts/profile_memory.py --quantization 8bit
 
 주의 — 이 스크립트는 이 프로젝트를 만든 샌드박스에 GPU와 Hugging Face Hub 접근이 둘 다
 없어서 실제로 실행해보지 못했다. 아래는 검증한 것과 못 한 것이다:
@@ -107,20 +99,7 @@ def parse_args() -> argparse.Namespace:
             "'사용자 지정(custom)' 두 표를 비교해서 출력한다."
         ),
     )
-    parser.add_argument(
-        "--quantization",
-        choices=["none", "4bit", "8bit"],
-        default="none",
-        help=(
-            "'none'(기본)이면 양자화 없이 bf16 그대로. '4bit'/'8bit'이면 bitsandbytes로 백본을 "
-            "양자화해서 얼리고 LoRA만 학습하는 QLoRA 스타일로 빌드한다 — 이 스크립트는 GPU가 "
-            "필수이므로 4bit/8bit이 실제로(진짜 CUDA 커널로) 검증되는 유일한 곳이다. "
-            "--no-lora와 같이 쓰면 양자화된 백본이 아예 학습에 안 낀다(정상 동작이지만 QLoRA 취지는 아님)."
-        ),
-    )
-    parser.add_argument("--bnb-4bit-quant-type", default="nf4", choices=["nf4", "fp4"])
-    parser.add_argument("--no-bnb-4bit-double-quant", dest="bnb_4bit_use_double_quant", action="store_false")
-    parser.set_defaults(use_lora=True, use_bf16=True, use_grad_checkpoint=True, use_ard=True, bnb_4bit_use_double_quant=True)
+    parser.set_defaults(use_lora=True, use_bf16=True, use_grad_checkpoint=True, use_ard=True)
     return parser.parse_args()
 
 
@@ -162,9 +141,6 @@ def build_policy(args, mode: str) -> SmolVLAPolicy:
         use_ard=args.use_ard,
         ard_arm_dim=args.ard_arm_dim,
         tokenizer_max_length=args.lang_seq_len,
-        quantization=None if args.quantization == "none" else args.quantization,
-        bnb_4bit_quant_type=args.bnb_4bit_quant_type,
-        bnb_4bit_use_double_quant=args.bnb_4bit_use_double_quant,
         device="cuda",
     )
     policy = SmolVLAPolicy(config)
@@ -311,10 +287,9 @@ def main() -> None:
 
     logging.info(
         "설정: LoRA=%s(r=%d) bf16=%s grad_checkpoint=%s ARD=%s chunk_size=%d action_dim=%d cameras=%d "
-        "layer_pruning_mode=%s vlm_layer_indices=%s quantization=%s",
+        "layer_pruning_mode=%s vlm_layer_indices=%s",
         args.use_lora, args.lora_r, args.use_bf16, args.use_grad_checkpoint, args.use_ard,
         args.chunk_size, args.action_dim, args.cameras, args.layer_pruning_mode, args.vlm_layer_indices,
-        args.quantization,
     )
 
     if args.vlm_layer_indices is not None:

@@ -97,32 +97,17 @@ python scripts/test_ard.py
 
 lerobot의 범용 학습 CLI(`lerobot_train.py`)는 모든 정책을 알아야 하는 `policies/factory.py`에
 의존해서 트림할 때 같이 지웠습니다. 대신 `scripts/train_ard.py`가 SmolVLA 하나만 아는 최소
-학습 루프입니다: `LeRobotDataset` 로드 → `SmolVLAConfig`/`SmolVLAPolicy` 생성 → (기본 켜짐)
-QLoRA 4bit 양자화 + LoRA 어댑터 부착 → optimizer/scheduler 빌드 → 학습 루프 → 주기적
-체크포인트 저장. `use_ard=True`일 때는 `ard_stabilizer_loss` 등 손실 breakdown도 함께
-로깅됩니다.
+학습 루프입니다: `LeRobotDataset` 로드 → `SmolVLAConfig`/`SmolVLAPolicy` 생성 → optimizer/
+scheduler 빌드 → 학습 루프 → 주기적 체크포인트 저장. `use_ard=True`일 때는 `ard_stabilizer_loss`
+등 손실 breakdown도 함께 로깅됩니다.
 
 ```bash
-pip install -e "third_party/lerobot[quantization]"
 python scripts/train_ard.py \
     --dataset-repo-id <HF_USER>/<DATASET> \
     --output-dir outputs/ard_run1 \
     --steps 20000 \
     --batch-size 32
 ```
-
-**기본값이 QLoRA입니다**: `--quantization`은 기본 `"4bit"`, `--use-lora`는 기본 켜짐이라
-아무 옵션 없이 실행하면 VLM 백본을 bitsandbytes 4bit(NF4)로 양자화해서 얼리고, LoRA
-어댑터(및 `use_ard=True`면 ARD head)만 학습합니다. 꺼야 한다면:
-
-```bash
-python scripts/train_ard.py --dataset-repo-id <...> --quantization none --no-lora
-```
-
-배치 사이즈가 작을 때(VRAM이 빠듯할 때) 가장 효과적이고, 배치를 크게 돌릴 수 있는 GPU라면
-실측상 이득이 적거나 없을 수 있습니다 — 아래 "QLoRA 스타일 백본 양자화" 절의 실측 비교표
-참고. `--lora-r`/`--lora-alpha`로 LoRA rank를, `--bnb-4bit-quant-type {nf4,fp4}`/
-`--no-bnb-4bit-double-quant`로 양자화 세부 옵션을 조정할 수 있습니다.
 
 `--no-use-ard`를 주면 ARD 없이 베이스라인 SmolVLA만 학습합니다. 시작할 때 액션 채널의
 왼팔/오른팔 예상 순서를 출력해주니, 실제 로봇 배선과 맞는지 눈으로 한 번 확인하세요 (ARD는
@@ -395,111 +380,12 @@ K_final=32/48/64 각각 5스텝 돌려 확인했습니다 — 전부 정상 종�
 작동한다**는 것만 증명하며, "실제로 태스크 관련 토큰을 골라내는지"는 사전학습된 진짜 SmolVLM2
 가중치로만 확인할 수 있습니다 — GPU/Hub 접근이 생기면 재확인이 필요합니다.
 
-## QLoRA 스타일 백본 양자화 (`quantization="4bit"/"8bit"`, bitsandbytes)
-
-VLM 백본을 4bit/8bit로 양자화해서 얼리고 LoRA 어댑터만 원래 정밀도로 학습하는 QLoRA
-(Dettmers et al., 2023) 패턴입니다. `SmolVLAConfig(quantization="4bit", load_vlm_weights=True)`
-로 켜면 `SmolVLMWithExpertModel.__init__`이 `transformers.BitsAndBytesConfig`를 만들어
-`AutoModelForImageTextToText.from_pretrained(..., quantization_config=...)`에 넘기고,
-`peft.prepare_model_for_kbit_training()`으로 QLoRA 표준 준비 단계(LayerNorm fp32 캐스팅,
-입력에 requires_grad 훅)를 거칩니다. `wrap_with_peft()`의 기본 LoRA 타겟도 양자화가 켜지면
-VLM 백본(`vlm_with_expert.vlm.model.text_model.layers.*.self_attn.(q|v)_proj`)까지 포함하도록
-넓어집니다 — 안 그러면 얼려진 백본은 이 정책에서 아예 학습에 참여하지 못합니다
-(`lerobot/policies/smolvla/quantization.py`, `configuration_smolvla.py`의
-`quantization`/`bnb_4bit_*` 필드, `modeling_smolvla.py` 참고).
-
-**중요한 제약, 이 샌드박스에서 직접 확인함**: bitsandbytes의 4bit/8bit은 CUDA 커널에 의존합니다.
-- `bnb.nn.Linear4bit`은 CPU에서 forward 자체가 `AssertionError`로 실패합니다 — 확실하고
-  재현 가능한 제약입니다. QLoRA는 정확히는 4bit(NF4)를 가리키므로 이게 가장 중요합니다.
-- `bnb.nn.Linear8bitLt`는 CPU에서 forward가 에러 없이 돌고 weight도 실제로 `int8`로
-  바뀌지만, GPU 경로의 표준 양자화 검증 속성(`weight.SCB`/`weight.CB`)이 CPU에서는 계속
-  `None`이라 "제대로 양자화됐다"고 확신할 수 없는 회색지대입니다 — "확실히 된다"도 "확실히
-  안 된다"도 아닙니다.
-
-그래서 `scripts/test_quantization.py`(오프라인, bitsandbytes 설치 여부와 무관하게 통과 —
-GPU가 있으면 `test_real_gpu_behavior()`가 자동으로 실제 CUDA 검증까지 추가로 수행)는 GPU
-없이도 검증 가능한 부분만 실제로 실행해서 확인합니다: `BitsAndBytesConfig` 구성, config
-검증, 메모리 이론값 계산, 그리고 **위 두 CPU 한계 현상 자체를 재현하는 테스트**. 추가로 소형
-합성 SmolVLM 백본(`AutoModelForImageTextToText.from_pretrained`까지 몽키패치 — 실제 압축은
-못 하지만 `quantization_config`가 실제로 거기까지 전달되는지, LoRA가 진짜로 백본에 붙는지는
-확인 가능)으로 `quantization="8bit"` + `wrap_with_peft()`를 실제 `SmolVLAPolicy.forward()`
-경로로 5스텝 돌려서, 백본 파라미터는 전부 얼려진 채(학습 가능한 백본 파라미터 0개) LoRA
-파라미터만 학습되고 loss가 유한하게 나오는 것까지 확인했습니다 — 이 과정에서 처음 작성한
-LoRA 타겟 정규식에 경로 오타(`vlm_with_expert.vlm.text_model`이어야 하는데 실제로는
-`vlm_with_expert.vlm.model.text_model`, 중간에 `.model.`이 하나 더 있음)가 있어서 백본이
-전혀 LoRA 적용을 못 받던 실제 버그를 이 검증 과정에서 잡아 고쳤습니다.
-
-### Colab GPU 실측 결과
-
-`scripts/profile_memory.py --quantization {none,4bit,8bit}`을 실제 Colab GPU(SmolVLM2-500M
-백본, LoRA+ARD+gradient checkpointing 켠 상태)에서 돌려 forward+backward peak memory를 쟀습니다.
-이 과정에서 실제 버그 두 개를 잡았습니다: (1) bitsandbytes 커스텀 autograd 출력에 대한
-in-place 잔차 덧셈(`+=`)이 4bit/8bit에서 각각 다른 방식으로 crash — out-of-place `+`로 수정,
-(2) 양자화된 레이어의 `.weight.dtype`(4bit=uint8, 8bit=int8, 압축 저장 형식)을 그대로
-activation cast target으로 쓰던 6곳이 attention 행렬곱까지 오염시켜 `baddbmm_cuda not
-implemented for Byte/Char`로 crash — 양자화된 레이어는 어차피 입력을 자기 compute_dtype으로
-알아서 캐스팅하므로, 저장 dtype이 uint8/int8일 땐 캐스팅을 건너뛰도록 수정. 두 버그 모두
-CPU에서는 애초에 재현이 안 돼서(4bit는 CPU에서 아예 안 돌고, 8bit도 CPU에선 검증 불가 회색
-지대라서) 실제 GPU 실행으로만 드러났습니다.
-
-![QLoRA 백본 양자화 Colab GPU 실측 메모리 비교표 — 레이어 프루닝 적용/미적용, 배치 1~32에서 bf16/4bit/8bit peak GPU memory와 bf16 대비 변화율](docs/images/quant_memory_table.png)
-
-아래는 위 이미지와 동일한 내용을 텍스트 표로 옮긴 것입니다 (레이어 프루닝 적용,
-`num_vlm_layers=16` 기준):
-
-| batch | bf16(양자화 없음) | 4bit | 4bit 변화율 | 8bit | 8bit 변화율 |
-|---|---|---|---|---|---|
-| 1 | 1.02 GB | 0.85 GB | **-16.7%** | 0.95 GB | -6.9% |
-| 2 | 1.17 GB | 1.01 GB | -13.7% | 1.11 GB | -5.1% |
-| 4 | 1.45 GB | 1.32 GB | -9.0% | 1.40 GB | -3.4% |
-| 8 | 2.01 GB | 1.94 GB | -3.5% | 1.98 GB | -1.5% |
-| 16 | 3.13 GB | 3.18 GB | +1.6% | 3.15 GB | +0.6% |
-| 32 | 5.38 GB | 5.66 GB | +5.2% | 5.49 GB | +2.0% |
-
-레이어 프루닝 미적용(원본 32레이어, action expert도 같이 커짐) 기준:
-
-| batch | bf16(양자화 없음) | 4bit | 4bit 변화율 | 8bit | 8bit 변화율 |
-|---|---|---|---|---|---|
-| 1 | 1.52 GB | 1.12 GB | **-26.3%** | 1.37 GB | -9.9% |
-| 2 | 1.66 GB | 1.28 GB | -22.9% | 1.56 GB | -6.0% |
-| 4 | 1.94 GB | 1.59 GB | -18.0% | 1.94 GB | 0.0% |
-| 8 | 2.50 GB | 2.21 GB | -11.6% | 2.70 GB | +8.0% |
-| 16 | 3.63 GB | 3.45 GB | -5.0% | 4.23 GB | +16.5% |
-| 32 | 5.88 GB | 5.93 GB | +0.8% | 7.25 GB | **+23.3%** |
-
-**왜 아래 이론치와 다른가**: 이론치(bf16→8bit -50%, 4bit -74%)는 **백본 가중치 저장 용량만**
-계산한 값입니다. 실측은 백본+action expert+LoRA+forward/backward 활성화 텐서를 전부 합친
-peak memory라서, 배치가 커질수록 활성화 메모리가 지배적이 되어 가중치 절감분의 비중이
-사라집니다. 게다가 bitsandbytes는 forward마다 압축 가중치를 원래 dtype으로 역양자화하는
-임시 버퍼를 만드는 오버헤드가 있고, 특히 8bit(`LLM.int8()`)는 이상치(outlier) 채널을 따로
-분리 처리하는 mixed-precision decomposition 구조라 이 오버헤드가 4bit(NF4)보다 훨씬 큽니다 —
-그 결과 배치가 크면 8bit이 오히려 bf16보다 메모리를 더 씁니다. **결론**: 배치를 작게 잡아야
-하는 VRAM 제약 상황(특히 4bit)에서는 실제로 도움이 되지만, 배치를 크게 돌릴 수 있는 GPU라면
-이 구현에서는 이득이 거의 없거나 손해입니다. `scripts/train_ard.py`는 기본적으로 `--quantization
-4bit`을 씁니다 — 소규모 GPU에서 파인튜닝하는 시나리오를 기본으로 가정했기 때문입니다.
-
-**450M 파라미터(SmolVLM2 백본) 기준 이론적 메모리 절감 추정치** (활성화/옵티마이저 상태/LoRA
-어댑터 자체는 제외, 정지된 백본 가중치 저장 용량만 — 위 실측표와는 다른 것에 주의):
-
-| dtype | bytes/param (bits/param) | 총 크기 | bf16 대비 절감률 |
-|---|---|---|---|
-| fp32 | 4.0 (32) | 1.68 GB | (기준 아님, 참고용) |
-| bf16/fp16 (현재 기본값) | 2.0 (16) | 0.84 GB | 0% (기준) |
-| 8bit (LLM.int8()) | 1.0 (8) | 0.42 GB | **50.0%** |
-| 4bit NF4 (double quant 없이) | 0.5625 (4.5) | 0.24 GB | **71.9%** |
-| 4bit NF4 + double quant | ~0.516 (~4.127) | 0.22 GB | **74.2%** |
-
-8bit/4bit 수치는 텐서/행 단위 스케일 오버헤드를 무시한 근사(8bit)와 QLoRA 논문(Dettmers et
-al., 2023)이 보고한 block_size=64 기준 실측 bits/param(4bit)을 그대로 쓴 것입니다 —
-`lerobot/policies/smolvla/quantization.py`의 `summarize_quantization_savings()`로 재현
-가능합니다.
-
 ## Layout
 
 - `requirements.txt` — research tooling installed on top of lerobot (notebook/plotting deps). torch and lerobot itself are installed by `scripts/install.sh`, not listed here.
 - `scripts/install.sh` — environment setup: CPU/GPU-aware torch install, editable `lerobot[smolvla]` install from `third_party/lerobot`, then `requirements.txt`.
 - `scripts/check_env.py` — import + CPU-fallback smoke test.
 - `scripts/test_ard.py` — offline unit tests for the ARD modification.
-- `scripts/train_ard.py` — SmolVLA(+ARD) 전용 최소 학습 스크립트 (lerobot의 범용 학습 CLI 대체). 기본적으로 QLoRA 4bit 양자화 + LoRA를 켠 채로 학습한다.
+- `scripts/train_ard.py` — SmolVLA(+ARD) 전용 최소 학습 스크립트 (lerobot의 범용 학습 CLI 대체).
 - `scripts/count_params.py` — 구성 요소별 파라미터 집계 + 해상도별 이미지 토큰 수 실측.
 - `third_party/lerobot/` — vendored, editable LeRobot/SmolVLA source.

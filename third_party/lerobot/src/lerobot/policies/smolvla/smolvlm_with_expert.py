@@ -25,8 +25,6 @@ from transformers import (
     SmolVLMForConditionalGeneration,
 )
 
-from lerobot.policies.smolvla.quantization import build_bnb_config
-
 
 def apply_rope(x, positions, max_wavelength=10_000):
     """
@@ -61,24 +59,6 @@ def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
     return hidden_dim
 
 
-def _resolve_linear_input_dtype(current_dtype: torch.dtype, linear: nn.Module) -> torch.dtype:
-    """linear의 weight dtype에 안전하게 맞출 수 있으면 그 dtype을, 아니면(weight가 uint8/int8로
-    양자화된 저장 형식이면) 원래 dtype을 그대로 반환한다.
-
-    bitsandbytes로 양자화된 레이어(Linear4bit/Linear8bitLt, peft로 LoRA를 씌운 것 포함)의
-    `.weight.dtype`은 실제 행렬곱에 쓰는 dtype이 아니라 압축 저장 형식이다 (4bit는 uint8에
-    두 개씩 packing, 8bit는 int8). 이걸 그대로 활성화(activation) 텐서에 캐스팅하면 그 값이
-    attention 행렬곱까지 전파되어 "baddbmm_cuda not implemented for Byte/Char"로 깨진다.
-    이 레이어들은 forward 시 입력을 알아서 자기 compute_dtype으로 캐스팅하므로(bitsandbytes가
-    자체적으로 "inputs will be cast from ... during quantization" 경고를 남기는 것으로 확인함),
-    그런 경우엔 원래 dtype을 그대로 유지해서 레이어에게 맡긴다.
-    """
-    weight_dtype = linear.weight.dtype
-    if weight_dtype in (torch.uint8, torch.int8):
-        return current_dtype
-    return weight_dtype
-
-
 class SmolVLMWithExpertModel(nn.Module):
     def __init__(
         self,
@@ -92,47 +72,18 @@ class SmolVLMWithExpertModel(nn.Module):
         vlm_layer_indices: list[int] | None = None,
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
-        quantization: str | None = None,
-        bnb_4bit_quant_type: str = "nf4",
-        bnb_4bit_use_double_quant: bool = True,
-        bnb_4bit_compute_dtype: str = "bfloat16",
         device: str = "auto",
     ):
         super().__init__()
-        quantization_config = build_bnb_config(
-            quantization,
-            bnb_4bit_quant_type=bnb_4bit_quant_type,
-            bnb_4bit_use_double_quant=bnb_4bit_use_double_quant,
-            bnb_4bit_compute_dtype=bnb_4bit_compute_dtype,
-        )
         if load_vlm_weights:
             print(f"Loading  {model_id} weights ...")
             self.vlm = AutoModelForImageTextToText.from_pretrained(
                 model_id,
-                # 양자화 로드일 땐 torch_dtype을 강제하지 않는다 — bnb_4bit_compute_dtype이
-                # 실제 행렬곱 시 역양자화 dtype을 따로 통제하고, 양자화 안 되는 나머지 부분
-                # (LayerNorm 등)은 transformers가 알아서 적절히 처리한다 (QLoRA 표준 로드 방식).
-                torch_dtype=None if quantization_config is not None else "bfloat16",
+                torch_dtype="bfloat16",
                 low_cpu_mem_usage=True,
-                quantization_config=quantization_config,
             )
-            if quantization_config is not None:
-                # QLoRA 표준 준비 단계: LayerNorm을 fp32로 캐스팅, 입력 임베딩에
-                # requires_grad 훅을 걸어 얼려진(양자화된) 앞쪽 레이어를 통과해도 그래디언트가
-                # 끊기지 않게 한다. use_gradient_checkpointing=False인 이유: 이 클래스의
-                # forward()는 표준 per-layer 호출을 우회하는 커스텀 인터리브 루프라
-                # gradient_checkpointing_enable()(smolvlm_with_expert.py에 이미 별도로 구현됨)로
-                # 따로 켜야 하고, 여기서 peft가 vlm 자체에 거는 체크포인팅과 중복/충돌하면 안 된다.
-                from peft import prepare_model_for_kbit_training
-
-                self.vlm = prepare_model_for_kbit_training(self.vlm, use_gradient_checkpointing=False)
             config = self.vlm.config
         else:
-            if quantization_config is not None:
-                raise ValueError(
-                    "`quantization`은 `load_vlm_weights=True`일 때만 의미가 있습니다 (SmolVLAConfig가 "
-                    "이미 이걸 검증하지만, 이 클래스를 직접 쓰는 스크립트를 위해 여기서도 한 번 더 막는다)."
-                )
             config = AutoConfig.from_pretrained(model_id)
             self.vlm = SmolVLMForConditionalGeneration(config=config)
         self.processor = AutoProcessor.from_pretrained(model_id)
@@ -301,9 +252,7 @@ class SmolVLMWithExpertModel(nn.Module):
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
 
-            hidden_states = hidden_states.to(
-                dtype=_resolve_linear_input_dtype(hidden_states.dtype, layer.self_attn.q_proj)
-            )
+            hidden_states = hidden_states.to(dtype=layer.self_attn.q_proj.weight.dtype)
             query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
             key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
             value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
@@ -388,9 +337,7 @@ class SmolVLMWithExpertModel(nn.Module):
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
 
-            hidden_states = hidden_states.to(
-                dtype=_resolve_linear_input_dtype(hidden_states.dtype, layer.self_attn.q_proj)
-            )
+            hidden_states = hidden_states.to(dtype=layer.self_attn.q_proj.weight.dtype)
             query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
             key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
             value_states = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
@@ -431,21 +378,19 @@ class SmolVLMWithExpertModel(nn.Module):
             expert_input_shape = expert_hidden_states.shape[:-1]
             expert_hidden_shape = (*expert_input_shape, -1, expert_layer.self_attn.head_dim)
 
-            expert_hidden_states = expert_hidden_states.to(
-                dtype=_resolve_linear_input_dtype(expert_hidden_states.dtype, expert_layer.self_attn.q_proj)
-            )
+            expert_hidden_states = expert_hidden_states.to(dtype=expert_layer.self_attn.q_proj.weight.dtype)
             expert_query_state = expert_layer.self_attn.q_proj(expert_hidden_states).view(expert_hidden_shape)
 
-            _key_states = key_states.to(
-                dtype=_resolve_linear_input_dtype(key_states.dtype, expert_layer.self_attn.k_proj)
-            ).view(*key_states.shape[:2], -1)
+            _key_states = key_states.to(dtype=expert_layer.self_attn.k_proj.weight.dtype).view(
+                *key_states.shape[:2], -1
+            )
             expert_key_states = expert_layer.self_attn.k_proj(_key_states).view(
                 *_key_states.shape[:-1], -1, expert_layer.self_attn.head_dim
             )  # k_proj should have same dim as kv
 
-            _value_states = value_states.to(
-                dtype=_resolve_linear_input_dtype(value_states.dtype, expert_layer.self_attn.v_proj)
-            ).view(*value_states.shape[:2], -1)
+            _value_states = value_states.to(dtype=expert_layer.self_attn.v_proj.weight.dtype).view(
+                *value_states.shape[:2], -1
+            )
             expert_value_states = expert_layer.self_attn.v_proj(_value_states).view(
                 *_value_states.shape[:-1], -1, expert_layer.self_attn.head_dim
             )
@@ -547,26 +492,18 @@ class SmolVLMWithExpertModel(nn.Module):
                     continue
                 end = start + hidden_states.shape[1]
 
-                _o_proj_input_dtype = _resolve_linear_input_dtype(att_output.dtype, layer.self_attn.o_proj)
-                if att_output.dtype != _o_proj_input_dtype:
-                    att_output = att_output.to(_o_proj_input_dtype)
+                if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+                    att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
                 att_out = att_output[:, start:end]
                 out_emb = layer.self_attn.o_proj(att_out)
 
-                # in-place(+=)가 아니라 새 텐서를 만드는 +를 쓴다: o_proj가 bitsandbytes로
-                # 양자화된 레이어(Linear4bit/Linear8bitLt)일 때, 그 출력은 커스텀 autograd
-                # Function이 만든 텐서라서 in-place 덧셈을 하면 (1) dtype이 uint8/byte로 잡혀
-                # "result type Float can't be cast to the desired output type Byte"가 나거나,
-                # (2) gradient checkpointing과 겹치면 "A view was created in no_grad mode and is
-                # being modified inplace..." 에러가 난다 (실제 GPU에서 재현/확인함). out-of-place
-                # 덧셈은 매번 새 텐서를 만들어서 이 문제를 피한다 — 값은 수학적으로 동일하다.
-                out_emb = out_emb + hidden_states
+                out_emb += hidden_states
                 after_first_residual = out_emb.clone()
 
                 out_emb = layer.post_attention_layernorm(out_emb)
                 out_emb = layer.mlp(out_emb)
 
-                out_emb = out_emb + after_first_residual
+                out_emb += after_first_residual
 
                 outputs_embeds.append(out_emb)
 

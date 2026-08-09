@@ -145,18 +145,6 @@ class SmolVLAConfig(PreTrainedConfig):
     token_pruning_k_final: int = 32  # 프레임당 최종 비전 토큰 수 (실험용 — 32/48/64 등으로 바꿔가며 비교)
     token_pruning_k_key: int = 6  # 무조건 남기는 핵심(최고 관련성) 토큰 수, 논문 권장 4~8
 
-    # --- QLoRA 스타일 백본 양자화 (bitsandbytes) ---
-    # VLM 백본을 4bit/8bit로 양자화해서 얼리고, LoRA 어댑터(wrap_with_peft())만 원래 정밀도로
-    # 학습한다. None이면 양자화 안 함(기존 동작 그대로). load_vlm_weights=True일 때만 의미가
-    # 있다 — 사전학습 가중치 없이 무작위 초기화된 백본을 양자화하는 건 QLoRA의 취지에 안 맞는다.
-    # 주의: bitsandbytes 4bit/8bit는 CUDA 커널에 의존한다 — CPU에서는 4bit는 아예 실행이 안
-    # 되고 8bit는 (겉보기엔 도는 것처럼 보여도) 실제로 양자화되지 않는다. lerobot.policies.
-    # smolvla.quantization 모듈 docstring 참고.
-    quantization: str | None = None  # None, "4bit", "8bit"
-    bnb_4bit_quant_type: str = "nf4"  # "nf4" 또는 "fp4"
-    bnb_4bit_use_double_quant: bool = True  # 2차 양자화로 블록당 오버헤드를 더 줄임 (QLoRA 논문)
-    bnb_4bit_compute_dtype: str = "bfloat16"  # 실제 행렬곱 시 역양자화해서 계산할 dtype
-
     def __post_init__(self):
         super().__post_init__()
 
@@ -200,19 +188,6 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError(f"`token_pruning_k_final`은 양수여야 합니다. 현재 값: {self.token_pruning_k_final}")
             if self.token_pruning_k_key <= 0:
                 raise ValueError(f"`token_pruning_k_key`는 양수여야 합니다. 현재 값: {self.token_pruning_k_key}")
-        if self.quantization is not None:
-            if self.quantization not in ("4bit", "8bit"):
-                raise ValueError(f"`quantization`은 None, '4bit', '8bit' 중 하나여야 합니다. 현재 값: {self.quantization!r}")
-            if not self.load_vlm_weights:
-                raise ValueError(
-                    "`quantization`은 `load_vlm_weights=True`일 때만 의미가 있습니다 — 사전학습 "
-                    "가중치 없이 무작위 초기화된 백본을 양자화하는 건 QLoRA의 취지에 맞지 않습니다."
-                )
-            if self.bnb_4bit_compute_dtype not in ("bfloat16", "float16", "float32"):
-                raise ValueError(
-                    f"`bnb_4bit_compute_dtype`은 'bfloat16'/'float16'/'float32' 중 하나여야 합니다. "
-                    f"현재 값: {self.bnb_4bit_compute_dtype!r}"
-                )
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):
