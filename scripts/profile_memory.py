@@ -20,6 +20,13 @@ pruned`나 `unpruned`를 주면 그중 하나만 돌려서 시간을 아낄 수 
 레이어 개수가 같으면 메모리 자체는 거의 그대로 나올 것으로 예상되지만, 그 구성으로 실제로
 문제없이 빌드/학습되는지 확인하는 용도다). 이때는 `--layer-pruning-mode`가 무시된다.
 
+`--use-bridge-attention`을 주면 ARD head가 VLA-Adapter식 Bridge Attention(백본 여러 레이어를
+cross-attention으로 조건받는 것)까지 켠 채로 빌드/프로파일링한다 — 실제 데이터셋 없이 빌드와
+forward+backward 자체가 되는지, 메모리가 얼마나 느는지만 빠르게 확인하는 용도다 (README의
+"Bridge Attention" 절 참고). `--ard-bridge-layer-indices`/`--ard-bridge-num-heads`로 세부
+옵션을 조정할 수 있다. Bridge Attention은 ARD head 확장이라 `--no-ard`와 같이 쓰면
+`SmolVLAConfig`가 바로 에러를 낸다.
+
 Colab/Kaggle 셀 예시:
     !git clone <이 레포 URL> ARD-VLA
     %cd ARD-VLA
@@ -99,6 +106,16 @@ def parse_args() -> argparse.Namespace:
             "'사용자 지정(custom)' 두 표를 비교해서 출력한다."
         ),
     )
+    parser.add_argument(
+        "--use-bridge-attention",
+        action="store_true",
+        help=(
+            "VLA-Adapter식 Bridge Attention까지 켠 채로 빌드/프로파일링한다 (--no-ard와 같이 "
+            "쓰면 SmolVLAConfig가 에러를 낸다 — Bridge Attention은 ARD head 확장이라 ARD 자체가 필요하다)."
+        ),
+    )
+    parser.add_argument("--ard-bridge-layer-indices", type=int, nargs="+", default=None)
+    parser.add_argument("--ard-bridge-num-heads", type=int, default=4)
     parser.set_defaults(use_lora=True, use_bf16=True, use_grad_checkpoint=True, use_ard=True)
     return parser.parse_args()
 
@@ -140,6 +157,9 @@ def build_policy(args, mode: str) -> SmolVLAPolicy:
         vlm_layer_indices=vlm_layer_indices,
         use_ard=args.use_ard,
         ard_arm_dim=args.ard_arm_dim,
+        use_bridge_attention=args.use_bridge_attention,
+        ard_bridge_layer_indices=args.ard_bridge_layer_indices,
+        ard_bridge_num_heads=args.ard_bridge_num_heads,
         tokenizer_max_length=args.lang_seq_len,
         device="cuda",
     )
@@ -286,10 +306,11 @@ def main() -> None:
         )
 
     logging.info(
-        "설정: LoRA=%s(r=%d) bf16=%s grad_checkpoint=%s ARD=%s chunk_size=%d action_dim=%d cameras=%d "
-        "layer_pruning_mode=%s vlm_layer_indices=%s",
+        "설정: LoRA=%s(r=%d) bf16=%s grad_checkpoint=%s ARD=%s bridge_attention=%s chunk_size=%d "
+        "action_dim=%d cameras=%d layer_pruning_mode=%s vlm_layer_indices=%s",
         args.use_lora, args.lora_r, args.use_bf16, args.use_grad_checkpoint, args.use_ard,
-        args.chunk_size, args.action_dim, args.cameras, args.layer_pruning_mode, args.vlm_layer_indices,
+        args.use_bridge_attention, args.chunk_size, args.action_dim, args.cameras,
+        args.layer_pruning_mode, args.vlm_layer_indices,
     )
 
     if args.vlm_layer_indices is not None:
