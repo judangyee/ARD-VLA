@@ -174,18 +174,23 @@ def apply_lora(policy: SmolVLAPolicy, args) -> SmolVLAPolicy:
     부기(trainable params 집계 등)를 위해서만 보관한다.
     """
     peft_model = policy.wrap_with_peft(peft_cli_overrides={"r": args.lora_r, "lora_alpha": args.lora_alpha})
-    if hasattr(peft_model, "print_trainable_parameters"):
-        peft_model.print_trainable_parameters()
 
     if args.use_ard:
         # wrap_with_peft()는 시작할 때 전체 파라미터를 얼리고(requires_grad=False) LoRA 어댑터만
         # 풀어준다 — ARD 기본 target_modules에는 stabilizer_head/actuator_head가 없어서, 그대로
-        # 두면 ARD head가 통째로 얼어붙는다. 실제 ARD 파인튜닝 시나리오와 맞추려면 다시 풀어줘야 한다.
+        # 두면 ARD head가(use_bridge_attention=True면 BridgeAttention까지) 통째로 얼어붙는다.
+        # 실제 ARD 파인튜닝 시나리오와 맞추려면 다시 풀어줘야 한다.
         n = 0
         for p in policy.model.ard_heads.parameters():
             p.requires_grad_(True)
             n += p.numel()
         logging.info("LoRA 적용 후 AsymmetricResidualHeads %d개 파라미터를 다시 학습 가능하게 풀었습니다.", n)
+
+    # print_trainable_parameters()는 반드시 위 ARD head 재활성화 *이후*에 호출한다 — 먼저
+    # 부르면(예전 코드가 그랬음) LoRA 타겟만 반영된 숫자가 찍혀서, use_bridge_attention=True일 때
+    # BridgeAttention 파라미터(수백만 개)가 통째로 빠진 걸로 착각하기 쉽다.
+    if hasattr(peft_model, "print_trainable_parameters"):
+        peft_model.print_trainable_parameters()
     return peft_model
 
 
