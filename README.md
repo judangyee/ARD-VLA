@@ -260,6 +260,33 @@ bridge 쪽에도 실제로 gradient가 흐르는지(첫 스텝엔 gate=0이라 �
 전부 확인했다. 실제 SmolVLM2 가중치로 손실이 실제로 더 잘 내려가는지(Bridge Attention의
 효과 자체)는 실제 GPU 환경에서 로컬 데이터셋으로 학습해봐야 확인할 수 있다.
 
+### Bridge Attention이 실제로 loss를 개선하는지 비교 (`scripts/compare_bridge_attention.py`)
+
+`--use-bridge-attention`을 켠 모델과 끈 모델을 **같은 데이터 순서로** 순차 학습시켜서 loss
+곡선을 직접 비교하는 스크립트입니다 (GPU 메모리를 하나만 쓰면서도 공정하게 비교하려고 동시가
+아니라 순차로 돌되, 두 실행 모두 같은 시드로 `DataLoader`를 만들어 배치 순서를 똑같이 맞춥니다).
+
+```bash
+python scripts/compare_bridge_attention.py \
+    --dataset-repo-id <HF_USER>/<DATASET> \
+    --steps 300 \
+    --batch-size 8
+```
+
+스텝별 loss 비교 표, `loss_curve.png`(두 곡선 겹쳐 그림), `loss_curve.csv`(원본 수치)를
+`--output-dir`(기본 `outputs/compare_bridge_attention`)에 남깁니다. **중요한 과학적 주의점**:
+이건 파라미터 개수를 맞춘 통제 실험이 아닙니다 — Bridge Attention을 켜면 ARD head의 학습 가능
+파라미터 자체가 늘어나므로(위 "파라미터 수" 표 참고), loss가 더 잘 내려간다 해도 그게 "여러
+레이어를 조건으로 주는 메커니즘" 덕분인지 "단순히 파라미터가 더 많아서"인지 이 비교만으로는
+완전히 분리되지 않습니다 — 이 데이터셋에서 실제로 도움이 되는지/안 되는지의 1차 판단 용도로
+쓰세요.
+
+이 스크립트도 실제 데이터셋 접근이 없는 이 샌드박스에서는 끝까지 돌려보지 못했다 —
+`train_ard.py`와 동일한 학습 루프 구조를 그대로 재사용했고(GradNorm은 비교 변수를 Bridge
+Attention 하나로 좁히기 위해 뺐다), 이 스크립트에서 새로 추가된 부분(두 변형이 정확히 같은
+배치 순서를 보도록 시드 고정하는 로직, 요약/CSV/그래프 저장 함수)은 합성 데이터로 직접
+오프라인 검증했다.
+
 ## 파라미터 구성 확인 (`scripts/count_params.py`)
 
 SmolVLA(+ARD) 전체 파라미터를 비전 인코더 / LLM(SmolLM2) / Action Expert / ARD head /
