@@ -30,6 +30,15 @@ lambda_smooth/force/traj를 고정값(기본 1.0) 대신 GradNorm(Chen et al., 2
     python scripts/train_ard.py --dataset-repo-id <...> --use-gradnorm --gradnorm-alpha 1.5
 자세한 구현은 lerobot.policies.smolvla.ard.GradNormLambdas 참고. --ard-lambda-* 값은 이
 모드에서는 무시된다(항상 1.0에서 시작).
+
+ARD head가 suffix_out(action expert의 마지막 지점 출력) 하나만이 아니라 SmolLM2 백본의 여러
+중간 레이어 특징까지 cross-attention으로 조건받게 하려면(VLA-Adapter, Wang et al., 2025식
+Bridge Attention) --use-bridge-attention을 준다:
+    python scripts/train_ard.py --dataset-repo-id <...> --use-bridge-attention
+자세한 구현은 lerobot.policies.smolvla.ard.BridgeAttention 참고. 기본은 꺼져 있고(기존과
+완전히 동일하게 동작), 켜면 --ard-bridge-layer-indices로 조건에 쓸 레이어를 직접 고르거나
+(기본은 [num_vlm_layers의 1/4, 1/2, 3/4, 마지막] 4개 지점 자동 선택), --ard-bridge-num-heads로
+cross-attention 헤드 수를 조정할 수 있다.
 """
 
 import argparse
@@ -102,6 +111,27 @@ def parse_args() -> argparse.Namespace:
     )
     ard_group.add_argument("--gradnorm-alpha", type=float, default=1.5, help="GradNorm asymmetry 하이퍼파라미터 (논문 기본값)")
     ard_group.add_argument("--gradnorm-lr", type=float, default=0.025, help="lambda 전용 옵티마이저 학습률")
+    ard_group.add_argument(
+        "--use-bridge-attention",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "VLA-Adapter(Wang et al., 2025)식 Bridge Attention — ARD head가 suffix_out 하나만이 "
+            "아니라 SmolLM2 백본의 여러 중간 레이어 특징도 cross-attention으로 조건받는다. "
+            "기본은 꺼져 있어 기존과 완전히 동일하게 동작한다(비교 실험용 플래그)."
+        ),
+    )
+    ard_group.add_argument(
+        "--ard-bridge-layer-indices",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Bridge Attention이 조건으로 쓸 VLM 레이어 인덱스(트림된 num_vlm_layers 기준, 원본 "
+            "32개 기준이 아님). 안 주면 [1/4, 1/2, 3/4, 마지막] 4개 지점을 자동으로 고른다."
+        ),
+    )
+    ard_group.add_argument("--ard-bridge-num-heads", type=int, default=4, help="Bridge Attention cross-attention 헤드 수")
 
     return parser.parse_args()
 
@@ -169,9 +199,12 @@ def main() -> None:
         use_gradnorm=args.use_gradnorm,
         gradnorm_alpha=args.gradnorm_alpha,
         gradnorm_lr=args.gradnorm_lr,
+        use_bridge_attention=args.use_bridge_attention,
+        ard_bridge_layer_indices=args.ard_bridge_layer_indices,
+        ard_bridge_num_heads=args.ard_bridge_num_heads,
     )
     device = torch.device(config.device)
-    logging.info("device=%s use_ard=%s", device, config.use_ard)
+    logging.info("device=%s use_ard=%s use_bridge_attention=%s", device, config.use_ard, config.use_bridge_attention)
 
     preprocessor, postprocessor = make_smolvla_pre_post_processors(config, dataset_stats=dataset.meta.stats)
 
@@ -183,6 +216,9 @@ def main() -> None:
         logging.info("VLM 레이어 구성: 사용자 지정 인덱스 %s (n=%d)", sorted(args.vlm_layer_indices), policy.model.vlm_with_expert.num_vlm_layers)
     else:
         logging.info("VLM 레이어 구성: 앞쪽 %d개", policy.model.vlm_with_expert.num_vlm_layers)
+
+    if config.use_bridge_attention:
+        logging.info("Bridge Attention 조건 레이어 인덱스(트림된 기준): %s", policy.model.bridge_layer_indices)
 
     optimizer = config.get_optimizer_preset().build(policy.get_optim_params())
     scheduler = config.get_scheduler_preset().build(optimizer, args.steps)

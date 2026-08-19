@@ -150,6 +150,12 @@ class SmolVLMWithExpertModel(nn.Module):
         self.attention_mode = attention_mode
         self.expert_hidden_size = lm_expert_config.hidden_size
         self.gradient_checkpointing = False
+        # ARD Bridge Attention(VLA-Adapter식)용 사이드채널 — forward(collect_layer_indices=...)가
+        # 요청받은 레이어 인덱스에서 VLM prefix 스트림의 hidden state를 캡처해서 여기 담아둔다.
+        # forward()의 반환 시그니처(튜플 arity)를 바꾸면 이 함수를 호출하는 모든 곳(sample_actions,
+        # denoise_step, VLAFlowMatching.forward 등)을 다 고쳐야 해서, 대신 값을 여기 담아두고
+        # 호출부가 forward() 직후에 바로 읽어가는 방식을 쓴다.
+        self.last_collected_prefix_layers: dict[int, torch.Tensor] | None = None
         self.set_requires_grad()
 
     def gradient_checkpointing_enable(self) -> None:
@@ -521,7 +527,14 @@ class SmolVLMWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] = None,
         use_cache: bool | None = None,
         fill_kv_cache: bool | None = None,
+        collect_layer_indices: list[int] | None = None,
     ):
+        """collect_layer_indices가 주어지면, 그 인덱스들에 해당하는 layer_idx를 지날 때마다
+        VLM(스트림 0) 쪽 hidden state를 `self.last_collected_prefix_layers`(layer_idx -> tensor
+        dict)에 담아둔다 — ARD Bridge Attention(VLA-Adapter식)이 여러 레이어의 조건 특징을
+        얻는 용도. 이 인터리브 루프가 이미 VLM 레이어를 하나씩 통과하며 스트림 0의 중간 결과를
+        만들어내고 있어서, 추가 forward pass 없이 그 값을 캡처하기만 하면 된다 — layer_importance.py
+        처럼 별도로 text_model(...)을 통째로 다시 돌리는 것과 달리 계산량이 늘지 않는다."""
         models = [self.get_vlm_model().text_model, self.lm_expert]
         model_layers = self.get_model_layers(models)
         for hidden_states in inputs_embeds:
@@ -542,6 +555,8 @@ class SmolVLMWithExpertModel(nn.Module):
             and not fill_kv_cache
             and torch.is_grad_enabled()
         )
+        collect_set = set(collect_layer_indices) if collect_layer_indices else None
+        collected: dict[int, torch.Tensor] | None = {} if collect_set else None
         for layer_idx in range(num_layers):
             layer_args = (
                 layer_idx,
@@ -561,6 +576,12 @@ class SmolVLMWithExpertModel(nn.Module):
                 )
             else:
                 inputs_embeds, past_key_values = self._run_layer(*layer_args)
+
+            if collect_set is not None and layer_idx in collect_set and inputs_embeds[0] is not None:
+                collected[layer_idx] = inputs_embeds[0]
+
+        if collect_set is not None:
+            self.last_collected_prefix_layers = collected
 
         # final norm
         outputs_embeds = []

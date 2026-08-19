@@ -34,6 +34,114 @@ from torch import Tensor, nn
 ARD_FORCE_TARGET = "ard_force_target"  # float, shape (batch,) 또는 (batch, chunk_size): 목표 접촉력/토크
 
 
+class BridgeAttention(nn.Module):
+    """VLA-Adapter(Wang et al., 2025)식 Bridge Attention.
+
+    기존 ARD head는 action expert 트랜스포머의 마지막 지점 출력(`suffix_out`) 하나만 조건으로
+    받는다. Bridge Attention은 여기에 더해 SmolLM2 백본의 **여러 중간 레이어**(초반/중반/후반 등
+    서로 다른 깊이) hidden state를 KV로, `suffix_out`을 Q로 하는 cross-attention을 계산해서
+    "백본이 여러 깊이에서 만든 표현"을 한 번에 조건으로 주입한다.
+
+    출력은 `tanh(gate)`로 스케일되는 학습 가능한 스칼라 게이트를 거친다 — `gate`는 0으로
+    초기화되므로(`tanh(0) = 0`) 학습 초반에는 이 브랜치가 아무 영향도 주지 않는다
+    (LLaMA-Adapter의 zero-init attention과 같은 아이디어). 기존 `AsymmetricResidualHeads`가
+    마지막 레이어를 0으로 초기화해 "처음엔 항등"으로 시작하는 것과 같은 설계 원칙을 그대로
+    따른 것이다 — `use_bridge_attention=True`로 켜도 학습 시작 시점의 모델 출력은 꺼져 있을
+    때와 완전히 동일하다.
+
+    주의 — 이 구현은 VLA-Adapter 논문을 그대로 옮긴 게 아니라, 사용자가 요청한 설계(여러 레이어
+    특징 + cross-attention 조건 주입 + tanh(gate) 스케일)를 직접 구현한 것이다. 특히 "여러
+    레이어의 특징"을 어떻게 KV로 합칠지는 논문에 정확히 명시되지 않은 구현 세부사항이라, 각
+    레이어의 prefix 토큰 시퀀스를 (레이어를 구분하는 학습 가능한 임베딩을 더해서) 그대로
+    이어붙이는 방식을 택했다 — 토큰 단위의 세밀한 정보(예: 어느 이미지 패치/언어 토큰인지)를
+    레이어별로 유지하면서도, 레이어 수(보통 3~4개)만큼만 KV 길이가 늘어나 계산 비용이 과하게
+    커지지 않는다.
+    """
+
+    def __init__(
+        self,
+        expert_hidden_size: int,
+        vlm_hidden_size: int,
+        num_bridge_layers: int,
+        num_heads: int = 4,
+    ):
+        super().__init__()
+        if expert_hidden_size % num_heads != 0:
+            raise ValueError(
+                f"expert_hidden_size({expert_hidden_size})는 num_heads({num_heads})로 나누어 "
+                f"떨어져야 합니다 (멀티헤드로 쪼갤 수 있어야 함)."
+            )
+        self.num_heads = num_heads
+        self.head_dim = expert_hidden_size // num_heads
+        # 레이어별로 "어느 깊이에서 왔는지" 구분하는 학습 가능한 임베딩 — 0-init이라 gate가
+        # 열리기 전까지는(그리고 열린 직후 당분간도) 레이어 간에 인위적인 차이를 만들지 않는다.
+        self.layer_embed = nn.Parameter(torch.zeros(num_bridge_layers, vlm_hidden_size))
+        self.q_proj = nn.Linear(expert_hidden_size, expert_hidden_size)
+        self.k_proj = nn.Linear(vlm_hidden_size, expert_hidden_size)
+        self.v_proj = nn.Linear(vlm_hidden_size, expert_hidden_size)
+        self.out_proj = nn.Linear(expert_hidden_size, expert_hidden_size)
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def _split_heads(self, x: Tensor) -> Tensor:
+        batch, seq, _ = x.shape
+        return x.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)  # (batch, heads, seq, head_dim)
+
+    def forward(self, query: Tensor, kv_layers: list[Tensor]) -> Tensor:
+        """query: (batch, chunk_size, expert_hidden_size) — 보통 `suffix_out`.
+        kv_layers: 길이 num_bridge_layers인 리스트, 각 원소는
+        (batch, prefix_len, vlm_hidden_size) — SmolLM2 백본의 서로 다른 레이어에서 뽑은
+        prefix(이미지+언어) hidden state (`smolvlm_with_expert.py`의
+        `SmolVLMWithExpertModel.forward(collect_layer_indices=...)` 참고).
+
+        반환: (batch, chunk_size, expert_hidden_size) — `query`에 그대로 더해서 쓰면 되도록 이미
+        `tanh(gate)`로 스케일된 값이다.
+        """
+        if len(kv_layers) != self.layer_embed.shape[0]:
+            raise ValueError(
+                f"kv_layers 길이({len(kv_layers)})가 BridgeAttention이 초기화된 "
+                f"num_bridge_layers({self.layer_embed.shape[0]})와 다릅니다."
+            )
+        batch = query.shape[0]
+        kv_input = torch.cat(
+            [feat + self.layer_embed[i] for i, feat in enumerate(kv_layers)], dim=1
+        )  # (batch, num_bridge_layers * prefix_len, vlm_hidden_size)
+
+        q = self._split_heads(self.q_proj(query))
+        k = self._split_heads(self.k_proj(kv_input))
+        v = self._split_heads(self.v_proj(kv_input))
+
+        attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v)  # (batch, heads, chunk, head_dim)
+        attn_out = attn_out.transpose(1, 2).reshape(batch, -1, self.num_heads * self.head_dim)
+        attn_out = self.out_proj(attn_out)
+        return torch.tanh(self.gate) * attn_out
+
+
+def resolve_bridge_layer_indices(num_vlm_layers: int, requested: list[int] | None) -> list[int]:
+    """Bridge Attention이 SmolLM2 백본의 어느(트림된) 레이어들에서 조건 특징을 뽑을지 결정한다.
+
+    requested가 주어지면 그대로 쓰고(범위/중복만 검증), None이면 자동으로 4개 지점
+    (1/4, 1/2, 3/4, 마지막)을 골라 초반/중반/후반/마지막 깊이를 대표하게 한다 —
+    "중간 레이어 + 마지막 레이어" 요청을 SmolVLA가 실제로 쓰는(트림된) 레이어 수에 맞게 구현한
+    기본값이다. 인덱스는 `num_vlm_layers`(원본 32개가 아니라 SmolVLA가 실제로 쓰는, 보통 16개)
+    기준이다 — layer_importance.py가 분석하는 원본 레이어 인덱싱과는 다르다는 점에 주의.
+    """
+    if requested is not None:
+        if len(requested) == 0:
+            raise ValueError("ard_bridge_layer_indices가 비어 있습니다 — 최소 1개 이상의 레이어 인덱스가 필요합니다.")
+        if len(set(requested)) != len(requested):
+            raise ValueError(f"ard_bridge_layer_indices에 중복된 인덱스가 있습니다: {requested}")
+        if any(i < 0 or i >= num_vlm_layers for i in requested):
+            raise ValueError(
+                f"ard_bridge_layer_indices는 0 이상 {num_vlm_layers - 1} 이하여야 합니다 "
+                f"(트림된 VLM 레이어 수: {num_vlm_layers}). 받은 값: {requested}"
+            )
+        return sorted(requested)
+    if num_vlm_layers < 4:
+        return list(range(num_vlm_layers))
+    quarter = max(num_vlm_layers // 4, 1)
+    return sorted({quarter, num_vlm_layers // 2, (3 * num_vlm_layers) // 4, num_vlm_layers - 1})
+
+
 class AsymmetricResidualHeads(nn.Module):
     """두 팔 각자의 채널에 대해 flow-matching 공유 출력을 보정하는 역할별 residual head.
 
@@ -41,9 +149,23 @@ class AsymmetricResidualHeads(nn.Module):
     길이의 예측을 만들어낸다. 이 head들은 전체 액션 전문가(action expert) 트랜스포머를 통째로
     복제하지 않으면서도, Stabilizer/Actuator 채널 블록 위에 역할 특화 보정을 추가로 얹어 각
     역할에 전용 학습 용량을 부여한다.
+
+    `use_bridge_attention=True`면 각 head 앞에 전용 `BridgeAttention`을 하나씩 붙여서(그래서
+    Stabilizer/Actuator가 백본 특징 중 서로 다른 부분에 주목하도록 독립적으로 학습될 수 있다),
+    `suffix_features`(마지막 지점 조건) 하나만이 아니라 `bridge_kv_layers`(백본 여러 레이어
+    조건)까지 함께 반영한다. 꺼져 있으면(기본값) 기존과 완전히 동일하게 동작한다.
     """
 
-    def __init__(self, expert_hidden_size: int, arm_dim: int, mlp_hidden_dim: int | None = None):
+    def __init__(
+        self,
+        expert_hidden_size: int,
+        arm_dim: int,
+        mlp_hidden_dim: int | None = None,
+        use_bridge_attention: bool = False,
+        vlm_hidden_size: int | None = None,
+        num_bridge_layers: int = 4,
+        bridge_num_heads: int = 4,
+    ):
         super().__init__()
         mlp_hidden_dim = mlp_hidden_dim or max(expert_hidden_size // 2, arm_dim)
         self.stabilizer_head = nn.Sequential(
@@ -64,11 +186,28 @@ class AsymmetricResidualHeads(nn.Module):
         nn.init.zeros_(self.actuator_head[-1].weight)
         nn.init.zeros_(self.actuator_head[-1].bias)
 
-    def forward(self, suffix_features: Tensor) -> tuple[Tensor, Tensor]:
+        self.use_bridge_attention = use_bridge_attention
+        self.stabilizer_bridge: BridgeAttention | None = None
+        self.actuator_bridge: BridgeAttention | None = None
+        if use_bridge_attention:
+            if vlm_hidden_size is None:
+                raise ValueError("use_bridge_attention=True면 vlm_hidden_size를 반드시 지정해야 합니다.")
+            self.stabilizer_bridge = BridgeAttention(expert_hidden_size, vlm_hidden_size, num_bridge_layers, bridge_num_heads)
+            self.actuator_bridge = BridgeAttention(expert_hidden_size, vlm_hidden_size, num_bridge_layers, bridge_num_heads)
+
+    def forward(self, suffix_features: Tensor, bridge_kv_layers: list[Tensor] | None = None) -> tuple[Tensor, Tensor]:
         """suffix_features: (batch, chunk_size, expert_hidden_size), 액션 전문가의 projection 이전
-        트랜스포머 출력. (stabilizer_residual, actuator_residual)을 반환하며 각각 shape은
+        트랜스포머 출력. bridge_kv_layers: `use_bridge_attention=True`일 때, SmolLM2 백본 여러
+        레이어에서 뽑은 prefix hidden state 리스트(`BridgeAttention.forward` 참고) — 안 주거나
+        `use_bridge_attention=False`면 기존과 동일하게 `suffix_features`만 사용한다.
+        (stabilizer_residual, actuator_residual)을 반환하며 각각 shape은
         (batch, chunk_size, arm_dim)이다."""
-        return self.stabilizer_head(suffix_features), self.actuator_head(suffix_features)
+        if self.use_bridge_attention and bridge_kv_layers is not None:
+            stabilizer_input = suffix_features + self.stabilizer_bridge(suffix_features, bridge_kv_layers)
+            actuator_input = suffix_features + self.actuator_bridge(suffix_features, bridge_kv_layers)
+        else:
+            stabilizer_input = actuator_input = suffix_features
+        return self.stabilizer_head(stabilizer_input), self.actuator_head(actuator_input)
 
 
 def resolve_actuator_is_first(default_actuator_arm: str, batch_size: int, device: torch.device) -> Tensor:

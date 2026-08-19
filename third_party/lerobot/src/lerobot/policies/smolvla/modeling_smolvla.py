@@ -52,6 +52,7 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 """
 
+import logging
 import math
 from collections import deque
 from typing import TypedDict
@@ -70,6 +71,7 @@ from lerobot.policies.smolvla.ard import (
     combine_by_role,
     compute_ard_losses,
     resolve_actuator_is_first,
+    resolve_bridge_layer_indices,
     split_by_role,
 )
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
@@ -652,10 +654,27 @@ class VLAFlowMatching(nn.Module):
         # ARD: 비대칭 역할 분리 (자세한 내용은 lerobot.policies.smolvla.ard 참고)
         self.ard_heads = None
         self.ard_gradnorm = None
+        self.bridge_layer_indices: list[int] | None = None
         if self.config.use_ard:
+            if self.config.use_bridge_attention:
+                # 트림된(SmolVLA가 실제로 쓰는) VLM 레이어 수 기준으로 인덱스를 확정한다 —
+                # config 단계에서는 실제 모델을 로드하기 전이라 상한을 몰라서 여기서 검증한다.
+                self.bridge_layer_indices = resolve_bridge_layer_indices(
+                    self.vlm_with_expert.num_vlm_layers, self.config.ard_bridge_layer_indices
+                )
+                logging.info(
+                    "ARD Bridge Attention 활성화 — 조건으로 쓸 VLM 레이어 인덱스(트림된 기준, num_vlm_layers=%d): %s",
+                    self.vlm_with_expert.num_vlm_layers, self.bridge_layer_indices,
+                )
             self.ard_heads = AsymmetricResidualHeads(
                 expert_hidden_size=self.vlm_with_expert.expert_hidden_size,
                 arm_dim=self.config.ard_arm_dim,
+                use_bridge_attention=self.config.use_bridge_attention,
+                vlm_hidden_size=self.vlm_with_expert.config.text_config.hidden_size
+                if self.config.use_bridge_attention
+                else None,
+                num_bridge_layers=len(self.bridge_layer_indices) if self.bridge_layer_indices else 4,
+                bridge_num_heads=self.config.ard_bridge_num_heads,
             )
             if self.config.use_gradnorm:
                 self.ard_gradnorm = GradNormLambdas(alpha=self.config.gradnorm_alpha)
@@ -883,7 +902,16 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
             fill_kv_cache=False,
+            collect_layer_indices=self.bridge_layer_indices,
         )
+        bridge_kv_layers = None
+        if self.bridge_layer_indices is not None:
+            collected = self.vlm_with_expert.last_collected_prefix_layers
+            # ard_heads/BridgeAttention의 Linear들은(action_out_proj와 마찬가지로) fp32라서,
+            # 백본이 bf16으로 도는 경우(vlm_model_name 로드 시 torch_dtype="bfloat16")를 대비해
+            # suffix_out과 동일하게 명시적으로 fp32로 올려준다.
+            bridge_kv_layers = [collected[i].to(dtype=torch.float32) for i in self.bridge_layer_indices]
+
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
@@ -896,7 +924,7 @@ class VLAFlowMatching(nn.Module):
                 self.config.ard_default_actuator_arm, batch_size=v_t.shape[0], device=v_t.device
             )
 
-            stabilizer_residual, actuator_residual = self.ard_heads(suffix_out)
+            stabilizer_residual, actuator_residual = self.ard_heads(suffix_out, bridge_kv_layers=bridge_kv_layers)
             left_residual, right_residual = combine_by_role(
                 stabilizer_residual, actuator_residual, actuator_is_first
             )
@@ -958,7 +986,15 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
+            collect_layer_indices=self.bridge_layer_indices,
         )
+        # ARD Bridge Attention: prefix(이미지+언어)는 이 KV 캐시 계산 시점에 딱 한 번만 처리되고
+        # 이후 모든 denoise_step 호출이 past_key_values를 재사용하는 것과 마찬가지로, 여기서
+        # 캡처한 여러 레이어 특징도 denoise_step마다 다시 계산하지 않고 그대로 재사용한다.
+        bridge_kv_layers = None
+        if self.bridge_layer_indices is not None:
+            collected = self.vlm_with_expert.last_collected_prefix_layers
+            bridge_kv_layers = [collected[i].to(dtype=torch.float32) for i in self.bridge_layer_indices]
 
         # ARD: chunk 하나당 어느 팔이 Actuator인지 한 번만 결정해서, 모든 `denoise_step` 호출이
         # 동일한 residual head를 적용하도록 한다.
@@ -983,6 +1019,7 @@ class VLAFlowMatching(nn.Module):
                     past_key_values=past_key_values,
                     timestep=current_timestep,
                     actuator_is_first=actuator_is_first,
+                    bridge_kv_layers=bridge_kv_layers,
                 )
 
             if self._rtc_enabled():
@@ -1015,6 +1052,7 @@ class VLAFlowMatching(nn.Module):
         x_t,
         timestep,
         actuator_is_first: Tensor | None = None,
+        bridge_kv_layers: list[Tensor] | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
@@ -1045,7 +1083,7 @@ class VLAFlowMatching(nn.Module):
 
         if self.config.use_ard and actuator_is_first is not None:
             arm_dim = self.config.ard_arm_dim
-            stabilizer_residual, actuator_residual = self.ard_heads(suffix_out)
+            stabilizer_residual, actuator_residual = self.ard_heads(suffix_out, bridge_kv_layers=bridge_kv_layers)
             left_residual, right_residual = combine_by_role(
                 stabilizer_residual, actuator_residual, actuator_is_first
             )

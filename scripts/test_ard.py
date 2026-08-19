@@ -17,10 +17,12 @@ import torch
 
 from lerobot.policies.smolvla.ard import (
     AsymmetricResidualHeads,
+    BridgeAttention,
     GradNormLambdas,
     combine_by_role,
     compute_ard_losses,
     resolve_actuator_is_first,
+    resolve_bridge_layer_indices,
     split_by_role,
 )
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
@@ -103,6 +105,120 @@ def test_asymmetric_residual_heads_zero_init():
     loss.backward()
     grad_norm = sum(p.grad.abs().sum().item() for p in heads.parameters() if p.grad is not None)
     check("AsymmetricResidualHeads가 gradient를 정상적으로 받는다", grad_norm > 0, detail=f"grad_norm={grad_norm}")
+
+
+def test_resolve_bridge_layer_indices():
+    # 기본(None): 1/4, 1/2, 3/4, 마지막 4개 지점.
+    idx = resolve_bridge_layer_indices(16, None)
+    check(
+        "num_vlm_layers=16, 기본값이면 4개 지점(1/4,1/2,3/4,마지막)을 고른다",
+        idx == sorted(idx) and len(idx) == 4 and idx[-1] == 15,
+        detail=f"idx={idx}",
+    )
+
+    # 레이어가 너무 적으면(4 미만) 전부 다 쓴다.
+    idx_small = resolve_bridge_layer_indices(3, None)
+    check("num_vlm_layers < 4면 전부 다 쓴다", idx_small == [0, 1, 2])
+
+    # 명시적으로 준 인덱스는 정렬만 해서 그대로 쓴다.
+    idx_explicit = resolve_bridge_layer_indices(16, [10, 2, 5])
+    check("명시적으로 준 인덱스는 정렬해서 그대로 쓴다", idx_explicit == [2, 5, 10])
+
+    try:
+        resolve_bridge_layer_indices(16, [])
+        check("빈 리스트를 거부한다", False)
+    except ValueError:
+        check("빈 리스트를 거부한다", True)
+
+    try:
+        resolve_bridge_layer_indices(16, [1, 1, 2])
+        check("중복된 인덱스를 거부한다", False)
+    except ValueError:
+        check("중복된 인덱스를 거부한다", True)
+
+    try:
+        resolve_bridge_layer_indices(16, [0, 16])
+        check("범위를 벗어난 인덱스(>= num_vlm_layers)를 거부한다", False)
+    except ValueError:
+        check("범위를 벗어난 인덱스(>= num_vlm_layers)를 거부한다", True)
+
+
+def test_bridge_attention_zero_init():
+    torch.manual_seed(0)
+    batch, chunk, expert_hidden, vlm_hidden, num_layers = 2, 5, 32, 48, 3
+    bridge = BridgeAttention(expert_hidden_size=expert_hidden, vlm_hidden_size=vlm_hidden, num_bridge_layers=num_layers, num_heads=4)
+
+    query = torch.randn(batch, chunk, expert_hidden)
+    kv_layers = [torch.randn(batch, 20, vlm_hidden) for _ in range(num_layers)]
+    out = bridge(query, kv_layers)
+    check(
+        "BridgeAttention은 초기화 시(gate=0) 완전히 0을 출력한다 (tanh(0)=0)",
+        torch.allclose(out, torch.zeros_like(out)),
+    )
+
+    loss = (out - torch.randn_like(out)).pow(2).mean()
+    # gate=0이라 out은 상수 0이지만, tanh(gate)의 gate에 대한 미분(1 - tanh(0)^2 = 1)은 0이
+    # 아니므로 gate를 포함한 모든 파라미터에 정상적으로 gradient가 흘러야 한다.
+    loss.backward()
+    grad_norm = sum(p.grad.abs().sum().item() for p in bridge.parameters() if p.grad is not None)
+    check("BridgeAttention이 gradient를 정상적으로 받는다(gate 포함)", grad_norm > 0, detail=f"grad_norm={grad_norm}")
+    check("gate 파라미터 자체도 gradient를 받는다", bridge.gate.grad is not None and bridge.gate.grad.abs().item() > 0)
+
+    try:
+        bridge(query, kv_layers[:-1])  # 레이어 수를 하나 빼서 mismatch 유발
+        check("kv_layers 길이가 안 맞으면 거부한다", False)
+    except ValueError:
+        check("kv_layers 길이가 안 맞으면 거부한다", True)
+
+
+def test_asymmetric_residual_heads_with_bridge_attention():
+    torch.manual_seed(0)
+    batch, chunk, expert_hidden, vlm_hidden, arm_dim, num_bridge_layers = 2, 5, 32, 48, 7, 3
+    heads = AsymmetricResidualHeads(
+        expert_hidden_size=expert_hidden,
+        arm_dim=arm_dim,
+        use_bridge_attention=True,
+        vlm_hidden_size=vlm_hidden,
+        num_bridge_layers=num_bridge_layers,
+        bridge_num_heads=4,
+    )
+    suffix_features = torch.randn(batch, chunk, expert_hidden)
+    bridge_kv_layers = [torch.randn(batch, 15, vlm_hidden) for _ in range(num_bridge_layers)]
+
+    stab_res, act_res = heads(suffix_features, bridge_kv_layers=bridge_kv_layers)
+    check(
+        "use_bridge_attention=True여도 초기화 시엔 여전히 완전한 0(항등) 상태다 "
+        "(bridge gate=0 AND head 마지막 레이어 zero-init, 둘 다 no-op)",
+        torch.allclose(stab_res, torch.zeros_like(stab_res)) and torch.allclose(act_res, torch.zeros_like(act_res)),
+    )
+
+    target = torch.randn(batch, chunk, arm_dim)
+    loss = (stab_res - target).pow(2).mean() + (act_res - target).pow(2).mean()
+    loss.backward()
+    grad_norm = sum(p.grad.abs().sum().item() for p in heads.parameters() if p.grad is not None)
+    check(
+        "bridge attention 포함 AsymmetricResidualHeads 전체가 gradient를 정상적으로 받는다",
+        grad_norm > 0, detail=f"grad_norm={grad_norm}",
+    )
+    check(
+        "stabilizer_bridge/actuator_bridge가 서로 다른(독립적인) 모듈이다",
+        heads.stabilizer_bridge is not heads.actuator_bridge,
+    )
+
+    # use_bridge_attention=False(기본값)면 bridge_kv_layers를 줘도 무시하고 기존과 완전히 동일하게 동작한다 (하위호환).
+    heads_no_bridge = AsymmetricResidualHeads(expert_hidden_size=expert_hidden, arm_dim=arm_dim)
+    out_ignored = heads_no_bridge(suffix_features, bridge_kv_layers=bridge_kv_layers)
+    out_none = heads_no_bridge(suffix_features, bridge_kv_layers=None)
+    check(
+        "use_bridge_attention=False면 bridge_kv_layers를 줘도 무시된다 (하위호환)",
+        torch.allclose(out_ignored[0], out_none[0]) and torch.allclose(out_ignored[1], out_none[1]),
+    )
+
+    try:
+        AsymmetricResidualHeads(expert_hidden_size=expert_hidden, arm_dim=arm_dim, use_bridge_attention=True)
+        check("use_bridge_attention=True인데 vlm_hidden_size가 없으면 거부한다", False)
+    except ValueError:
+        check("use_bridge_attention=True인데 vlm_hidden_size가 없으면 거부한다", True)
 
 
 def test_compute_ard_losses():
@@ -249,6 +365,9 @@ def main():
     test_resolve_actuator_is_first_is_fixed()
     test_split_combine_roundtrip()
     test_asymmetric_residual_heads_zero_init()
+    test_resolve_bridge_layer_indices()
+    test_bridge_attention_zero_init()
+    test_asymmetric_residual_heads_with_bridge_attention()
     test_compute_ard_losses()
     test_gradnorm_lambdas()
 

@@ -128,6 +128,15 @@ class SmolVLAConfig(PreTrainedConfig):
     ard_lambda_force: float = 1.0  # Actuator 힘 추적(force-tracking) 페널티 가중치 (use_gradnorm=True면 무시됨 — GradNorm은 항상 1.0에서 시작)
     ard_lambda_traj: float = 1.0  # Actuator 궤적 스무딩(trajectory-smoothness) 페널티 가중치 (use_gradnorm=True면 무시됨 — GradNorm은 항상 1.0에서 시작)
 
+    # --- VLA-Adapter(Wang et al., 2025)식 Bridge Attention — ARD head가 suffix_out(마지막 지점)
+    # 하나만이 아니라 SmolLM2 백본의 여러 중간 레이어 특징도 cross-attention으로 조건받게 함 ---
+    use_bridge_attention: bool = False  # use_ard=True일 때만 의미가 있다
+    # None이면 [num_vlm_layers의 1/4, 1/2, 3/4, 마지막] 4개 지점을 자동으로 고른다 (초반/중반/
+    # 후반/마지막 깊이 대표). 인덱스는 원본 32개가 아니라 SmolVLA가 실제로 쓰는(트림된)
+    # num_vlm_layers 기준이다 — lerobot.policies.smolvla.ard.resolve_bridge_layer_indices 참고.
+    ard_bridge_layer_indices: list[int] | None = None
+    ard_bridge_num_heads: int = 4  # Bridge Attention cross-attention의 헤드 수
+
     # --- GradNorm (Chen et al., 2018) — lambda_smooth/force/traj를 고정값 대신 자동 조정 ---
     # 켜면 세 lambda가 nn.Parameter가 되어 매 스텝, "공유 표현"(actuator/stabilizer head
     # 바로 직전의 suffix_out)에 각 정규화 항이 만드는 그래디언트 norm이 서로 균형 잡히도록
@@ -183,6 +192,20 @@ class SmolVLAConfig(PreTrainedConfig):
                 )
         if self.use_gradnorm and not self.use_ard:
             raise ValueError("`use_gradnorm`은 `use_ard=True`일 때만 의미가 있습니다.")
+        if self.use_bridge_attention:
+            if not self.use_ard:
+                raise ValueError("`use_bridge_attention`은 `use_ard=True`일 때만 의미가 있습니다.")
+            if self.ard_bridge_num_heads <= 0:
+                raise ValueError(f"`ard_bridge_num_heads`는 양수여야 합니다. 현재 값: {self.ard_bridge_num_heads}")
+            if self.ard_bridge_layer_indices is not None:
+                if len(self.ard_bridge_layer_indices) == 0:
+                    raise ValueError("`ard_bridge_layer_indices`가 비어 있습니다 — 최소 1개 이상의 레이어 인덱스가 필요합니다.")
+                if len(set(self.ard_bridge_layer_indices)) != len(self.ard_bridge_layer_indices):
+                    raise ValueError(f"`ard_bridge_layer_indices`에 중복된 인덱스가 있습니다: {self.ard_bridge_layer_indices}")
+                if any(i < 0 for i in self.ard_bridge_layer_indices):
+                    raise ValueError(f"`ard_bridge_layer_indices`는 음수를 포함할 수 없습니다: {self.ard_bridge_layer_indices}")
+                # num_vlm_layers 상한 체크는 실제 모델을 로드해야 알 수 있어서(트림 후 레이어 수),
+                # modeling_smolvla.py의 VLAFlowMatching.__init__에서 resolve_bridge_layer_indices로 한다.
         if self.use_token_pruning:
             if self.token_pruning_k_final <= 0:
                 raise ValueError(f"`token_pruning_k_final`은 양수여야 합니다. 현재 값: {self.token_pruning_k_final}")
