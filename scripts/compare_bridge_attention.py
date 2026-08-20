@@ -41,7 +41,8 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).parent))
 from train_ard import split_policy_features, warn_if_action_layout_looks_wrong  # noqa: E402
 
-from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
+from lerobot.datasets.factory import resolve_delta_timestamps  # noqa: E402
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata  # noqa: E402
 from lerobot.datasets.utils import dataset_to_policy_features  # noqa: E402
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig  # noqa: E402
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy  # noqa: E402
@@ -243,10 +244,20 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    logging.info("데이터셋 로드 중: %s", args.dataset_repo_id)
-    dataset = LeRobotDataset(args.dataset_repo_id)
-    features = dataset_to_policy_features(dataset.meta.features)
+    logging.info("데이터셋 메타데이터 로드 중: %s", args.dataset_repo_id)
+    ds_meta = LeRobotDatasetMetadata(args.dataset_repo_id)
+    features = dataset_to_policy_features(ds_meta.features)
     input_features, output_features = split_policy_features(features)
+
+    # train_ard.py와 동일한 이유로 delta_timestamps가 필요하다 — 없으면 action이 단일
+    # 프레임으로만 나와서 embed_suffix()가 기대하는 (B, chunk_size, action_dim) 형태가
+    # 깨진다(자세한 설명은 train_ard.py의 해당 주석 참고). baseline/bridge 두 변형 모두
+    # chunk_size(SmolVLAConfig 기본값)가 같으므로, 대표로 하나의 config만 만들어 쓴다.
+    probe_config = build_config(args, use_bridge_attention=False, input_features=input_features, output_features=output_features)
+    delta_timestamps = resolve_delta_timestamps(probe_config, ds_meta)
+
+    logging.info("데이터셋 로드 중: %s", args.dataset_repo_id)
+    dataset = LeRobotDataset(args.dataset_repo_id, delta_timestamps=delta_timestamps)
     warn_if_action_layout_looks_wrong(dataset, args.ard_arm_dim)
 
     torch.manual_seed(args.seed)

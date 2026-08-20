@@ -109,6 +109,14 @@ python scripts/train_ard.py \
     --batch-size 32
 ```
 
+`LeRobotDataset`은 `config.chunk_size`(flow-matching이 한 번에 예측하는 액션 시퀀스 길이)
+기준으로 `delta_timestamps`를 만들어서 로드합니다 — 이게 없으면 액션이 단일 프레임(한 시점)
+으로만 나와서 `embed_suffix()`가 기대하는 `(B, chunk_size, action_dim)` 형태가 깨지고,
+`make_att_2d_masks`에서 `RuntimeError: size ... must match ... at non-singleton dimension 2`로
+학습이 크래시합니다. 실제로 `lerobot/aloha_mobile_cabinet`으로 첫 real-dataset 학습을 시도하다
+발견한 버그이며, `lerobot.datasets.factory.resolve_delta_timestamps`(공식 `lerobot_train.py`가
+쓰는 것과 동일한 유틸)로 고쳤습니다.
+
 `--no-use-ard`를 주면 ARD 없이 베이스라인 SmolVLA만 학습합니다. 시작할 때 액션 채널의
 왼팔/오른팔 예상 순서를 출력해주니, 실제 로봇 배선과 맞는지 눈으로 한 번 확인하세요 (ARD는
 "앞 `ard_arm_dim`개=왼팔, 다음 `ard_arm_dim`개=오른팔"이라는 관례를 가정할 뿐, 데이터셋이

@@ -58,7 +58,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from lerobot.configs.types import FeatureType
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.factory import resolve_delta_timestamps
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
@@ -230,14 +231,11 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    logging.info("데이터셋 로드 중: %s", args.dataset_repo_id)
-    dataset = LeRobotDataset(args.dataset_repo_id)
+    logging.info("데이터셋 메타데이터 로드 중: %s", args.dataset_repo_id)
+    ds_meta = LeRobotDatasetMetadata(args.dataset_repo_id)
 
-    features = dataset_to_policy_features(dataset.meta.features)
+    features = dataset_to_policy_features(ds_meta.features)
     input_features, output_features = split_policy_features(features)
-
-    if args.use_ard:
-        warn_if_action_layout_looks_wrong(dataset, args.ard_arm_dim)
 
     config = SmolVLAConfig(
         input_features=input_features,
@@ -270,6 +268,20 @@ def main() -> None:
         "device=%s use_ard=%s use_bridge_attention=%s use_freq_policy=%s",
         device, config.use_ard, config.use_bridge_attention, config.use_freq_policy,
     )
+
+    # SmolVLA는 flow-matching으로 chunk_size 길이의 액션 시퀀스 전체를 한 번에 예측한다
+    # (embed_suffix가 (B, chunk_size, action_dim) 형태를 기대함). delta_timestamps 없이
+    # LeRobotDataset을 만들면 action이 그 프레임 하나(단일 시점)로만 나와서 이 가정이
+    # 깨지고, att_masks(설정값 chunk_size 기준)와 pad_masks(실제 텐서 길이 기준)의 길이가
+    # 어긋나 make_att_2d_masks에서 텐서 크기 불일치로 크래시한다 — 실제
+    # lerobot/aloha_mobile_cabinet 학습 시도에서 발견됨. config.action_delta_indices
+    # (=range(chunk_size))를 기준으로 delta_timestamps를 만들어 넘겨서 방지한다.
+    logging.info("데이터셋 로드 중: %s", args.dataset_repo_id)
+    delta_timestamps = resolve_delta_timestamps(config, ds_meta)
+    dataset = LeRobotDataset(args.dataset_repo_id, delta_timestamps=delta_timestamps)
+
+    if args.use_ard:
+        warn_if_action_layout_looks_wrong(dataset, args.ard_arm_dim)
 
     preprocessor, postprocessor = make_smolvla_pre_post_processors(config, dataset_stats=dataset.meta.stats)
 
