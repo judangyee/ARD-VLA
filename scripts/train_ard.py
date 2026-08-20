@@ -176,7 +176,15 @@ def split_policy_features(features: dict) -> tuple[dict, dict]:
 def warn_if_action_layout_looks_wrong(dataset: LeRobotDataset, arm_dim: int) -> None:
     """ARD는 액션 벡터의 앞 arm_dim개 채널=왼팔, 다음 arm_dim개=오른팔이라고 가정한다.
     이 가정이 맞는지 자동으로 검증할 방법은 없으니(dataset은 순서를 보장하지 않는다),
-    최소한 사람이 눈으로 확인할 수 있게 액션 채널 이름을 출력해준다."""
+    최소한 사람이 눈으로 확인할 수 있게 액션 채널 이름을 출력해준다.
+
+    데이터셋마다 meta.features[ACTION]["names"]의 형태가 다르다 — 평평한 문자열 리스트인 게
+    가장 흔하지만, {"motors": [...]}처럼 한 단계 감싼 dict인 데이터셋도 실제로 있다(예:
+    lerobot/aloha_mobile_cabinet — 실제 Colab 실행에서 `names[:arm_dim]`이
+    `KeyError: slice(...)`로 죽는 걸 보고 확인함, dict는 슬라이싱이 아니라 키 조회를 하므로).
+    이 함수는 학습을 막으면 안 되는 순수 진단/로깅용이라, 어떤 형태가 와도 크래시하지 않고
+    최대한 사람이 읽을 수 있는 형태로 보여주거나, 안 되면 조용히 경고만 남기고 넘어간다.
+    """
     action_feature = dataset.meta.features.get(ACTION)
     if action_feature is None:
         return
@@ -189,6 +197,28 @@ def warn_if_action_layout_looks_wrong(dataset: LeRobotDataset, arm_dim: int) -> 
             arm_dim,
         )
         return
+
+    if isinstance(names, dict):
+        # {"motors": [...]}처럼 한 단계 감싸져 있는 흔한 경우 — 리스트 값을 찾아서 편다.
+        flat_names = next((v for v in names.values() if isinstance(v, list)), None)
+        if flat_names is None:
+            logging.warning(
+                "데이터셋의 액션 채널 이름(names)이 예상치 못한 dict 구조라(키: %s) 왼팔/오른팔 "
+                "순서를 자동으로 보여줄 수 없습니다. ARD는 앞 %d개=왼팔, 다음 %d개=오른팔이라고 "
+                "가정하니 직접 확인하세요.",
+                list(names.keys()), arm_dim, arm_dim,
+            )
+            return
+        names = flat_names
+
+    if not isinstance(names, list) or len(names) < 2 * arm_dim:
+        logging.warning(
+            "데이터셋의 액션 채널 이름(names)을 왼팔/오른팔 %d개씩으로 나눠 보여줄 수 없는 "
+            "형태입니다(%r). ARD는 앞 %d개=왼팔, 다음 %d개=오른팔이라고 가정하니 직접 확인하세요.",
+            arm_dim, names, arm_dim, arm_dim,
+        )
+        return
+
     left, right = names[:arm_dim], names[arm_dim : 2 * arm_dim]
     logging.info("액션 채널 순서 (ARD 가정: 앞 %d개=왼팔, 다음 %d개=오른팔):", arm_dim, arm_dim)
     logging.info("  왼팔(Stabilizer 예상)  : %s", left)
