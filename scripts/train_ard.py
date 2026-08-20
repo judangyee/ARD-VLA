@@ -39,6 +39,15 @@ Bridge Attention) --use-bridge-attention을 준다:
 완전히 동일하게 동작), 켜면 --ard-bridge-layer-indices로 조건에 쓸 레이어를 직접 고르거나
 (기본은 [num_vlm_layers의 1/4, 1/2, 3/4, 마지막] 4개 지점 자동 선택), --ard-bridge-num-heads로
 cross-attention 헤드 수를 조정할 수 있다.
+
+기존 flow-matching 회귀 손실에 FreqPolicy(2025)식 주파수 영역 일관성 손실을 추가하려면
+--use-freq-policy를 준다 (SmolVLA의 병렬 flow-matching 디코딩 자체는 그대로 유지하고, 그
+논문의 "저주파[궤적 전체 형태] 우선" 통찰만 additive loss로 가져온 것 — 자세한 설계 의도는
+lerobot.policies.smolvla.freq_policy 참고):
+    python scripts/train_ard.py --dataset-repo-id <...> --use-freq-policy
+--use-ard와 무관하게(둘 다 꺼도) 독립적으로 켤 수 있다. --freq-lambda로 total loss에 더해지는
+가중치를, --freq-decay로 저주파 우선 정도를 조정한다(0이면 시간 영역 MSE와 동일, 클수록 저주파
+쪽으로 쏠림).
 """
 
 import argparse
@@ -133,6 +142,26 @@ def parse_args() -> argparse.Namespace:
     )
     ard_group.add_argument("--ard-bridge-num-heads", type=int, default=4, help="Bridge Attention cross-attention 헤드 수")
 
+    freq_group = parser.add_argument_group("FreqPolicy")
+    freq_group.add_argument(
+        "--use-freq-policy",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "FreqPolicy(2025)식 주파수 영역 일관성 손실을 기존 flow-matching 회귀 손실에 추가한다 "
+            "— 생성 메커니즘(병렬 flow-matching 디코딩) 자체는 그대로 두고, '저주파(궤적 전체 "
+            "형태)가 고주파(디테일)보다 우선'이라는 통찰만 additive loss로 가져온 것이다. "
+            "--use-ard와 무관하게 독립적으로 켤 수 있다."
+        ),
+    )
+    freq_group.add_argument("--freq-lambda", type=float, default=1.0, help="주파수 일관성 손실을 total loss에 더할 때의 가중치")
+    freq_group.add_argument(
+        "--freq-decay",
+        type=float,
+        default=2.0,
+        help="0이면 시간 영역 MSE와 수학적으로 동일(Parseval 정리). 클수록 저주파에 더 쏠린 가중치 (chunk_size와 무관하게 정규화됨).",
+    )
+
     return parser.parse_args()
 
 
@@ -202,9 +231,15 @@ def main() -> None:
         use_bridge_attention=args.use_bridge_attention,
         ard_bridge_layer_indices=args.ard_bridge_layer_indices,
         ard_bridge_num_heads=args.ard_bridge_num_heads,
+        use_freq_policy=args.use_freq_policy,
+        freq_lambda=args.freq_lambda,
+        freq_decay=args.freq_decay,
     )
     device = torch.device(config.device)
-    logging.info("device=%s use_ard=%s use_bridge_attention=%s", device, config.use_ard, config.use_bridge_attention)
+    logging.info(
+        "device=%s use_ard=%s use_bridge_attention=%s use_freq_policy=%s",
+        device, config.use_ard, config.use_bridge_attention, config.use_freq_policy,
+    )
 
     preprocessor, postprocessor = make_smolvla_pre_post_processors(config, dataset_stats=dataset.meta.stats)
 
@@ -294,6 +329,8 @@ def main() -> None:
                     f"  lambda(s/f/t)={loss_dict['ard_lambda_smooth']:.3f}/"
                     f"{loss_dict['ard_lambda_force']:.3f}/{loss_dict['ard_lambda_traj']:.3f}"
                 )
+            if config.use_freq_policy:
+                msg += f"  freq_consistency={loss_dict['freq_consistency_loss']:.4f}"
             logging.info(msg)
 
         if step % args.save_every == 0 or step == args.steps:

@@ -75,6 +75,7 @@ from lerobot.policies.smolvla.ard import (
     split_by_role,
 )
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla.freq_policy import compute_frequency_consistency_loss
 from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
 from lerobot.policies.smolvla.token_pruning import compute_task_relevance_scores, select_tokens
 from lerobot.policies.utils import (
@@ -410,9 +411,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims.
-            # 참고: ARD의 비대칭 가중치(alpha/beta, smoothness/force/trajectory 항)는 배치 단위
-            # 결합이라 여기서는 적용되지 않는다 — RA-BC per-sample 가중치는 `use_ard`가 켜져
-            # 있어도 그냥 flow-matching 손실을 그대로 사용한다.
+            # 참고: ARD의 비대칭 가중치(alpha/beta, smoothness/force/trajectory 항)와 FreqPolicy식
+            # 주파수 일관성 손실은 둘 다 배치 단위 결합이라 여기서는 적용되지 않는다 — RA-BC
+            # per-sample 가중치는 `use_ard`/`use_freq_policy`가 켜져 있어도 그냥 flow-matching
+            # 손실을 그대로 사용한다.
             per_sample_loss = losses.mean(dim=(1, 2))
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
@@ -434,6 +436,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 shared_activation=ard_extras["shared_activation"] if self.model.ard_gradnorm is not None else None,
             )
             loss = ard_out.total
+            if self.config.use_freq_policy:
+                loss = loss + self.config.freq_lambda * ard_extras["freq_loss"]
+                loss_dict["freq_consistency_loss"] = ard_extras["freq_loss"].item()
             loss_dict["loss"] = loss.item()
             loss_dict["ard_stabilizer_loss"] = ard_out.stabilizer_loss.item()
             loss_dict["ard_actuator_loss"] = ard_out.actuator_loss.item()
@@ -454,6 +459,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         # Default: return scalar mean loss
         loss = losses.mean()
+        if self.config.use_freq_policy and ard_extras is not None:
+            loss = loss + self.config.freq_lambda * ard_extras["freq_loss"]
+            loss_dict["freq_consistency_loss"] = ard_extras["freq_loss"].item()
         loss_dict["loss"] = loss.item()
         return loss, loss_dict
 
@@ -872,9 +880,12 @@ class VLAFlowMatching(nn.Module):
     ) -> tuple[Tensor, dict | None]:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors).
 
-        반환값 (losses, ard_extras): `config.use_ard`가 아니면 `ard_extras`는 None이고, 켜져
-        있으면 `compute_ard_losses`(lerobot.policies.smolvla.ard 참고)가 비대칭 Stabilizer/
-        Actuator 손실을 만드는 데 필요한, 역할별로 라우팅된 예측값들을 담고 있다.
+        반환값 (losses, ard_extras): `config.use_ard`와 `config.use_freq_policy`가 둘 다 꺼져
+        있으면 `ard_extras`는 None이다. `use_ard`가 켜져 있으면 `compute_ard_losses`
+        (lerobot.policies.smolvla.ard 참고)가 비대칭 Stabilizer/Actuator 손실을 만드는 데
+        필요한, 역할별로 라우팅된 예측값들을 담고 있다. `use_freq_policy`가 켜져 있으면(둘 중
+        하나만 켜져 있어도) `"freq_loss"` 키에 FreqPolicy식 주파수 일관성 손실
+        (lerobot.policies.smolvla.freq_policy 참고)이 담긴다.
         """
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -917,7 +928,6 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
 
-        ard_extras = None
         if self.config.use_ard:
             arm_dim = self.config.ard_arm_dim
             actuator_is_first = resolve_actuator_is_first(
@@ -939,11 +949,22 @@ class VLAFlowMatching(nn.Module):
 
         losses = F.mse_loss(u_t, v_t, reduction="none")
 
+        # use_ard와 무관하게 켤 수 있으므로, ard_extras가 None이 아니게 되는 조건에
+        # use_freq_policy도 포함시킨다 — SmolVLAPolicy.forward()가 이 dict에서 "freq_loss"
+        # 키를 읽어 total loss에 더한다(lerobot.policies.smolvla.freq_policy 참고).
+        if self.config.use_ard or self.config.use_freq_policy:
+            ard_extras = {}
+        else:
+            ard_extras = None
+
+        if self.config.use_freq_policy:
+            ard_extras["freq_loss"] = compute_frequency_consistency_loss(v_t, u_t, decay=self.config.freq_decay)
+
         if self.config.use_ard:
             stabilizer_pred, actuator_pred = split_by_role(
                 v_t[..., : 2 * arm_dim], arm_dim, actuator_is_first
             )
-            ard_extras = {
+            ard_extras.update({
                 "actuator_is_first": actuator_is_first,
                 "stabilizer_pred": stabilizer_pred,
                 "actuator_pred": actuator_pred,
@@ -951,7 +972,7 @@ class VLAFlowMatching(nn.Module):
                 # ard_heads가 둘 다 이 텐서를 입력으로 받는다. use_gradnorm=False면 안 쓰인다.
                 "shared_activation": suffix_out,
                 "per_element_loss": losses[..., : 2 * arm_dim],
-            }
+            })
 
         return losses, ard_extras
 

@@ -27,6 +27,11 @@ forward+backward 자체가 되는지, 메모리가 얼마나 느는지만 빠르
 옵션을 조정할 수 있다. Bridge Attention은 ARD head 확장이라 `--no-ard`와 같이 쓰면
 `SmolVLAConfig`가 바로 에러를 낸다.
 
+`--use-freq-policy`를 주면 FreqPolicy(2025)식 주파수 영역 일관성 손실까지 켠 채로 빌드/
+프로파일링한다 — 새 nn.Module 파라미터가 없는 순수 손실 항이라(README의 "FreqPolicy" 절
+참고) 메모리 증가는 거의 없어야 정상이다. `--no-ard`와 같이 써도 된다(Bridge Attention과
+달리 ARD에 종속되지 않음).
+
 Colab/Kaggle 셀 예시:
     !git clone <이 레포 URL> ARD-VLA
     %cd ARD-VLA
@@ -116,6 +121,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--ard-bridge-layer-indices", type=int, nargs="+", default=None)
     parser.add_argument("--ard-bridge-num-heads", type=int, default=4)
+    parser.add_argument(
+        "--use-freq-policy",
+        action="store_true",
+        help=(
+            "FreqPolicy식 주파수 영역 일관성 손실까지 켠 채로 빌드/프로파일링한다 — --no-ard와도 "
+            "같이 쓸 수 있다(Bridge Attention과 달리 ARD에 종속되지 않음)."
+        ),
+    )
+    parser.add_argument("--freq-lambda", type=float, default=1.0)
+    parser.add_argument("--freq-decay", type=float, default=2.0)
     parser.set_defaults(use_lora=True, use_bf16=True, use_grad_checkpoint=True, use_ard=True)
     return parser.parse_args()
 
@@ -160,6 +175,9 @@ def build_policy(args, mode: str) -> SmolVLAPolicy:
         use_bridge_attention=args.use_bridge_attention,
         ard_bridge_layer_indices=args.ard_bridge_layer_indices,
         ard_bridge_num_heads=args.ard_bridge_num_heads,
+        use_freq_policy=args.use_freq_policy,
+        freq_lambda=args.freq_lambda,
+        freq_decay=args.freq_decay,
         tokenizer_max_length=args.lang_seq_len,
         device="cuda",
     )
@@ -311,10 +329,10 @@ def main() -> None:
         )
 
     logging.info(
-        "설정: LoRA=%s(r=%d) bf16=%s grad_checkpoint=%s ARD=%s bridge_attention=%s chunk_size=%d "
-        "action_dim=%d cameras=%d layer_pruning_mode=%s vlm_layer_indices=%s",
+        "설정: LoRA=%s(r=%d) bf16=%s grad_checkpoint=%s ARD=%s bridge_attention=%s freq_policy=%s "
+        "chunk_size=%d action_dim=%d cameras=%d layer_pruning_mode=%s vlm_layer_indices=%s",
         args.use_lora, args.lora_r, args.use_bf16, args.use_grad_checkpoint, args.use_ard,
-        args.use_bridge_attention, args.chunk_size, args.action_dim, args.cameras,
+        args.use_bridge_attention, args.use_freq_policy, args.chunk_size, args.action_dim, args.cameras,
         args.layer_pruning_mode, args.vlm_layer_indices,
     )
 

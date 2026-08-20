@@ -154,6 +154,20 @@ class SmolVLAConfig(PreTrainedConfig):
     token_pruning_k_final: int = 32  # 프레임당 최종 비전 토큰 수 (실험용 — 32/48/64 등으로 바꿔가며 비교)
     token_pruning_k_key: int = 6  # 무조건 남기는 핵심(최고 관련성) 토큰 수, 논문 권장 4~8
 
+    # --- FreqPolicy(2025)식 주파수 영역 일관성 손실 ---
+    # 액션 청크(u_t/v_t)를 DCT로 주파수 성분으로 분해해서, 저주파(궤적 전체의 형태)에 더 큰
+    # 가중치를 준 MSE를 기존 flow-matching 회귀 손실에 추가로 더한다. FreqPolicy 논문의
+    # "coarse-to-fine 자기회귀 생성" 아키텍처 자체를 이식한 게 아니라(SmolVLA의 병렬 flow-
+    # matching 디코딩은 그대로 유지), 그 논문의 "저주파 우선" 통찰만 additive loss로 가져온
+    # 것이다. use_ard와 무관하게(둘 다 꺼도/켜도) 독립적으로 켤 수 있다.
+    # lerobot.policies.smolvla.freq_policy 참고.
+    use_freq_policy: bool = False
+    freq_lambda: float = 1.0  # 주파수 일관성 손실을 total loss에 더할 때의 가중치
+    # decay=0이면 전체 주파수 bin에 균등 가중(=시간 영역 MSE와 수학적으로 동일, Parseval 정리).
+    # decay가 클수록 저주파에 더 쏠린다 — chunk_size에 무관하게, 최고 주파수 bin의 가중치가
+    # 최저 주파수 bin의 exp(-decay)배가 되도록 정규화되어 있다(예: decay=2 -> 약 13.5%).
+    freq_decay: float = 2.0
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -211,6 +225,13 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError(f"`token_pruning_k_final`은 양수여야 합니다. 현재 값: {self.token_pruning_k_final}")
             if self.token_pruning_k_key <= 0:
                 raise ValueError(f"`token_pruning_k_key`는 양수여야 합니다. 현재 값: {self.token_pruning_k_key}")
+        if self.use_freq_policy:
+            if self.chunk_size < 2:
+                raise ValueError(f"`use_freq_policy`는 `chunk_size`가 2 이상이어야 의미가 있습니다. 현재 값: {self.chunk_size}")
+            if self.freq_lambda < 0:
+                raise ValueError(f"`freq_lambda`는 음수일 수 없습니다. 현재 값: {self.freq_lambda}")
+            if self.freq_decay < 0:
+                raise ValueError(f"`freq_decay`는 음수일 수 없습니다. 현재 값: {self.freq_decay}")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):
