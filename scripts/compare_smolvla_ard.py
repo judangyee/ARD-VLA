@@ -257,7 +257,7 @@ def print_comparison_table(all_results, batch_sizes) -> None:
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
 
     if not torch.cuda.is_available():
         raise SystemExit(

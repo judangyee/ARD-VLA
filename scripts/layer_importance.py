@@ -174,7 +174,7 @@ def print_comparison(rows: list[dict], num_vlm_layers: int, original_num_layers:
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
 
     if args.device is not None:
         device = torch.device(args.device)

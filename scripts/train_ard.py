@@ -229,7 +229,7 @@ def warn_if_action_layout_looks_wrong(dataset: LeRobotDataset, arm_dim: int) -> 
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
 
     logging.info("데이터셋 메타데이터 로드 중: %s", args.dataset_repo_id)
     ds_meta = LeRobotDatasetMetadata(args.dataset_repo_id)
