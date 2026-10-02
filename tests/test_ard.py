@@ -2,16 +2,16 @@
 """ARD (Asymmetric Role Decomposition, 비대칭 역할 분리) SmolVLA 수정 사항에 대한 오프라인 테스트.
 
 lerobot.policies.smolvla.ard를, 실제 학습/추론 파이프라인과 동일한 shape의 합성(synthetic)
-텐서로 직접 검증하고, SmolVLAConfig의 ARD 검증 로직도 함께 확인한다. SmolVLAPolicy 전체를
-생성하지는 않는다 — 그러려면 `load_vlm_weights=False`여도 Hugging Face Hub에서 SmolVLM2
-백본 config를 내려받아야 하는데, 이 환경의 네트워크 정책이 Hub 접근을 막아놓았기 때문이다.
+텐서로 직접 검증하고, SmolVLAConfig의 ARD 검증 로직도 함께 확인한다. 이 파일 자체는
+SmolVLAPolicy 전체를 생성하지는 않는다(ard.py 모듈 함수들을 합성 텐서로 직접 호출) — 실제
+Hugging Face Hub 접근 없이도 SmolVLAPolicy 전체(forward/backward/추론 경로 포함)를 검증하는
+테스트는 `tests/conftest.py`의 몽키패치 fixture를 쓰는 `tests/test_ard_integration.py`에 있다.
 GPU 유무와 관계없이 어떤 머신에서든 안전하게 실행할 수 있다.
 
 Actuator 팔은 config로 고정된다(`ard_default_actuator_arm`, 기본값 "right") — 샘플별로나
 언어 지시에 따라 역할이 바뀌지 않는다.
 """
 
-import sys
 import warnings
 
 import torch
@@ -30,14 +30,13 @@ from lerobot.policies.smolvla.ard import (
 )
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 
-FAILURES = []
-
-
-def check(name: str, condition: bool, detail: str = ""):
-    status = "PASS" if condition else "FAIL"
-    print(f"[{status}] {name}" + (f" — {detail}" if detail and not condition else ""))
-    if not condition:
-        FAILURES.append(name)
+def check(name: str, condition: bool, detail: str = "") -> None:
+    """pytest 네이티브 assert로 바로 연결한다 — 실패하면 AssertionError가 올라가서
+    pytest가 어느 test_* 함수의 몇 번째 check()에서 실패했는지 트레이스백으로 보여준다.
+    (이 레포 전체 스크립트에서 쓰던 기존 "이름 + condition (+ detail)" 호출부는 그대로
+    두고, 이 헬퍼의 구현만 pytest 스타일로 바꿨다.)"""
+    message = name if not detail else f"{name} — {detail}"
+    assert condition, message
 
 
 def test_config_validation():
@@ -831,37 +830,3 @@ def test_gradnorm_force_head_connection():
         "force_loss의 shared_activation(suffix_out)에 대한 그래디언트가 0이 아니다 (ForceHead가 suffix_out과 연결되어 있음)",
         force_grad is not None and force_grad.abs().sum().item() > 0,
     )
-
-
-def main():
-    test_config_validation()
-    test_resolve_actuator_is_first_is_fixed()
-    test_split_combine_roundtrip()
-    test_asymmetric_residual_heads_zero_init()
-    test_resolve_bridge_layer_indices()
-    test_bridge_attention_zero_init()
-    test_asymmetric_residual_heads_with_bridge_attention()
-    test_force_head()
-    test_compute_ard_losses()
-    test_compute_symmetric_losses()
-    test_ard_smooth_traj_loss_use_denoised_action_not_velocity()
-    test_ard_smooth_traj_loss_zero_for_constant_trajectory()
-    test_ard_reg_time_weighting_one_minus_t()
-    test_gradnorm_lambdas()
-    test_gradnorm_force_head_connection()
-
-    print()
-    if FAILURES:
-        print(f"[FAIL] {len(FAILURES)}개 항목 실패: {FAILURES}")
-        sys.exit(1)
-    print("[OK] ARD 단위 테스트 전체 통과.")
-    print(
-        "참고: SmolVLAPolicy 전체를 생성해서 테스트하지는 않았습니다 — 그러려면 Hugging Face "
-        "Hub에서 SmolVLM2 백본 config를 내려받아야 하는데, 이 환경의 네트워크 정책이 이를 막고 "
-        "있습니다. 대신 ard.py 모듈과 modeling_smolvla.py의 forward/sample_actions/"
-        "denoise_step에 연결된 로직을 합성 텐서로 직접 검증했습니다."
-    )
-
-
-if __name__ == "__main__":
-    main()

@@ -8,3 +8,4 @@
 jupyterlab==4.3.5
 ipykernel==6.29.5
 matplotlib==3.10.0
+pytest>=8.0.0

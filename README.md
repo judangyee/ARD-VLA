@@ -30,6 +30,22 @@ source .venv/bin/activate
 python scripts/check_env.py
 ```
 
+## 테스트 (`pytest`)
+
+단위/오프라인 테스트는 전부 `tests/`에 있고, 레포 루트의 `pytest.ini`가 `testpaths = tests`로
+설정돼 있어서 아무 인자 없이 `pytest`만 치면 전부 돈다:
+
+```bash
+pytest
+```
+
+GPU도, Hugging Face Hub 접근도 필요 없다 — `tests/conftest.py`가 `AutoConfig.from_pretrained`/
+`AutoProcessor.from_pretrained`를 아주 작은 합성 SmolVLM 설정으로 몽키패치해서, 실제
+`SmolVLAPolicy` 전체(forward/backward/추론 경로 포함)를 검증하는 테스트(`tests/
+test_ard_integration.py`)까지도 오프라인으로 돈다. 개별 파일만 돌리려면
+`pytest tests/test_ard.py`처럼 평소 pytest 쓰듯 하면 된다. CI(`.github/workflows/`)도 같은
+명령으로 매 push/PR마다 돈다.
+
 ## Modifying SmolVLA's model code
 
 `lerobot` is installed in **editable mode** from the source vendored at `third_party/lerobot` (trimmed from [huggingface/lerobot](https://github.com/huggingface/lerobot) `v0.4.4`, Apache-2.0), not from PyPI. This means the SmolVLA implementation lives inside this repo and is tracked by git:
@@ -88,17 +104,17 @@ ARD-VLA 연구계획서(양손 도구 조작 파인튜닝: 한 팔은 작업물�
 
 **검증.** 이 샌드박스의 네트워크 정책이 Hugging Face Hub를 막고 있고, `SmolVLAPolicy`는
 `load_vlm_weights=False`여도 SmolVLM2 백본 config를 항상 다운로드해야 해서 — 여기서는
-end-to-end로 생성해볼 수 없었습니다. 대신 `scripts/test_ard.py`에서 오프라인으로 검증한
+end-to-end로 생성해볼 수 없었습니다. 대신 `tests/test_ard.py`에서 오프라인으로 검증한
 내용: `SmolVLAConfig`의 새 검증 로직, 고정 역할 라우팅이 항상 오른팔 채널을 Actuator head로
 보내는지, 역할 split/combine 라운드트립, residual head의 zero-init/gradient 흐름,
 `compute_ard_losses`의 수치 계산(이 과정에서 실제 버그도 하나 잡았습니다: `L_force`가
 샘플별 타겟을 타임스텝별 예측값과 브로드캐스팅하려던 문제). `scripts/check_env.py`로는
-기본(`use_ard=False`) 경로가 여전히 그대로 import/실행되는 것도 확인했습니다. 둘 다 아래로
-실행할 수 있습니다:
+기본(`use_ard=False`) 경로가 여전히 그대로 import/실행되는 것도 확인했습니다. 테스트는
+`pytest`로 돌립니다(아래 "테스트" 절 참고):
 
 ```bash
 python scripts/check_env.py
-python scripts/test_ard.py
+pytest tests/test_ard.py
 ```
 
 `SmolVLAPolicy` 자체로 실제 forward/backward pass를 돌려보는 것(`use_ard=True`, 작은 VLM
@@ -183,7 +199,7 @@ python scripts/train_ard.py --dataset-repo-id <...> --use-gradnorm --gradnorm-al
 갱신되지 않고(다른 두 lambda의 재정규화에 딸려서만 미세하게 움직임) 1.0 근처에 머뭅니다.
 실질적으로는 smooth/traj 2-태스크 GradNorm이나 마찬가지입니다.
 
-이 스크립트는 GPU/Hub 접근 없이 end-to-end로 못 돌려봤지만, `scripts/test_ard.py`에
+이 스크립트는 GPU/Hub 접근 없이 end-to-end로 못 돌려봤지만, `tests/test_ard.py`에
 `GradNormLambdas`용 테스트 6개를 추가해서(초기 weights, 실제로 lambda가 움직이는지, 재정규화
 후 합이 유지되는지, force처럼 그래프와 끊긴 항도 안 죽는지, `gradnorm=None`이면 기존 고정
 lambda 경로와 완전히 같은지) 전부 통과를 확인했고, 별도로 **작은 합성 SmolVLM 백본**(진짜
@@ -233,7 +249,7 @@ step |        pos |     smooth |       traj | smooth/pos |   traj/pos
 으로 고친 뒤에는 `pos_loss`와 같은 자릿수(38~78% / 73~201%)로 커져서, `alpha`/`beta`/
 `lambda_*` 조정이 실제로 의미 있게 작동할 수 있는 스케일이 됐다.)
 
-**검증된 것**: `scripts/test_ard.py`에 추가한 회귀 테스트로 — (1) `v_t == u_t`(완벽한 예측)일
+**검증된 것**: `tests/test_ard.py`에 추가한 회귀 테스트로 — (1) `v_t == u_t`(완벽한 예측)일
 때 `x0_hat`이 `noise`/`time`을 무엇으로 샘플하든 `actions`와 대수적으로 정확히 같아짐,
 (2) 그 결과 `smooth_loss`/`traj_loss`가 `noise`와 무관하게 실제 `actions`의 1차/2차 차분과
 정확히 같아짐, (3) 상수 궤적이면 완벽한 예측에서 두 손실이 정확히 0이 됨, (4) 수정 전 방식
@@ -327,7 +343,7 @@ python scripts/train_ard.py --dataset-repo-id <...> --use-bridge-attention \
 
 **검증.** 이 샌드박스는 Hub/GPU 접근이 없어 실제 SmolVLM2 가중치로는 확인하지 못했다 — bitsandbytes
 같은 CUDA 필수 요소는 이 기능에 없어서(순수 PyTorch `nn.Linear`/`scaled_dot_product_attention`만
-사용), 이론상 CPU에서도 그대로 동작해야 하고 실제로 그렇게 확인했다. `scripts/test_ard.py`에
+사용), 이론상 CPU에서도 그대로 동작해야 하고 실제로 그렇게 확인했다. `tests/test_ard.py`에
 `BridgeAttention`/`resolve_bridge_layer_indices`/`AsymmetricResidualHeads(use_bridge_attention=True)`
 단위 테스트를 추가했고(zero-init 항등성, gradient 흐름, 잘못된 인자 거부, 하위호환 등), 별도로
 소형 합성 SmolVLM 백본으로 `SmolVLAPolicy`를 실제로 만들어서: (1) 레이어 인덱스가 기대대로
@@ -402,7 +418,7 @@ python scripts/train_ard.py --dataset-repo-id <...> --use-freq-policy --freq-lam
 python scripts/profile_memory.py --use-freq-policy
 ```
 
-**검증.** `scripts/test_freq_policy.py`(오프라인, GPU/Hub 접근 없이 순수 텐서 연산만으로
+**검증.** `tests/test_freq_policy.py`(오프라인, GPU/Hub 접근 없이 순수 텐서 연산만으로
 전부 검증 가능)에서: DCT 행렬의 직교정규성과 역변환 정확도(임의 n에 대해 복원 오차 <1e-8),
 `decay=0`일 때 시간 영역 MSE와의 정확한 수학적 등가성(Parseval 정리 자체를 회귀 테스트로
 검증), `decay>0`일 때 저주파 bin의 오차가 고주파 bin의 같은 크기 오차보다 손실에 더 크게
@@ -593,7 +609,7 @@ SmolVLA는 프레임 하나를 SigLIP 인코더 + pixel shuffle(`transformers`�
 메서드 하나를 거치므로 별도 처리가 필요 없습니다). `token_pruning_k_final`이 실험 변수입니다 —
 64에서 얼마나 더 줄일지 자유롭게 바꿔볼 수 있습니다.
 
-`scripts/test_token_pruning.py`(오프라인, 13개 통과 — 핵심 세트 보장, 다양성 채우기가 실제로
+`tests/test_token_pruning.py`(오프라인, 13개 통과 — 핵심 세트 보장, 다양성 채우기가 실제로
 코사인 거리 최대 토큰을 고르는지, gather 기반이라 선택된 토큰에만 정확히 gradient가 흐르는지
 등)에 더해, 실제 코드 경로(`SmolVLAPolicy.forward()` → `embed_prefix()`)를 소형 합성
 SmolVLM 백본(Hub 접근 없이 `AutoConfig`/`AutoProcessor.from_pretrained`만 몽키패치, vision
@@ -612,7 +628,7 @@ K_final=32/48/64 각각 5스텝 돌려 확인했습니다 — 전부 정상 종�
 - `requirements.txt` — research tooling installed on top of lerobot (notebook/plotting deps). torch and lerobot itself are installed by `scripts/install.sh`, not listed here.
 - `scripts/install.sh` — environment setup: CPU/GPU-aware torch install, editable `lerobot[smolvla]` install from `third_party/lerobot`, then `requirements.txt`.
 - `scripts/check_env.py` — import + CPU-fallback smoke test.
-- `scripts/test_ard.py` — offline unit tests for the ARD modification.
+- `tests/test_ard.py` — offline unit tests for the ARD modification.
 - `scripts/train_ard.py` — SmolVLA(+ARD) 전용 최소 학습 스크립트 (lerobot의 범용 학습 CLI 대체).
 - `scripts/count_params.py` — 구성 요소별 파라미터 집계 + 해상도별 이미지 토큰 수 실측.
 - `third_party/lerobot/` — vendored, editable LeRobot/SmolVLA source.

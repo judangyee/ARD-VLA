@@ -3,20 +3,18 @@
 대한 오프라인 단위 테스트. GPU/Hub 접근 없이 합성 텐서로 검증한다 (test_ard.py와 같은 방식).
 """
 
-import sys
 
 import torch
 
 from lerobot.policies.smolvla.token_pruning import compute_task_relevance_scores, select_tokens
 
-FAILURES = []
-
-
-def check(name: str, condition: bool, detail: str = ""):
-    status = "PASS" if condition else "FAIL"
-    print(f"[{status}] {name}" + (f" — {detail}" if detail and not condition else ""))
-    if not condition:
-        FAILURES.append(name)
+def check(name: str, condition: bool, detail: str = "") -> None:
+    """pytest 네이티브 assert로 바로 연결한다 — 실패하면 AssertionError가 올라가서
+    pytest가 어느 test_* 함수의 몇 번째 check()에서 실패했는지 트레이스백으로 보여준다.
+    (이 레포 전체 스크립트에서 쓰던 기존 "이름 + condition (+ detail)" 호출부는 그대로
+    두고, 이 헬퍼의 구현만 pytest 스타일로 바꿨다.)"""
+    message = name if not detail else f"{name} — {detail}"
+    assert condition, message
 
 
 def test_relevance_scores():
@@ -96,25 +94,3 @@ def test_gradient_flow():
         n_with_grad == batch * 32,
         detail=f"n_with_grad={n_with_grad}, 기대값={batch * 32}",
     )
-
-
-def main():
-    test_relevance_scores()
-    test_select_tokens_core_set_always_kept()
-    test_diversity_fill_picks_farthest_token()
-    test_gradient_flow()
-
-    print()
-    if FAILURES:
-        print(f"[FAIL] {len(FAILURES)}개 항목 실패: {FAILURES}")
-        sys.exit(1)
-    print("[OK] 비전 토큰 프루닝 단위 테스트 전체 통과.")
-    print(
-        "참고: SmolVLAPolicy 전체(embed_prefix 안에서 실제로 호출되는 경로)를 생성해서 테스트하지는 "
-        "않았습니다 — Hugging Face Hub에서 SmolVLM2 백본 config를 내려받아야 하는데 이 환경은 Hub "
-        "접근이 막혀 있습니다. 대신 token_pruning.py 자체를 합성 텐서로 직접 검증했습니다."
-    )
-
-
-if __name__ == "__main__":
-    main()

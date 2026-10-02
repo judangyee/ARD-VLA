@@ -4,7 +4,6 @@
 """
 
 import math
-import sys
 
 import torch
 
@@ -17,14 +16,13 @@ from lerobot.policies.smolvla.freq_policy import (
     get_dct_matrix,
 )
 
-FAILURES = []
-
-
-def check(name: str, condition: bool, detail: str = ""):
-    status = "PASS" if condition else "FAIL"
-    print(f"[{status}] {name}" + (f" — {detail}" if detail and not condition else ""))
-    if not condition:
-        FAILURES.append(name)
+def check(name: str, condition: bool, detail: str = "") -> None:
+    """pytest 네이티브 assert로 바로 연결한다 — 실패하면 AssertionError가 올라가서
+    pytest가 어느 test_* 함수의 몇 번째 check()에서 실패했는지 트레이스백으로 보여준다.
+    (이 레포 전체 스크립트에서 쓰던 기존 "이름 + condition (+ detail)" 호출부는 그대로
+    두고, 이 헬퍼의 구현만 pytest 스타일로 바꿨다.)"""
+    message = name if not detail else f"{name} — {detail}"
+    assert condition, message
 
 
 def test_dct_matrix_orthonormal():
@@ -181,33 +179,3 @@ def test_config_validation():
     # use_freq_policy=False면 위 제약이 전혀 적용되지 않는다 (하위호환 확인).
     cfg2 = SmolVLAConfig(use_freq_policy=False, chunk_size=1, n_action_steps=1)
     check("use_freq_policy=False면 chunk_size=1도 허용된다 (freq_policy와 무관)", cfg2.chunk_size == 1)
-
-
-def main():
-    test_dct_matrix_orthonormal()
-    test_dct_matrix_cache()
-    test_band_weights()
-    test_freq_loss_parseval_equivalence()
-    test_freq_loss_zero_when_equal()
-    test_freq_loss_prioritizes_low_frequency()
-    test_freq_loss_gradient_flow()
-    test_freq_loss_input_validation()
-    test_freq_loss_short_chunk_no_crash()
-    test_band_errors_diagnostic()
-    test_config_validation()
-
-    print()
-    if FAILURES:
-        print(f"[FAIL] {len(FAILURES)}개 항목 실패: {FAILURES}")
-        sys.exit(1)
-    print("[OK] FreqPolicy 주파수 일관성 손실 단위 테스트 전체 통과.")
-    print(
-        "참고: SmolVLAPolicy 전체(VLAFlowMatching.forward/SmolVLAPolicy.forward에 실제로 연결된 "
-        "경로)를 생성해서 테스트하지는 않았습니다 — Hugging Face Hub 접근이 막혀 있는 이 환경의 "
-        "한계입니다. 대신 freq_policy.py 자체를 직접 검증했고, 실제 forward/backward 연결은 "
-        "합성 백본으로 별도 확인했습니다(세션 기록 참고)."
-    )
-
-
-if __name__ == "__main__":
-    main()

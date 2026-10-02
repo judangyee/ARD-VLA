@@ -1,0 +1,30 @@
+name: tests
+
+# CPU 전용 pytest CI. GPU/Hugging Face Hub 접근이 필요한 검증(실제 가중치로 돌려보는 것)은
+# 이 레포의 성격상(README "Setup"/"Verifying the environment" 절 참고) 로컬 GPU 환경에서
+# 수동으로 해야 한다 — 여기서는 tests/conftest.py의 몽키패치(합성 SmolVLM config)로 오프라인
+# 동작하는 단위/통합 테스트만 돈다. 실제 Hub 접근이 필요한 테스트가 나중에 추가되면
+# `requires_hub` 마커를 붙이면 되고(pytest.ini 참고), 이 워크플로는 `-m "not requires_hub"`로
+# 그런 테스트를 자동으로 건너뛴다.
+
+on:
+  push:
+    branches: ["main", "master", "claude/**"]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install environment (CPU-only torch + editable lerobot[smolvla] + requirements.txt)
+        run: bash scripts/install.sh --no-venv
+
+      - name: Run pytest (skip tests that need real Hugging Face Hub access, if any)
+        run: pytest -m "not requires_hub"
