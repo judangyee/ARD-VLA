@@ -347,6 +347,19 @@ class ARDLossOutput:
     grad_loss: Tensor | None = None  # GradNorm 활성화 시에만 채워짐 (ARD-VLA 학습 루프가 별도로 backward)
 
 
+def _reduce_reg_loss(sq_diff: Tensor, time_weights: Tensor | None) -> Tensor:
+    """smooth_loss/traj_loss의 제곱차(`sq_diff`, shape (batch, ..., arm_dim))를 스칼라로
+    줄인다. `time_weights`가 None이면(기본, `ard_reg_time_weighting="none"`) 기존과 완전히
+    동일하게 전체 원소 평균(`sq_diff.mean()`)을 쓴다 — 이 분기는 과거 코드와 bit-for-bit
+    동일해야 하므로 절대 건드리지 않는다. `time_weights`(shape (batch,))가 주어지면 샘플별
+    평균을 먼저 낸 뒤 그 가중 평균을 쓴다(`ard_reg_time_weighting="one_minus_t"`가 여기로
+    `1 - time`을 넘긴다 — modeling_smolvla.py의 VLAFlowMatching.forward 참고)."""
+    if time_weights is None:
+        return sq_diff.mean()
+    per_sample = sq_diff.mean(dim=tuple(range(1, sq_diff.ndim)))
+    return (per_sample * time_weights).mean()
+
+
 def compute_ard_losses(
     per_element_loss: Tensor,
     stabilizer_traj_pred: Tensor,
@@ -361,6 +374,7 @@ def compute_ard_losses(
     force_target: Tensor | None = None,
     gradnorm: GradNormLambdas | None = None,
     shared_activation: Tensor | None = None,
+    reg_time_weights: Tensor | None = None,
 ) -> ARDLossOutput:
     """베이스 flow-matching 회귀 손실에 ARD의 역할별 정규화 항들을 결합한다.
 
@@ -391,6 +405,11 @@ def compute_ard_losses(
     gradnorm / shared_activation: 둘 다 주어지면 `lambda_smooth`/`lambda_force`/`lambda_traj`
         인자 대신 `gradnorm.lambda_*`(GradNorm으로 학습되는 값)를 쓴다. `gradnorm`만 주고
         `shared_activation`을 안 주면 에러 — GradNorm 그래디언트 norm 계산에 반드시 필요하다.
+    reg_time_weights: (batch,) 또는 None(기본). `config.ard_reg_time_weighting="one_minus_t"`일
+        때 `modeling_smolvla.py`가 `1 - time`을 넘긴다 — `x0_hat`은 flow-matching 타임스텝
+        `t`가 클수록(거의 순수 노이즈에 가까운 샘플일수록) 오차/분산이 커지는 경향이 있어서,
+        smooth_loss/traj_loss에서 그런 샘플의 영향을 줄이는 용도다. None이면(기본) 기존과
+        완전히 동일하게 가중치 없는 평균을 쓴다(`_reduce_reg_loss` 참고).
     """
     if gradnorm is not None and shared_activation is None:
         raise ValueError("gradnorm을 쓰려면 shared_activation(예: suffix_out)도 같이 넘겨야 합니다.")
@@ -401,7 +420,9 @@ def compute_ard_losses(
     # L_smooth = sum |s_t - s_{t-1}|^2, chunk 구간 내 예측된(노이즈 제거된) stabilizer 액션
     # 궤적 추정치(x0_hat 기반)에 대한 흔들림 페널티.
     if stabilizer_traj_pred.shape[1] > 1:
-        smooth_loss = (stabilizer_traj_pred[:, 1:] - stabilizer_traj_pred[:, :-1]).pow(2).mean()
+        smooth_loss = _reduce_reg_loss(
+            (stabilizer_traj_pred[:, 1:] - stabilizer_traj_pred[:, :-1]).pow(2), reg_time_weights
+        )
     else:
         smooth_loss = stabilizer_traj_pred.new_zeros(())
 
@@ -409,7 +430,7 @@ def compute_ard_losses(
     # 페널티(정밀한 도구 조작 중 급격한 방향 전환에 불이익을 준다).
     if actuator_traj_pred.shape[1] > 2:
         second_diff = actuator_traj_pred[:, 2:] - 2 * actuator_traj_pred[:, 1:-1] + actuator_traj_pred[:, :-2]
-        traj_loss = second_diff.pow(2).mean()
+        traj_loss = _reduce_reg_loss(second_diff.pow(2), reg_time_weights)
     else:
         traj_loss = actuator_traj_pred.new_zeros(())
 

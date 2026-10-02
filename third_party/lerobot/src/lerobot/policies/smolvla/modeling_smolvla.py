@@ -434,6 +434,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 force_target=force_target,
                 gradnorm=self.model.ard_gradnorm,
                 shared_activation=ard_extras["shared_activation"] if self.model.ard_gradnorm is not None else None,
+                reg_time_weights=ard_extras["reg_time_weights"],
             )
             loss = ard_out.total
             if self.config.use_freq_policy:
@@ -973,10 +974,18 @@ class VLAFlowMatching(nn.Module):
             stabilizer_traj_pred, actuator_traj_pred = split_by_role(
                 x0_hat[..., : 2 * arm_dim], arm_dim, actuator_is_first
             )
+            # x0_hat의 오차/분산은 t가 클수록(거의 순수 노이즈에 가까운 샘플일수록) 커지는
+            # 경향이 있다(README의 "ARD" 절 실측 참고) — ard_reg_time_weighting="one_minus_t"면
+            # 그런 샘플의 smooth/traj 기여를 (1-t)로 줄인다. 기본("none")이면 None을 넘겨서
+            # compute_ard_losses가 기존과 완전히 동일한 가중치 없는 평균을 쓰게 한다.
+            reg_time_weights = None
+            if self.config.ard_reg_time_weighting == "one_minus_t":
+                reg_time_weights = (1 - time).to(dtype=x0_hat.dtype)
             ard_extras.update({
                 "actuator_is_first": actuator_is_first,
                 "stabilizer_traj_pred": stabilizer_traj_pred,
                 "actuator_traj_pred": actuator_traj_pred,
+                "reg_time_weights": reg_time_weights,
                 # GradNorm 전용: actuator/stabilizer head 바로 직전의 공유 표현 — action_out_proj와
                 # ard_heads가 둘 다 이 텐서를 입력으로 받는다. use_gradnorm=False면 안 쓰인다.
                 "shared_activation": suffix_out,

@@ -128,6 +128,12 @@ class SmolVLAConfig(PreTrainedConfig):
     ard_lambda_force: float = 1.0  # Actuator 힘 추적(force-tracking) 페널티 가중치 (use_gradnorm=True면 무시됨 — GradNorm은 항상 1.0에서 시작)
     ard_lambda_traj: float = 1.0  # Actuator 궤적 스무딩(trajectory-smoothness) 페널티 가중치 (use_gradnorm=True면 무시됨 — GradNorm은 항상 1.0에서 시작)
 
+    # smooth_loss/traj_loss가 거는 대상인 x0_hat = x_t - t*v_t는, t(flow-matching 타임스텝)가
+    # 클수록(거의 순수 노이즈에 가까운 샘플일수록) 오차/분산이 커지는 경향이 있다(실측:
+    # README의 "ARD" 절 참고). "one_minus_t"면 샘플별로 (1-t) 가중치를 곱해서 t≈1 샘플의
+    # 영향을 줄인다 — "none"(기본값)이면 가중치 없이(기존과 완전히 동일하게) 그냥 평균낸다.
+    ard_reg_time_weighting: str = "none"  # "none" 또는 "one_minus_t"
+
     # --- VLA-Adapter(Wang et al., 2025)식 Bridge Attention — ARD head가 suffix_out(마지막 지점)
     # 하나만이 아니라 SmolLM2 백본의 여러 중간 레이어 특징도 cross-attention으로 조건받게 함 ---
     use_bridge_attention: bool = False  # use_ard=True일 때만 의미가 있다
@@ -203,6 +209,11 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError(
                     f"`ard_default_actuator_arm`은 'left' 또는 'right'여야 합니다. "
                     f"현재 값: {self.ard_default_actuator_arm!r}"
+                )
+            if self.ard_reg_time_weighting not in ("none", "one_minus_t"):
+                raise ValueError(
+                    f"`ard_reg_time_weighting`은 'none' 또는 'one_minus_t'여야 합니다. "
+                    f"현재 값: {self.ard_reg_time_weighting!r}"
                 )
         if self.use_gradnorm and not self.use_ard:
             raise ValueError("`use_gradnorm`은 `use_ard=True`일 때만 의미가 있습니다.")

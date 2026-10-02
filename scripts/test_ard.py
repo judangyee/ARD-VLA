@@ -54,6 +54,15 @@ def test_config_validation():
     except ValueError:
         check("잘못된 ard_default_actuator_arm 값을 거부한다", True)
 
+    check("ard_reg_time_weighting 기본값은 'none'이다", SmolVLAConfig().ard_reg_time_weighting == "none")
+    cfg_weighted = SmolVLAConfig(use_ard=True, ard_reg_time_weighting="one_minus_t")
+    check("ard_reg_time_weighting='one_minus_t'가 정상 생성된다", cfg_weighted.ard_reg_time_weighting == "one_minus_t")
+    try:
+        SmolVLAConfig(use_ard=True, ard_reg_time_weighting="bogus")
+        check("잘못된 ard_reg_time_weighting 값을 거부한다", False)
+    except ValueError:
+        check("잘못된 ard_reg_time_weighting 값을 거부한다", True)
+
 
 def test_resolve_actuator_is_first_is_fixed():
     device = torch.device("cpu")
@@ -416,6 +425,95 @@ def test_ard_smooth_traj_loss_zero_for_constant_trajectory():
     )
 
 
+def test_ard_reg_time_weighting_one_minus_t():
+    """ard_reg_time_weighting="one_minus_t"가 modeling_smolvla.py에서 하는 일(1-time을
+    reg_time_weights로 넘기는 것)을 compute_ard_losses 레벨에서 직접 재현해서 검증한다."""
+    torch.manual_seed(0)
+    batch, chunk, arm_dim = 3, 6, 7
+    actuator_is_first = resolve_actuator_is_first("right", batch_size=batch, device="cpu")
+    # 일부러 거친(매끄럽지 않은) 궤적을 줘서 smooth/traj_loss가 0이 아니게 만든다.
+    stabilizer_traj_pred = torch.randn(batch, chunk, arm_dim)
+    actuator_traj_pred = torch.randn(batch, chunk, arm_dim)
+
+    # 모든 샘플이 t=1이면 가중치(1-t)=0이라, 궤적이 아무리 거칠어도 smooth/traj_loss가
+    # 정확히 0이어야 한다.
+    all_t1_weights = torch.zeros(batch)
+    out_t1 = compute_ard_losses(
+        per_element_loss=torch.zeros(batch, chunk, 2 * arm_dim),
+        stabilizer_traj_pred=stabilizer_traj_pred,
+        actuator_traj_pred=actuator_traj_pred,
+        actuator_is_first=actuator_is_first,
+        arm_dim=arm_dim,
+        alpha=0.3,
+        beta=0.7,
+        lambda_smooth=1.0,
+        lambda_force=1.0,
+        lambda_traj=1.0,
+        reg_time_weights=all_t1_weights,
+    )
+    check(
+        "ard_reg_time_weighting: 전 샘플 t=1(가중치 0)이면 smooth_loss가 정확히 0이다",
+        out_t1.smooth_loss.item() == 0.0,
+    )
+    check(
+        "ard_reg_time_weighting: 전 샘플 t=1(가중치 0)이면 traj_loss가 정확히 0이다",
+        out_t1.traj_loss.item() == 0.0,
+    )
+
+    # 전 샘플 t=0(가중치 1)이면 가중치 없는(reg_time_weights=None) 기존 경로와 값이 같아야
+    # 한다 — per-sample mean 후 평균 내는 것과, 전체를 한 번에 평균 내는 것이 같은 chunk
+    # 길이에서는 수학적으로 동일하기 때문이다(단, 연산 순서가 달라 float32 수준의 완전한
+    # bit-exactness까지는 보장하지 않으므로 isclose로 비교한다 — bit-exactness는
+    # reg_time_weights=None(기본, "none") 경로 자체에서만 보장된다).
+    all_t0_weights = torch.ones(batch)
+    out_t0 = compute_ard_losses(
+        per_element_loss=torch.zeros(batch, chunk, 2 * arm_dim),
+        stabilizer_traj_pred=stabilizer_traj_pred,
+        actuator_traj_pred=actuator_traj_pred,
+        actuator_is_first=actuator_is_first,
+        arm_dim=arm_dim,
+        alpha=0.3,
+        beta=0.7,
+        lambda_smooth=1.0,
+        lambda_force=1.0,
+        lambda_traj=1.0,
+        reg_time_weights=all_t0_weights,
+    )
+    out_unweighted = compute_ard_losses(
+        per_element_loss=torch.zeros(batch, chunk, 2 * arm_dim),
+        stabilizer_traj_pred=stabilizer_traj_pred,
+        actuator_traj_pred=actuator_traj_pred,
+        actuator_is_first=actuator_is_first,
+        arm_dim=arm_dim,
+        alpha=0.3,
+        beta=0.7,
+        lambda_smooth=1.0,
+        lambda_force=1.0,
+        lambda_traj=1.0,
+    )
+    check(
+        "ard_reg_time_weighting: 전 샘플 t=0(가중치 1)이면 가중치 없는 경로와 값이 (근사적으로) 같다",
+        torch.isclose(out_t0.smooth_loss, out_unweighted.smooth_loss, atol=1e-6).item()
+        and torch.isclose(out_t0.traj_loss, out_unweighted.traj_loss, atol=1e-6).item(),
+    )
+
+    # reg_time_weights를 아예 안 주면(기본값 None, "none" 모드) 과거 코드가 하던 것과 똑같이
+    # "전체 원소를 한 번에 .mean()"한 값과 bit-for-bit 동일해야 한다(_reduce_reg_loss의
+    # time_weights=None 분기가 정확히 이 식이어야 함).
+    expected_smooth_unweighted = (stabilizer_traj_pred[:, 1:] - stabilizer_traj_pred[:, :-1]).pow(2).mean()
+    expected_traj_unweighted = (
+        (actuator_traj_pred[:, 2:] - 2 * actuator_traj_pred[:, 1:-1] + actuator_traj_pred[:, :-2]).pow(2).mean()
+    )
+    check(
+        "ard_reg_time_weighting=none(기본, reg_time_weights 생략)이면 smooth_loss가 과거 코드의 전체-평균 식과 bit-for-bit 동일하다",
+        torch.equal(out_unweighted.smooth_loss, expected_smooth_unweighted),
+    )
+    check(
+        "ard_reg_time_weighting=none(기본, reg_time_weights 생략)이면 traj_loss가 과거 코드의 전체-평균 식과 bit-for-bit 동일하다",
+        torch.equal(out_unweighted.traj_loss, expected_traj_unweighted),
+    )
+
+
 def test_gradnorm_lambdas():
     torch.manual_seed(0)
     gradnorm = GradNormLambdas(alpha=1.5, init_value=1.0)
@@ -504,6 +602,7 @@ def main():
     test_compute_ard_losses()
     test_ard_smooth_traj_loss_use_denoised_action_not_velocity()
     test_ard_smooth_traj_loss_zero_for_constant_trajectory()
+    test_ard_reg_time_weighting_one_minus_t()
     test_gradnorm_lambdas()
 
     print()
