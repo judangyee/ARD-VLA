@@ -225,14 +225,14 @@ def test_compute_ard_losses():
     torch.manual_seed(0)
     batch, chunk, arm_dim = 4, 6, 7
     per_element_loss = torch.rand(batch, chunk, 2 * arm_dim, requires_grad=True)
-    stabilizer_pred = torch.randn(batch, chunk, arm_dim, requires_grad=True)
-    actuator_pred = torch.randn(batch, chunk, arm_dim, requires_grad=True)
+    stabilizer_traj_pred = torch.randn(batch, chunk, arm_dim, requires_grad=True)
+    actuator_traj_pred = torch.randn(batch, chunk, arm_dim, requires_grad=True)
     actuator_is_first = resolve_actuator_is_first("right", batch_size=batch, device=per_element_loss.device)
 
     out = compute_ard_losses(
         per_element_loss=per_element_loss,
-        stabilizer_pred=stabilizer_pred,
-        actuator_pred=actuator_pred,
+        stabilizer_traj_pred=stabilizer_traj_pred,
+        actuator_traj_pred=actuator_traj_pred,
         actuator_is_first=actuator_is_first,
         arm_dim=arm_dim,
         alpha=0.3,
@@ -249,8 +249,8 @@ def test_compute_ard_losses():
     # alpha=1, beta=0이면 (근사적으로) stabilizer 손실만 남아야 한다.
     stab_only = compute_ard_losses(
         per_element_loss=per_element_loss.detach(),
-        stabilizer_pred=stabilizer_pred.detach(),
-        actuator_pred=actuator_pred.detach(),
+        stabilizer_traj_pred=stabilizer_traj_pred.detach(),
+        actuator_traj_pred=actuator_traj_pred.detach(),
         actuator_is_first=actuator_is_first,
         arm_dim=arm_dim,
         alpha=1.0,
@@ -269,8 +269,8 @@ def test_compute_ard_losses():
 
     with_force = compute_ard_losses(
         per_element_loss=per_element_loss.detach(),
-        stabilizer_pred=stabilizer_pred.detach(),
-        actuator_pred=actuator_pred.detach(),
+        stabilizer_traj_pred=stabilizer_traj_pred.detach(),
+        actuator_traj_pred=actuator_traj_pred.detach(),
         actuator_is_first=actuator_is_first,
         arm_dim=arm_dim,
         alpha=0.3,
@@ -281,6 +281,139 @@ def test_compute_ard_losses():
         force_target=torch.zeros(batch),
     )
     check("force_target을 주면 force_loss가 0이 아니게 된다", with_force.force_loss.item() > 0.0)
+
+
+def _compute_x0_hat(noise: torch.Tensor, actions: torch.Tensor, time: torch.Tensor, v_t: torch.Tensor) -> torch.Tensor:
+    """modeling_smolvla.py의 VLAFlowMatching.forward()와 동일한 식: x_t = t*noise + (1-t)*actions,
+    x0_hat = x_t - t*v_t. 이 테스트 파일은 SmolVLAPolicy를 생성하지 않으므로(Hub 접근 불가),
+    실제 forward()를 호출하지 않고 이 식만 별도로 재현해서 compute_ard_losses에 흘려 넣는다."""
+    time_expanded = time[:, None, None]
+    x_t = time_expanded * noise + (1 - time_expanded) * actions
+    return x_t - time_expanded * v_t
+
+
+def test_ard_smooth_traj_loss_use_denoised_action_not_velocity():
+    """개념 버그 회귀 테스트: smooth_loss/traj_loss는 velocity(v_t)가 아니라 x0_hat(노이즈 제거된
+    액션 궤적 추정치)에 걸려야 한다. v_t == u_t(완벽한 예측)이면 x0_hat == actions가 대수적으로
+    정확히 성립하므로(noise가 상쇄됨), 이때 smooth/traj_loss는 noise를 뭘 샘플했든, time을 뭘
+    샘플했든 실제 actions 자체의 1차/2차 차분과 정확히 같아야 한다."""
+    torch.manual_seed(0)
+    batch, chunk, arm_dim = 3, 8, 7
+    actuator_is_first = resolve_actuator_is_first("right", batch_size=batch, device="cpu")
+
+    actions = torch.randn(batch, chunk, 2 * arm_dim)
+    # actions 자체의 1차/2차 차분으로부터, split_by_role 이후 기대되는 smooth/traj를 직접 계산.
+    stab_actions, act_actions = split_by_role(actions, arm_dim, actuator_is_first)
+    expected_smooth = (stab_actions[:, 1:] - stab_actions[:, :-1]).pow(2).mean()
+    expected_traj = (
+        (act_actions[:, 2:] - 2 * act_actions[:, 1:-1] + act_actions[:, :-2]).pow(2).mean()
+    )
+
+    for trial, (noise_seed, time_seed) in enumerate([(1, 2), (3, 4), (5, 6)]):
+        torch.manual_seed(noise_seed)
+        noise = torch.randn(batch, chunk, 2 * arm_dim)
+        torch.manual_seed(time_seed)
+        time = torch.rand(batch)
+
+        v_t = noise - actions  # 완벽한 예측: v_t == u_t
+        x0_hat = _compute_x0_hat(noise, actions, time, v_t)
+        check(
+            f"[trial {trial}] v_t==u_t(완벽한 예측)이면 x0_hat이 noise/time과 무관하게 actions와 정확히 같다",
+            torch.allclose(x0_hat, actions, atol=1e-5),
+        )
+
+        stabilizer_traj_pred, actuator_traj_pred = split_by_role(x0_hat, arm_dim, actuator_is_first)
+        out = compute_ard_losses(
+            per_element_loss=torch.zeros_like(actions),
+            stabilizer_traj_pred=stabilizer_traj_pred,
+            actuator_traj_pred=actuator_traj_pred,
+            actuator_is_first=actuator_is_first,
+            arm_dim=arm_dim,
+            alpha=0.3,
+            beta=0.7,
+            lambda_smooth=1.0,
+            lambda_force=1.0,
+            lambda_traj=1.0,
+        )
+        check(
+            f"[trial {trial}] 완벽한 예측이면 smooth_loss가 noise와 무관하게 실제 actions의 1차 차분과 같다",
+            torch.isclose(out.smooth_loss, expected_smooth, atol=1e-5).item(),
+            detail=f"got={out.smooth_loss.item()} expected={expected_smooth.item()}",
+        )
+        check(
+            f"[trial {trial}] 완벽한 예측이면 traj_loss가 noise와 무관하게 실제 actions의 2차 차분과 같다",
+            torch.isclose(out.traj_loss, expected_traj, atol=1e-5).item(),
+            detail=f"got={out.traj_loss.item()} expected={expected_traj.item()}",
+        )
+
+    # (반대로) 만약 실수로 x0_hat이 아니라 v_t = noise - actions 자체를 썼다면, noise가 매
+    # 타임스텝 독립 샘플이라 smooth/traj가 0이 아닌 상당히 큰 값으로 나와야 정상이다 — 이
+    # 테스트가 실제로 "틀렸던 동작"과 "고친 동작"을 구분하고 있다는 걸 보여주는 대조군.
+    torch.manual_seed(7)
+    noise = torch.randn(batch, chunk, 2 * arm_dim)
+    v_t_wrong_input = noise - actions
+    stab_wrong, act_wrong = split_by_role(v_t_wrong_input, arm_dim, actuator_is_first)
+    out_wrong = compute_ard_losses(
+        per_element_loss=torch.zeros_like(actions),
+        stabilizer_traj_pred=stab_wrong,
+        actuator_traj_pred=act_wrong,
+        actuator_is_first=actuator_is_first,
+        arm_dim=arm_dim,
+        alpha=0.3,
+        beta=0.7,
+        lambda_smooth=1.0,
+        lambda_force=1.0,
+        lambda_traj=1.0,
+    )
+    check(
+        "대조군: velocity(v_t)를 (잘못) 직접 썼다면 smooth_loss가 actions 기준값과 다르게 나온다",
+        not torch.isclose(out_wrong.smooth_loss, expected_smooth, atol=1e-5).item(),
+        detail=f"wrong={out_wrong.smooth_loss.item()} actions_based={expected_smooth.item()}",
+    )
+
+
+def test_ard_smooth_traj_loss_zero_for_constant_trajectory():
+    """actions가 chunk 전체에 걸쳐 상수(시간에 따라 안 변함)면, 완벽한 예측에서 x0_hat도
+    상수이므로 1차/2차 차분 기반 smooth_loss/traj_loss는 정확히 0이어야 한다."""
+    torch.manual_seed(0)
+    batch, chunk, arm_dim = 2, 6, 7
+    actuator_is_first = resolve_actuator_is_first("right", batch_size=batch, device="cpu")
+
+    constant_step = torch.randn(batch, 1, 2 * arm_dim)
+    actions = constant_step.expand(batch, chunk, 2 * arm_dim).contiguous()
+
+    noise = torch.randn(batch, chunk, 2 * arm_dim)
+    time = torch.rand(batch)
+    v_t = noise - actions  # 완벽한 예측
+    x0_hat = _compute_x0_hat(noise, actions, time, v_t)
+    check("상수 궤적이면 완벽한 예측의 x0_hat도 noise와 무관하게 상수(=actions)다", torch.allclose(x0_hat, actions, atol=1e-5))
+
+    stabilizer_traj_pred, actuator_traj_pred = split_by_role(x0_hat, arm_dim, actuator_is_first)
+    out = compute_ard_losses(
+        per_element_loss=torch.zeros_like(actions),
+        stabilizer_traj_pred=stabilizer_traj_pred,
+        actuator_traj_pred=actuator_traj_pred,
+        actuator_is_first=actuator_is_first,
+        arm_dim=arm_dim,
+        alpha=0.3,
+        beta=0.7,
+        lambda_smooth=1.0,
+        lambda_force=1.0,
+        lambda_traj=1.0,
+    )
+    # float32 연산 잔차(이 테스트 기준 1e-15 수준) 때문에 정확히 0.0은 아닐 수 있어 작은 허용
+    # 오차를 둔다 — exact 0.0을 요구했다가 실제로는 버그가 아닌 부동소수점 노이즈로 실패했던
+    # 점을 확인하고 고친 것.
+    check(
+        "상수 궤적 + 완벽한 예측이면 smooth_loss가 (부동소수점 오차 내에서) 0이다",
+        out.smooth_loss.item() < 1e-8,
+        detail=f"smooth_loss={out.smooth_loss.item()}",
+    )
+    check(
+        "상수 궤적 + 완벽한 예측이면 traj_loss가 (부동소수점 오차 내에서) 0이다",
+        out.traj_loss.item() < 1e-8,
+        detail=f"traj_loss={out.traj_loss.item()}",
+    )
 
 
 def test_gradnorm_lambdas():
@@ -300,13 +433,13 @@ def test_gradnorm_lambdas():
         shared = torch.randn(batch, chunk, hidden, requires_grad=True)
         per_element_loss = shared[..., : 2 * arm_dim] ** 2
         # 일부러 스케일을 다르게 줘서(스무스=크게, 궤적=작게) lambda가 실제로 움직이는지 확인한다.
-        stabilizer_pred = shared[..., :arm_dim] * 3.0
-        actuator_pred = shared[..., arm_dim : 2 * arm_dim] * 0.1
+        stabilizer_traj_pred = shared[..., :arm_dim] * 3.0
+        actuator_traj_pred = shared[..., arm_dim : 2 * arm_dim] * 0.1
 
         out = compute_ard_losses(
             per_element_loss=per_element_loss,
-            stabilizer_pred=stabilizer_pred,
-            actuator_pred=actuator_pred,
+            stabilizer_traj_pred=stabilizer_traj_pred,
+            actuator_traj_pred=actuator_traj_pred,
             actuator_is_first=actuator_is_first,
             arm_dim=arm_dim,
             alpha=0.3,
@@ -347,8 +480,8 @@ def test_gradnorm_lambdas():
     # gradnorm이 아예 None이면(기존 고정 lambda 경로) grad_loss는 여전히 None이어야 한다 (하위호환).
     fixed = compute_ard_losses(
         per_element_loss=per_element_loss.detach(),
-        stabilizer_pred=stabilizer_pred.detach(),
-        actuator_pred=actuator_pred.detach(),
+        stabilizer_traj_pred=stabilizer_traj_pred.detach(),
+        actuator_traj_pred=actuator_traj_pred.detach(),
         actuator_is_first=actuator_is_first,
         arm_dim=arm_dim,
         alpha=0.3,
@@ -369,6 +502,8 @@ def main():
     test_bridge_attention_zero_init()
     test_asymmetric_residual_heads_with_bridge_attention()
     test_compute_ard_losses()
+    test_ard_smooth_traj_loss_use_denoised_action_not_velocity()
+    test_ard_smooth_traj_loss_zero_for_constant_trajectory()
     test_gradnorm_lambdas()
 
     print()
