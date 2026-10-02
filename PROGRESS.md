@@ -14,11 +14,11 @@
 - [x] 3. 대칭 대조군 모드 — `ard_symmetric`(기본 False), train_ard.py/compare_smolvla_ard.py/
       compare_bridge_attention.py CLI 연결.
 - [x] 4. 테스트를 `tests/`로 이전 + pytest 설정 + CPU 전용 CI.
-- [ ] 5. README 요약/가설 추가 + 새 옵션 문서화 + Layout 갱신 + docs/ 분리.
+- [x] 5. README 요약/가설 추가 + 새 옵션 문서화 + Layout 갱신 + docs/ 분리.
 
 ## 현재 상태
 
-1~4단계 완료.
+1~5단계 전부 완료.
 
 1단계: `configuration_smolvla.py`에 `ard_reg_time_weighting`("none" 기본 |
 "one_minus_t") 필드 + 검증 추가. `ard.py`에 `_reduce_reg_loss` 헬퍼(가중치 없으면
@@ -102,6 +102,25 @@ bitsandbytes 같은 선택 의존성이 필요한 기존 테스트는 없었다(
 `pytest`(루트에서 인자 없이), `pytest -m "not requires_hub"`, `scripts/check_env.py` 전부
 통과 확인(35개 테스트 전부 통과).
 
+5단계: `docs/` 신설 — `docs/ard.md`(ARD 핵심 구조 + GradNorm + 이번 작업에서 새로 추가된
+`ard_reg_time_weighting`/`ard_use_force_head`/`ard_symmetric` 세 옵션 문서화, 1~3단계 전부
+처음으로 README 밖에 문서화됨), `docs/bridge_attention.md`, `docs/freq_policy.md`,
+`docs/token_pruning.md`, `docs/profiling_tools.md`(count_params/gradient checkpointing/
+profile_memory/compare_smolvla_ard/layer_importance — compare_smolvla_ard의 세 변형 비교
+사용법은 중복을 피해 docs/ard.md로 링크만 건다)로 README의 기능별 상세 검증 기록을 전부
+옮겼다. "검증된 것 vs 아닌 것"(또는 "측정됨") 표기 관례는 그대로 유지했다.
+
+README.md는 맨 위에 3~5줄 가설 요약("Stabilizer/Actuator 역할 비대칭을 구조/손실에
+반영하면 대칭 처리보다 낫다")을 추가하고, 각 기능 절을 몇 줄 요약 + docs/ 링크로 압축했다.
+Layout 섹션을 `tests/`/`docs/`/`.github/workflows/`/`pytest.ini`/`PROGRESS.md`/
+새로 추가된 scripts(`profile_memory.py`/`compare_smolvla_ard.py`/
+`compare_bridge_attention.py`/`layer_importance.py`)까지 포함하도록 갱신했다.
+
+`pytest`(35개 전부 통과), `python scripts/check_env.py` 재확인(문서/README만 바꾼
+변경이라 코드 동작에 영향 없음을 재확인하는 목적).
+
 ## 다음에 할 일
 
-5단계(README 요약/가설 추가, Layout 갱신, docs/ 분리)부터 시작.
+없음 — 5단계까지 전부 완료. 사용자가 요청한 5단계 작업(코드 수정 + 단위 테스트 + 문서)은
+전부 끝났고, 실제 GPU/Hub 환경에서의 실험(probe/학습/메모리 측정)은 이번 작업 범위 밖이라
+그대로 남겨뒀다 — 각 docs/*.md의 "측정됨"/"아직 확인되지 않은 것" 절 참고.

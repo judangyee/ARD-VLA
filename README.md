@@ -2,6 +2,19 @@
 
 Research environment for experimenting with [SmolVLA](https://huggingface.co/docs/lerobot/smolvla), the small vision-language-action policy from Hugging Face's [LeRobot](https://github.com/huggingface/lerobot) framework.
 
+**ARD-VLA가 무엇인가.** 양손 도구 조작(한 팔은 작업물을 고정하는 Stabilizer, 다른 팔은
+정밀 조작을 수행하는 Actuator) 파인튜닝을 위해 SmolVLA의 액션 전문가에 선택적인 비대칭
+듀얼 헤드 구조(ARD, Asymmetric Role Decomposition)를 추가한 연구용 포크입니다. 모든 ARD
+관련 기능은 기본적으로 꺼져 있고, 켜지 않으면 업스트림 SmolVLA와 동일하게 동작합니다.
+
+**연구 가설.** 양손 조작에서 두 팔은 역할이 본질적으로 다르다 — Stabilizer는 "흔들리지
+않고 가만히 있는 것"이, Actuator는 "정밀하게 힘/궤적을 제어하는 것"이 중요하다. 이
+역할 비대칭을 모델 구조(헤드 분리)와 손실 함수(팔별로 다른 정규화 항)에 명시적으로
+반영하면, 양팔에 동일한 처리를 적용하는 대칭(symmetric) 접근보다 더 나은 정책을 학습할
+수 있을 것이다. 이 레포는 이 가설을 검증하기 위한 ARD 구조/손실과, 공정 비교를 위한
+대칭 대조군(`ard_symmetric`)을 함께 제공한다 — 아직 실제 데이터로 가설 자체를 검증하지는
+못했다(아래 각 기능 문서의 "검증된 것 vs 아닌 것" 참고).
+
 ## Setup
 
 ```bash
@@ -43,8 +56,8 @@ GPU도, Hugging Face Hub 접근도 필요 없다 — `tests/conftest.py`가 `Aut
 `AutoProcessor.from_pretrained`를 아주 작은 합성 SmolVLM 설정으로 몽키패치해서, 실제
 `SmolVLAPolicy` 전체(forward/backward/추론 경로 포함)를 검증하는 테스트(`tests/
 test_ard_integration.py`)까지도 오프라인으로 돈다. 개별 파일만 돌리려면
-`pytest tests/test_ard.py`처럼 평소 pytest 쓰듯 하면 된다. CI(`.github/workflows/`)도 같은
-명령으로 매 push/PR마다 돈다.
+`pytest tests/test_ard.py`처럼 평소 pytest 쓰듯 하면 된다. CI(`.github/workflows/tests.yml`)도
+같은 명령(`pytest -m "not requires_hub"`)으로 매 push/PR마다 돈다.
 
 ## Modifying SmolVLA's model code
 
@@ -68,57 +81,45 @@ What's left (`configs/`, `datasets/`, `envs/configs.py` only, `optim/`, `policie
 
 ## ARD: 비대칭 역할 분리 (Asymmetric Role Decomposition)
 
-ARD-VLA 연구계획서(양손 도구 조작 파인튜닝: 한 팔은 작업물을 고정하고, 다른 팔이 정밀한
-조작을 수행)에 따라, SmolVLA의 액션 전문가(action expert)가 선택적인 비대칭 듀얼 헤드 모드를
-지원하도록 확장했습니다. **Actuator 팔은 config로 고정되며, 항상 오른팔입니다** — 지시문마다
-역할이 바뀌지 않습니다. `ard_default_actuator_arm`이 그 역할을 맡을 팔을 지정하고, 모든
-샘플에 동일하게 적용됩니다.
+SmolVLA의 액션 전문가에 Stabilizer/Actuator 전용 residual head를 추가하는 핵심 기능입니다.
+`use_ard=False`(기본)면 업스트림 SmolVLA와 완전히 동일하게 동작합니다.
 
-- `third_party/lerobot/src/lerobot/policies/smolvla/ard.py` (신규 파일) — `AsymmetricResidualHeads`
-  (공유 flow-matching 출력 위에서 Stabilizer/Actuator 채널을 특화시키는 zero-init residual
-  MLP), `resolve_actuator_is_first`(고정된 왼팔/오른팔 라우팅), `compute_ard_losses`
-  (`alpha * L_stab + beta * L_act`, `L_stab = L_pos + λ·L_smooth`, `L_act = L_pos + λ·L_force +
-  λ·L_traj` — 연구계획서의 손실 설계를 그대로 따름. `L_pos`는 별도의 L1 항을 다시 계산하지
-  않고 베이스 모델 자체의 flow-matching 회귀 손실을 재사용합니다).
+- **핵심 구조/손실**: `AsymmetricResidualHeads`, `compute_ard_losses`(`L_pos`/`L_smooth`/
+  `L_force`/`L_traj`를 `alpha`/`beta`로 결합), 고정 왼팔/오른팔 라우팅.
+- **`ard_reg_time_weighting`**("none" 기본 | "one_minus_t") — smooth/traj 손실이 노이즈가
+  많이 섞인(`t`가 큰) 샘플에서 과도하게 시끄러워지는 것을 `(1-t)` 가중으로 완화하는 옵션.
+- **`ard_use_force_head`**(기본 False) — 접촉력/토크를 actuator 채널 재활용 대신 별도
+  `ForceHead` MLP로 예측.
+- **`ard_symmetric`**(기본 False) — 양팔에 동일한 정규화를 거는 공정 비교용 대조군 모드.
+- **GradNorm** (`--use-gradnorm`) — smooth/force/traj lambda를 그래디언트 norm 기준으로
+  자동 조정.
 
-  **`L_smooth`/`L_traj`가 거는 대상 — velocity가 아니라 노이즈 제거된 액션 추정치.**
-  `VLAFlowMatching.forward`는 flow-matching의 예측 velocity field `v_t`(목표는
-  `u_t = noise - actions`)를 만든다. 초기 구현은 `L_smooth`(1차 차분)/`L_traj`(2차 차분)를
-  이 `v_t` 자체에 걸었는데, 이건 개념적으로 틀렸다 — `u_t`는 매 타임스텝 독립적으로 샘플된
-  `noise` 때문에 시간축으로 원래 거칠어서, `v_t`에 스무딩 벌점을 주면 "이 velocity는
-  매끄러워야 한다"고 강요하는 셈이 되어 flow-matching 회귀 목표(`u_t`를 맞히는 것) 자체와
-  정면으로 충돌한다. 지금은 직선 보간 `x_t = t·noise + (1-t)·actions`로부터 역산한
-  `x0_hat = x_t - t·v_t`(노이즈 제거된 액션 추정치 — `v_t == u_t`일 때 `x0_hat`이 `actions`와
-  정확히 같아짐을 대수적으로 보장)에 `L_smooth`/`L_traj`를 건다. `compute_ard_losses`의
-  `stabilizer_traj_pred`/`actuator_traj_pred` 인자 이름도 이 의미를 명확히 하도록 바뀌었다.
-- `configuration_smolvla.py` — 새 `use_ard`, `ard_arm_dim`, `ard_alpha`/`ard_beta`,
-  `ard_lambda_{smooth,force,traj}`, `ard_default_actuator_arm`(기본값 `"right"`) 필드 추가,
-  기본값은 전부 꺼짐 (`use_ard=False`이면 업스트림 SmolVLA와 완전히 동일하게 동작 — 플래그를
-  켜지 않는 한 코드 경로가 전혀 바뀌지 않음을 검증함).
-- `modeling_smolvla.py` — `VLAFlowMatching.forward`(학습 손실), `.sample_actions`/
-  `.denoise_step`(추론, RTC 포함) 모두 동일한 residual head 보정과 고정 역할 라우팅을
-  적용해서 학습과 추론이 서로 어긋나지 않도록 함.
-- 선택적 샘플별 배치 키, 없으면 아무 영향 없음: `ard_force_target` (접촉력/토크 supervision —
-  현재 이 레포의 어떤 데이터셋도 이 값을 제공하지 않아서, 데이터셋이 생기기 전까지 `L_force`는
-  항상 0).
-
-**검증.** 이 샌드박스의 네트워크 정책이 Hugging Face Hub를 막고 있고, `SmolVLAPolicy`는
-`load_vlm_weights=False`여도 SmolVLM2 백본 config를 항상 다운로드해야 해서 — 여기서는
-end-to-end로 생성해볼 수 없었습니다. 대신 `tests/test_ard.py`에서 오프라인으로 검증한
-내용: `SmolVLAConfig`의 새 검증 로직, 고정 역할 라우팅이 항상 오른팔 채널을 Actuator head로
-보내는지, 역할 split/combine 라운드트립, residual head의 zero-init/gradient 흐름,
-`compute_ard_losses`의 수치 계산(이 과정에서 실제 버그도 하나 잡았습니다: `L_force`가
-샘플별 타겟을 타임스텝별 예측값과 브로드캐스팅하려던 문제). `scripts/check_env.py`로는
-기본(`use_ard=False`) 경로가 여전히 그대로 import/실행되는 것도 확인했습니다. 테스트는
-`pytest`로 돌립니다(아래 "테스트" 절 참고):
+자세한 구조 설명, 각 옵션 사용법, 그리고 지금까지의 검증된 것/측정된 것/아직 확인되지 않은 것
+기록은 **[docs/ard.md](docs/ard.md)** 에 있습니다.
 
 ```bash
-python scripts/check_env.py
-pytest tests/test_ard.py
+pytest tests/test_ard.py tests/test_ard_integration.py
 ```
 
-`SmolVLAPolicy` 자체로 실제 forward/backward pass를 돌려보는 것(`use_ard=True`, 작은 VLM
-차원으로)이 이 환경에 Hub 접근이 가능해지면 진행할 다음 검증 단계입니다.
+## Bridge Attention (`--use-bridge-attention`, VLA-Adapter식)
+
+ARD head가 action expert의 마지막 지점 출력(`suffix_out`) 하나만 보는 대신, SmolLM2 백본의
+여러 중간 레이어를 cross-attention으로 동시에 조건받게 하는 옵션입니다. zero-init gate라
+꺼져 있으면(기본) 기존과 100% 동일합니다. 파라미터 수 증가, 레이어 인덱스 자동/수동 선택,
+`scripts/compare_bridge_attention.py`를 통한 loss 비교 방법은 **[docs/bridge_attention.md](docs/bridge_attention.md)**
+에 있습니다.
+
+## FreqPolicy: 주파수 영역 일관성 손실 (`--use-freq-policy`)
+
+액션 청크를 DCT로 분해해서 저주파(궤적 형태)를 고주파(디테일)보다 우선하는 추가 손실입니다.
+`use_ard`와 독립적으로 켤 수 있고, 새 학습 파라미터가 없습니다. 수학적 등가성(Parseval)
+검증과 사용법은 **[docs/freq_policy.md](docs/freq_policy.md)** 에 있습니다.
+
+## 비전 토큰 프루닝 (`--use-token-pruning`, EfficientVLA식)
+
+프레임당 고정 64개 비전 토큰을 태스크 관련성 + 다양성 기준으로 줄이는 옵션입니다. 선택
+로직, gradient 흐름, K_final 스윕 검증은 **[docs/token_pruning.md](docs/token_pruning.md)**
+에 있습니다.
 
 ## 학습 (로컬 GPU 환경)
 
@@ -126,7 +127,7 @@ lerobot의 범용 학습 CLI(`lerobot_train.py`)는 모든 정책을 알아야 �
 의존해서 트림할 때 같이 지웠습니다. 대신 `scripts/train_ard.py`가 SmolVLA 하나만 아는 최소
 학습 루프입니다: `LeRobotDataset` 로드 → `SmolVLAConfig`/`SmolVLAPolicy` 생성 → optimizer/
 scheduler 빌드 → 학습 루프 → 주기적 체크포인트 저장. `use_ard=True`일 때는 `ard_stabilizer_loss`
-등 손실 breakdown도 함께 로깅됩니다.
+등 손실 breakdown도 함께 로깅됩니다(모드별 `loss_dict["ard_mode"]`도 포함).
 
 ```bash
 python scripts/train_ard.py \
@@ -144,491 +145,52 @@ python scripts/train_ard.py \
 발견한 버그이며, `lerobot.datasets.factory.resolve_delta_timestamps`(공식 `lerobot_train.py`가
 쓰는 것과 동일한 유틸)로 고쳤습니다.
 
-`--no-use-ard`를 주면 ARD 없이 베이스라인 SmolVLA만 학습합니다. 시작할 때 액션 채널의
-왼팔/오른팔 예상 순서를 출력해주니, 실제 로봇 배선과 맞는지 눈으로 한 번 확인하세요 (ARD는
-"앞 `ard_arm_dim`개=왼팔, 다음 `ard_arm_dim`개=오른팔"이라는 관례를 가정할 뿐, 데이터셋이
-실제로 그 순서인지는 검증하지 않습니다).
+`--no-use-ard`를 주면 ARD 없이 베이스라인 SmolVLA만 학습합니다. `--ard-symmetric`을 주면
+ARD 대신 [대칭 대조군 모드](docs/ard.md#대칭-대조군-모드-ablation-ard_symmetric)로 학습합니다.
+시작할 때 액션 채널의 왼팔/오른팔 예상 순서를 출력해주니, 실제 로봇 배선과 맞는지 눈으로 한
+번 확인하세요 (ARD는 "앞 `ard_arm_dim`개=왼팔, 다음 `ard_arm_dim`개=오른팔"이라는 관례를
+가정할 뿐, 데이터셋이 실제로 그 순서인지는 검증하지 않습니다).
 
 `--vlm-layer-indices`로 VLM 레이어를 "앞쪽 N개"가 아니라 특정 인덱스 조합으로 구성해서 학습할
 수도 있습니다 — `scripts/layer_importance.py`가 코사인 유사도 기준으로 골라준 레이어들을 그대로
-넣는 식입니다:
+넣는 식입니다(자세한 건 [docs/profiling_tools.md](docs/profiling_tools.md) 참고):
 
 ```bash
 python scripts/train_ard.py --dataset-repo-id <...> \
     --vlm-layer-indices 2 3 4 7 8 9 10 11 12 14 15 16 20 21 25 26
 ```
 
-먼저 `scripts/profile_memory.py --vlm-layer-indices ...`로 같은 조합이 메모리/빌드 문제없이
-도는지 확인해보는 걸 권장합니다 (이미 Colab GPU에서 검증된 경로입니다 — "메모리 프로파일링"
-절 참고).
-
 이 스크립트도 이 샌드박스에서는 end-to-end로 돌려보지 못했습니다(Hub 접근 차단) — 대신
 헬퍼 함수들(`split_policy_features`, `warn_if_action_layout_looks_wrong`)은 합성 데이터로
 직접 검증했고, import/인자 파싱도 확인했습니다. 실제 학습 루프 자체는 로컬 GPU 환경에서
 처음 돌려보실 때 검증해주세요.
 
-## GradNorm으로 lambda 자동 조정 (`--use-gradnorm`)
-
-`ard_lambda_smooth`/`force`/`traj`는 기본적으로 고정값(1.0)인데, `--use-gradnorm`을 주면
-GradNorm(Chen et al., 2018)으로 매 스텝 자동 조정됩니다 (`lerobot/policies/smolvla/ard.py`의
-`GradNormLambdas`). 핵심 아이디어: smooth/force/traj 세 항이 "공유 표현"(actuator/stabilizer
-head 바로 직전의 `suffix_out` — 액션 전문가 트랜스포머 출력, `action_out_proj`와 `ard_heads`가
-둘 다 이 텐서를 입력으로 받습니다)에 만드는 그래디언트 norm을 서로 균형 잡히게 맞춥니다.
-초기 대비 유난히 느리게 줄어드는(=상대적으로 여전히 큰) 항일수록 그래디언트 norm 목표치를
-크게 잡아서 해당 lambda가 커지도록 유도합니다.
-
-```bash
-python scripts/train_ard.py --dataset-repo-id <...> --use-gradnorm --gradnorm-alpha 1.5 --gradnorm-lr 0.025
-```
-
-**설계에서 중요한 점 두 가지**:
-1. lambda(`GradNormLambdas.weights`)는 메인 total loss의 backward로 직접 업데이트되면 안
-   됩니다 — 그러면 lambda가 그냥 0으로 수렴해버립니다(그래야 해당 항의 기여가 사라져서
-   total이 작아지므로). 그래서 메인 loss를 만들 때는 항상 `lambda.detach()`를 쓰고, 진짜
-   업데이트는 GradNorm 전용 손실(`L_grad`, `loss_dict['ard_grad_loss_tensor']`)로 학습
-   루프가 별도 옵티마이저(`policy.model.ard_gradnorm.weights`만 대상으로)를 만들어 처리합니다.
-   `policy.get_optim_params()`가 이 파라미터를 메인 옵티마이저에서 자동으로 제외합니다.
-2. 순서가 중요합니다: `grad_loss.backward(inputs=[...], retain_graph=True)`와 메인
-   `loss.backward()`를 **둘 다** 먼저 끝낸 뒤에야 `gradnorm_optimizer.step()` +
-   `renormalize()`를 호출해야 합니다 — lambda를 먼저 in-place로 바꿔버리면 메인 loss의
-   그래프가 그 값을 참조하고 있어서 "in-place로 바뀐 값" 에러가 납니다. `renormalize()`는
-   GradNorm 논문대로 세 lambda의 합을 항상 3(태스크 개수)으로 재정규화합니다.
-
-`force_target`이 없으면(이 레포의 모든 데이터셋이 그렇습니다) `force_loss`는 `suffix_out`과
-연결되지 않은 상수 0이라 그 항의 그래디언트 norm은 항상 0입니다 — `lambda_force`는 사실상
-갱신되지 않고(다른 두 lambda의 재정규화에 딸려서만 미세하게 움직임) 1.0 근처에 머뭅니다.
-실질적으로는 smooth/traj 2-태스크 GradNorm이나 마찬가지입니다.
-
-이 스크립트는 GPU/Hub 접근 없이 end-to-end로 못 돌려봤지만, `tests/test_ard.py`에
-`GradNormLambdas`용 테스트 6개를 추가해서(초기 weights, 실제로 lambda가 움직이는지, 재정규화
-후 합이 유지되는지, force처럼 그래프와 끊긴 항도 안 죽는지, `gradnorm=None`이면 기존 고정
-lambda 경로와 완전히 같은지) 전부 통과를 확인했고, 별도로 **작은 합성 SmolVLM 백본**(진짜
-Hub 다운로드 없이 `AutoConfig.from_pretrained`/`AutoProcessor.from_pretrained`만
-몽키패치)으로 `SmolVLAPolicy.forward()` → `compute_ard_losses()` → GradNorm 업데이트까지
-실제 코드 경로를 8스텝 돌려서 고정 lambda 방식과 비교했습니다:
-
-```
-고정 lambda=1.0:  ard_lambda_* 없음 (애초에 안 바뀜)
-GradNorm 8스텝 후: lambda_smooth 1.00 -> 1.33   lambda_force 1.00 -> 1.00(거의 고정)   lambda_traj 1.00 -> 0.67
-```
-
-이 실험 당시(아래에서 설명하는 `x0_hat` 수정 전) `smooth_loss`/`traj_loss`가 `pos_loss`에
-비해 원래 작았다는 사실과 별개로, GradNorm은 **그래디언트 norm**을 기준으로
-판단하기 때문에 라벨 그대로의 손실 크기와는 다른 방향으로 조정될 수 있습니다 — 실제로 이
-합성 백본 실험에서 `traj_loss`의 그래디언트 norm이 상대적으로 작게 나와서 GradNorm이
-`lambda_traj`를 오히려 낮췄습니다. 8스텝만에 손실 자체의 비율(smooth/pos, traj/pos)은 고정
-방식과 거의 같았는데, 이건 당연합니다 — GradNorm은 *미래* 그래디언트 업데이트 방향을
-바꾸는 것이지, 그 순간의 손실값 자체를 바꾸는 게 아니라서 몇 스텝 만에 차이가 크게 벌어지진
-않습니다. 이 실험은 8레이어짜리 무작위 초기화 장난감 백본 기준이라 절대적인 수치나 방향성이
-진짜 SmolVLM2에서도 그대로 재현될지는 실제 GPU 환경에서 다시 확인이 필요합니다.
-
-**주의 — 위 `smooth_loss`/`traj_loss` 스케일 수치는 수정 전(velocity 기반) 설계 기준입니다.**
-`L_smooth`/`L_traj`가 `v_t`(velocity)가 아니라 `x0_hat`(노이즈 제거된 액션 추정치)에 걸리도록
-고친 뒤, 같은 합성 백본으로 8스텝 probe를 수정 전/후 다시 돌려 비교했습니다:
-
-```
-[before-fix] (velocity v_t에 직접 건 경우)
-step |        pos |     smooth |       traj | smooth/pos |   traj/pos
-   1 |    2.68297 |    0.05490 |    0.29448 |      0.020 |      0.110
-   4 |    2.54958 |    0.05027 |    0.21060 |      0.020 |      0.083
-   8 |    2.32579 |    0.04368 |    0.09939 |      0.019 |      0.043
-
-[after-fix] (x0_hat에 건 경우)
-step |        pos |     smooth |       traj | smooth/pos |   traj/pos
-   1 |    2.68297 |    1.02752 |    1.95705 |      0.383 |      0.729
-   4 |    2.53317 |    1.07494 |    3.50039 |      0.424 |      1.382
-   8 |    2.34088 |    0.98089 |    1.82520 |      0.419 |      0.780
-```
-
-(둘 다 8레이어가 아니라 2레이어짜리 무작위 초기화 장난감 SmolVLM 백본, seed=0, 동일한 배치
-시퀀스 기준 — `pos` 열은 거의 그대로인데(ARD 외적인 베이스 flow-matching 손실이라 당연함),
-`smooth`/`traj`는 수정 후 자릿수가 통째로 달라진다. 이건 버그였다는 증거이기도 하다 — 수정
-전 `smooth_loss`/`traj_loss`는 `pos_loss`의 2~11%에 불과해 사실상 거의 기여를 못 했는데
-(위 GradNorm 절의 "원래 작다"는 서술이 이 증상을 가리킨 것), noise가 타임스텝마다 독립
-샘플이라 `v_t` 자체가 원래 거칠다는 걸 감안하면 오히려 더 커야 할 신호였다 — `x0_hat` 기반
-으로 고친 뒤에는 `pos_loss`와 같은 자릿수(38~78% / 73~201%)로 커져서, `alpha`/`beta`/
-`lambda_*` 조정이 실제로 의미 있게 작동할 수 있는 스케일이 됐다.)
-
-**검증된 것**: `tests/test_ard.py`에 추가한 회귀 테스트로 — (1) `v_t == u_t`(완벽한 예측)일
-때 `x0_hat`이 `noise`/`time`을 무엇으로 샘플하든 `actions`와 대수적으로 정확히 같아짐,
-(2) 그 결과 `smooth_loss`/`traj_loss`가 `noise`와 무관하게 실제 `actions`의 1차/2차 차분과
-정확히 같아짐, (3) 상수 궤적이면 완벽한 예측에서 두 손실이 정확히 0이 됨, (4) 수정 전 방식
-(velocity를 직접 쓰는 대조군)과는 값이 달라짐 — 을 직접 수치로 확인했고, 기존 GradNorm
-테스트 전부와 `force_loss` 로직(입력만 `x0_hat` 기반으로 바뀌었을 뿐 동작은 그대로)도 여전히
-통과합니다.
-
-**측정됨(실제로 문제가 될 수 있다는 쪽)**: `x0_hat = x_t - t·v_t`는 `t`(flow-matching
-타임스텝)가 클수록 오차가 커질 수 있습니다 — `x0_hat - actions = -t·(v_t - u_t)`이므로
-velocity 예측 오차가 `t` 배만큼 그대로 반영되고, 학습 초반/언더피팅 구간에서는 `t`가 1에
-가까운(거의 순수 노이즈인) 샘플일수록 `v_t`의 예측 오차 자체가 실질적으로 더 큰 경향이
-있습니다. 같은 장난감 백본을 8스텝 가볍게 학습시킨 뒤 `t`를 5개 구간으로 고정해서
-`|x0_hat - actions|`의 평균/표준편차를 측정했습니다:
-
-```
-t 구간          | mean|x0_hat-actions| | std|x0_hat-actions|
-[0.00, 0.20)    |                 0.12 |                0.07
-[0.20, 0.40)    |                 0.36 |                0.07
-[0.40, 0.60)    |                 0.60 |                0.08
-[0.60, 0.80)    |                 0.83 |                0.10
-[0.80, 1.00)    |                 1.06 |                0.10
-```
-
-평균 오차가 `t=[0, 0.2)`에서 `t=[0.8, 1.0)`까지 약 8.7배(0.12 → 1.06)로 뚜렷하게 커지는
-걸 확인했습니다 — 우려가 실제 현상임을 이 장난감 백본 기준으로는 확인한 셈입니다. 다만 이게
-진짜 SmolVLM2 규모에서도 학습에 실질적으로 해로운 수준인지(단순히 "큰 t의 샘플일수록
-smooth/traj 신호가 더 시끄럽다" 정도인지, 아니면 학습을 실제로 방해하는지)는 확인되지
-않았습니다 — 실제 GPU 환경에서 다시 측정해봐야 압니다. 문제가 된다면 `(1-t)` 가중(= `t`가
-클수록 smooth/traj 항의 기여를 줄이는 방식) 같은 보정을 추가할 수 있지만, 이번 수정에는
-포함하지 않았습니다(선택적 후속 작업 — 켤지 말지, 가중 함수를 뭘로 할지는 사용자가 실제
-데이터로 확인한 뒤 결정하는 게 낫다고 판단함).
-
-## Bridge Attention: 백본 여러 레이어를 조건으로 (`--use-bridge-attention`, VLA-Adapter식)
-
-기존 ARD head(`stabilizer_head`/`actuator_head`)는 action expert 트랜스포머의 **마지막 지점
-출력**(`suffix_out`) 하나만 조건으로 받는다. VLA-Adapter(Wang et al., 2025)의 Bridge
-Attention 아이디어를 빌려서, SmolLM2 백본의 **여러 중간 레이어**(초반/중반/후반/마지막 등
-서로 다른 깊이) hidden state까지 cross-attention으로 동시에 조건받을 수 있게 확장했다.
-
-- `lerobot/policies/smolvla/ard.py`(신규) — `BridgeAttention`: `suffix_out`을 쿼리로, 선택된
-  여러 VLM 레이어의 prefix(이미지+언어) hidden state를 KV로 하는 멀티헤드 cross-attention.
-  레이어마다 다른 깊이에서 왔다는 걸 구분하는 학습 가능한 `layer_embed`를 더한 뒤 이어붙여서
-  KV로 쓴다. 출력은 `tanh(gate)`로 스케일되고 `gate`는 0으로 초기화되어(LLaMA-Adapter의
-  zero-init attention과 같은 방식) 학습 초반에는 이 브랜치가 아무 영향도 주지 않는다 — 기존
-  head의 마지막 레이어 zero-init과 합쳐져서, `--use-bridge-attention`을 켜도 학습 시작 시점의
-  모델 출력은 꺼져 있을 때와 **완전히 동일**하다.
-- `resolve_bridge_layer_indices()` — 조건으로 쓸 레이어 인덱스를 정한다. `--ard-bridge-layer-indices`를
-  안 주면 (SmolVLA가 실제로 쓰는, 트림된) `num_vlm_layers`의 1/4·1/2·3/4·마지막 지점 4개를
-  자동으로 고른다. **주의**: 이 인덱스는 원본 32개가 아니라 트림된(기본 16개) 레이어 기준이다
-  — `layer_importance.py`가 분석하는 원본 인덱싱과 다르다.
-- `smolvlm_with_expert.py`의 `SmolVLMWithExpertModel.forward(collect_layer_indices=...)` —
-  VLM/action expert를 레이어 단위로 번갈아 처리하는 기존 인터리브 루프가 이미 매 레이어마다
-  VLM 스트림의 중간 결과를 만들어내고 있어서, 지정한 레이어 인덱스를 지날 때 그 값을
-  `self.last_collected_prefix_layers`에 캡처하기만 하면 된다 — **추가 forward pass 없이**
-  공짜로 얻는다. `layer_importance.py`처럼 `text_model(...)`을 별도로 통째로 다시 돌리는
-  방식은(그 방식도 처음엔 검토했다) 계산량이 그만큼 늘어나는 데다, 애초에 이 인터리브 루프는
-  각 레이어의 `forward()`를 통으로 부르지 않고 `self_attn`/`mlp` 서브모듈을 직접 호출하는
-  구조라 `layer_importance.py`가 쓰는 (레이어 전체에 거는) forward hook 방식 자체가 여기서는
-  안 먹힌다 — 그래서 훅 대신 인터리브 루프 안에서 직접 캡처하는 방식을 택했다.
-  추론(`sample_actions`)에서는 prefix KV 캐시를 만드는 시점에 **딱 한 번만** 계산되고, 이후
-  `num_steps`번의 `denoise_step` 호출 전부가 `past_key_values`와 마찬가지로 그 결과를
-  재사용한다(다시 계산하지 않음).
-- `AsymmetricResidualHeads`에 `stabilizer_bridge`/`actuator_bridge`(각각 독립된 `BridgeAttention`
-  인스턴스)를 추가했다 — Stabilizer/Actuator가 백본 특징 중 서로 다른 부분에 주목하도록 별도로
-  학습된다. `SmolVLAConfig(use_bridge_attention=False)`가 기본값이라 켜지 않으면 기존과 100%
-  동일하게 동작한다.
-
-```bash
-python scripts/train_ard.py --dataset-repo-id <...> --use-bridge-attention
-# 조건 레이어를 직접 고르거나 헤드 수를 바꾸려면:
-python scripts/train_ard.py --dataset-repo-id <...> --use-bridge-attention \
-    --ard-bridge-layer-indices 4 8 12 15 --ard-bridge-num-heads 8
-```
-
-**파라미터 수 증가.** SmolLM2-360M의 공개적으로 알려진 config 값(hidden_size=960 — 이
-샌드박스는 Hub 접근이 없어 직접 로드해서 재검증은 못 했다) 기준, `expert_width_multiplier=0.75`
-(action expert hidden=720), `ard_arm_dim=7`, 기본 4개 조건 레이어로 계산하면:
-
-| | 파라미터 수 | 전체(~450M) 대비 |
-|---|---|---|
-| ARD head만 (Bridge 없음) | 524,174 | 0.1165% |
-| ARD head + Bridge Attention | 5,376,016 | 1.1947% |
-
-즉 ARD head가 차지하는 비중이 **0.12% → 1.19%**로 늘어난다 — 절대량으로는 약 485만
-파라미터(전체 모델의 약 1%) 추가로, 액션 전문가 트랜스포머 전체를 복제하는 것에 비하면 여전히
-경량이다. `BridgeAttention` 인스턴스 하나(stabilizer 또는 actuator)의 내역은 `q_proj`/`out_proj`가
-각각 `H_e × H_e`(720×720), `k_proj`/`v_proj`가 각각 `H_v × H_e`(960×720)이고, `layer_embed`는
-`num_bridge_layers × H_v`(4×960)로 미미하다 — 이 계산은
-`AsymmetricResidualHeads(use_bridge_attention=True, ...)`를 직접 만들어서 파라미터를 세는
-방식으로 재현 가능하다.
-
-**검증.** 이 샌드박스는 Hub/GPU 접근이 없어 실제 SmolVLM2 가중치로는 확인하지 못했다 — bitsandbytes
-같은 CUDA 필수 요소는 이 기능에 없어서(순수 PyTorch `nn.Linear`/`scaled_dot_product_attention`만
-사용), 이론상 CPU에서도 그대로 동작해야 하고 실제로 그렇게 확인했다. `tests/test_ard.py`에
-`BridgeAttention`/`resolve_bridge_layer_indices`/`AsymmetricResidualHeads(use_bridge_attention=True)`
-단위 테스트를 추가했고(zero-init 항등성, gradient 흐름, 잘못된 인자 거부, 하위호환 등), 별도로
-소형 합성 SmolVLM 백본으로 `SmolVLAPolicy`를 실제로 만들어서: (1) 레이어 인덱스가 기대대로
-계산되는지, (2) 학습 경로(`policy.forward`)에서 forward+backward 5스텝이 정상 동작하고
-bridge 쪽에도 실제로 gradient가 흐르는지(첫 스텝엔 gate=0이라 정확히 0, 이후 스텝부터
-0이 아니게 됨 — 설계대로), (3) 추론 경로(`sample_actions`)에서 prefix 레이어 수집이 정확히
-1번만 일어나고 이후 `num_steps`번의 `denoise_step`이 전부 그 결과를 재사용하는지(직접 호출
-횟수를 세어 확인), (4) `gradient_checkpointing_enable()`과 동시에 켜도 문제없는지까지
-전부 확인했다. 실제 SmolVLM2 가중치로 손실이 실제로 더 잘 내려가는지(Bridge Attention의
-효과 자체)는 실제 GPU 환경에서 로컬 데이터셋으로 학습해봐야 확인할 수 있다.
-
-### Bridge Attention이 실제로 loss를 개선하는지 비교 (`scripts/compare_bridge_attention.py`)
-
-`--use-bridge-attention`을 켠 모델과 끈 모델을 **같은 데이터 순서로** 순차 학습시켜서 loss
-곡선을 직접 비교하는 스크립트입니다 (GPU 메모리를 하나만 쓰면서도 공정하게 비교하려고 동시가
-아니라 순차로 돌되, 두 실행 모두 같은 시드로 `DataLoader`를 만들어 배치 순서를 똑같이 맞춥니다).
-
-```bash
-python scripts/compare_bridge_attention.py \
-    --dataset-repo-id <HF_USER>/<DATASET> \
-    --steps 300 \
-    --batch-size 8
-```
-
-스텝별 loss 비교 표, `loss_curve.png`(두 곡선 겹쳐 그림), `loss_curve.csv`(원본 수치)를
-`--output-dir`(기본 `outputs/compare_bridge_attention`)에 남깁니다. **중요한 과학적 주의점**:
-이건 파라미터 개수를 맞춘 통제 실험이 아닙니다 — Bridge Attention을 켜면 ARD head의 학습 가능
-파라미터 자체가 늘어나므로(위 "파라미터 수" 표 참고), loss가 더 잘 내려간다 해도 그게 "여러
-레이어를 조건으로 주는 메커니즘" 덕분인지 "단순히 파라미터가 더 많아서"인지 이 비교만으로는
-완전히 분리되지 않습니다 — 이 데이터셋에서 실제로 도움이 되는지/안 되는지의 1차 판단 용도로
-쓰세요.
-
-이 스크립트도 실제 데이터셋 접근이 없는 이 샌드박스에서는 끝까지 돌려보지 못했다 —
-`train_ard.py`와 동일한 학습 루프 구조를 그대로 재사용했고(GradNorm은 비교 변수를 Bridge
-Attention 하나로 좁히기 위해 뺐다), 이 스크립트에서 새로 추가된 부분(두 변형이 정확히 같은
-배치 순서를 보도록 시드 고정하는 로직, 요약/CSV/그래프 저장 함수)은 합성 데이터로 직접
-오프라인 검증했다.
-
-## FreqPolicy: 주파수 영역 일관성 손실 (`--use-freq-policy`, FreqPolicy(2025)식)
-
-FreqPolicy 원 논문은 액션 청크를 DCT(Discrete Cosine Transform)로 주파수 성분으로 분해해서,
-저주파(궤적 전체의 형태)부터 고주파(세부 디테일)까지 coarse-to-fine 순서로 자기회귀
-(autoregressive) 생성하는 새로운 액션 디코딩 방식입니다. 이 레포는 SmolVLA의 기존
-flow-matching 병렬 디코딩(청크 전체를 한 번에 예측, 고정 `num_steps`번 반복 정제 — "지금
-ARD-VLA는 병렬 디코딩으로..." 절 참고)을 그대로 유지하기로 했으므로(생성 메커니즘 자체는
-바꾸지 않음), 그 논문의 핵심 통찰 — **저주파(궤적의 전반적인 형태)가 고주파(디테일)보다 더
-근본적이고 먼저/더 신뢰성 있게 맞아야 한다** — 만 가져와서, 기존 flow-matching 회귀 손실에
-얹는 **추가(additive) 주파수 일관성 손실**로 구현했습니다.
-
-- `lerobot/policies/smolvla/freq_policy.py`(신규) — `build_dct_matrix`: 직교정규(orthonormal)
-  DCT-II 변환 행렬을 만든다(`scipy.fft.dct(norm="ortho")`와 동일 정의, 학습 파라미터 없이
-  고정 행렬이라 새 `nn.Module`이 필요 없다). `compute_frequency_consistency_loss`: 예측
-  velocity(`v_t`)와 목표 velocity(`u_t`)를 청크(시간) 축으로 DCT 변환한 뒤, 저주파 bin에
-  더 큰 가중치(`exp(-decay * k/(chunk_size-1))`)를 준 MSE를 계산한다. `decay=0`이면(전
-  bin 가중치 1) 이 손실은 **Parseval 정리**에 의해 시간 영역 MSE와 수학적으로 정확히 같다 —
-  `decay`를 얼마나 올리는지가 "저주파를 얼마나 더 우선할지"를 결정하는 유일한 새 신호다.
-- 참고로 기존 ARD의 `smooth_loss`(1차 차분)/`traj_loss`(2차 차분)도 사실 고주파 성분에
-  벌점을 주는 것과 같은 방향의 아이디어입니다(유한 차분은 일종의 고역통과 필터입니다) — 이
-  손실은 그걸 1차/2차 차분이라는 좁은 근사 대신, 청크 길이 전체에 대한 완전한 스펙트럼
-  분해로 일반화한 것으로 볼 수 있습니다.
-- `use_ard`와 완전히 독립적입니다(둘 다 꺼도 켤 수 있음) — `SmolVLAConfig(use_freq_policy=True)`
-  만으로 켤 수 있고, `VLAFlowMatching.forward()`에서 계산된 `freq_loss`가 `loss_dict["freq_consistency_loss"]`
-  로 로깅되며 `freq_lambda`만큼 가중되어 total loss에 더해집니다.
-- 새 학습 파라미터가 전혀 없습니다(순수 신호처리 손실 함수라 `nn.Module`을 새로 추가하지
-  않음) — Bridge Attention과 달리 파라미터 수/메모리 증가가 사실상 0에 가까워야 정상입니다.
-
-```bash
-python scripts/train_ard.py --dataset-repo-id <...> --use-freq-policy
-# 가중치/저주파 우선 정도 조정:
-python scripts/train_ard.py --dataset-repo-id <...> --use-freq-policy --freq-lambda 0.5 --freq-decay 3.0
-# 데이터셋 없이 빌드/메모리만 빠르게 확인:
-python scripts/profile_memory.py --use-freq-policy
-```
-
-**검증.** `tests/test_freq_policy.py`(오프라인, GPU/Hub 접근 없이 순수 텐서 연산만으로
-전부 검증 가능)에서: DCT 행렬의 직교정규성과 역변환 정확도(임의 n에 대해 복원 오차 <1e-8),
-`decay=0`일 때 시간 영역 MSE와의 정확한 수학적 등가성(Parseval 정리 자체를 회귀 테스트로
-검증), `decay>0`일 때 저주파 bin의 오차가 고주파 bin의 같은 크기 오차보다 손실에 더 크게
-반영되는지, gradient 흐름, 잘못된 입력 거부, config 검증까지 확인했습니다. 별도로 소형 합성
-SmolVLM 백본으로 `SmolVLAPolicy.forward()`를 실제로 만들어서 `use_ard`/`use_freq_policy`
-4가지 조합(둘 다 꺼짐/`use_ard`만/`use_freq_policy`만/둘 다 켜짐) 전부와 `use_bridge_attention`
-까지 셋을 동시에 켠 조합까지 forward+backward가 정상 동작하는지, `loss_dict`의
-`freq_consistency_loss` 키 존재 여부가 정확히 `use_freq_policy`를 따르는지 확인했습니다.
-실제 SmolVLM2 가중치로 이 손실이 실제로 궤적 품질(smoothness, task 성공률 등)을 개선하는지는
-아직 확인하지 못했습니다 — 실제 로봇 데이터셋으로 학습해봐야 압니다.
-
-## 파라미터 구성 확인 (`scripts/count_params.py`)
-
-SmolVLA(+ARD) 전체 파라미터를 비전 인코더 / LLM(SmolLM2) / Action Expert / ARD head /
-나머지 shim 레이어로 나눠서 개수와 비중을 보여주고, 지정한 해상도별로 이미지가 실제로 몇 개의
-토큰이 되는지도 출력합니다. `load_vlm_weights=False`라 전체 가중치를 받지는 않지만, config는
-Hugging Face Hub에서 받아야 해서 이 샌드박스에서는 실행이 안 됩니다 (compile/import/CLI 파싱은
-확인했고, 실행하면 예상대로 네트워크 호출 단계에서 막히는 것까지 확인했습니다).
-
-```bash
-python scripts/count_params.py --resolutions 384 512 768
-```
-
-중요: SmolVLA는 SmolLM2-360M의 레이어를 전부 쓰지 않고 `config.num_vlm_layers`(기본값 16)개만
-물리적으로 잘라서 씁니다(`smolvlm_with_expert.py`의 `text_model.layers = ...[:num_vlm_layers]`).
-이 스크립트는 원본 레이어 수와 실제 사용하는 레이어 수를 둘 다 보여줘서 이 부분을 헷갈리지
-않게 합니다.
-
-## Gradient checkpointing (`SmolVLMWithExpertModel.gradient_checkpointing_enable()`)
-
-`SmolVLMWithExpertModel.forward()`는 VLM과 action expert를 레이어 단위로 번갈아 호출하는
-커스텀 루프라서, transformers의 표준 `model.gradient_checkpointing_enable()` 훅이 걸리지
-않습니다 (그 훅은 서브모듈의 표준 `forward()` 호출 경로를 가로채는데, 이 루프는 그 경로를
-쓰지 않습니다). 그래서 이번에 별도로 추가했습니다:
-
-```python
-vlm_expert = policy.model.vlm_with_expert
-vlm_expert.gradient_checkpointing_enable()   # 켜기
-vlm_expert.gradient_checkpointing_disable()  # 끄기
-```
-
-내부적으로 레이어 하나의 본문을 `_run_layer()`로 뽑아내고, 학습 중(`self.training`)이면서
-KV 캐시를 안 쓰는 forward 경로(`use_cache=False`, `fill_kv_cache=False` — 즉 학습 시
-`VLAFlowMatching.forward`가 실제로 쓰는 경로)에서만 `torch.utils.checkpoint.checkpoint(
-self._run_layer, ..., use_reentrant=False)`로 감쌉니다. 추론(`sample_actions`/`denoise_step`,
-KV 캐시 사용)에는 영향이 없습니다.
-
-이 기능은 실제 SmolVLM2 모델로 검증하지 못했습니다(Hub 접근 차단, GPU 없음) — 대신 동일한
-호출 시그니처(텐서 리스트 + `None` + non-tensor 인자가 섞인 형태)를 흉내 낸 가짜 레이어로
-체크포인팅 유무에 따라 forward 출력과 gradient가 정확히 일치하는지 별도로 검증했습니다.
-`check_env.py`/`test_ard.py`는 이 플래그가 기본 `False`라 회귀 없이 통과합니다.
-
-## 메모리 프로파일링 (`scripts/profile_memory.py`)
-
-LoRA + bf16 autocast + gradient checkpointing을 모두 켠 상태에서, bimanual 액션
-(14 DoF, `chunk_size=50`) 더미 배치로 forward+backward를 한 번 돌려 배치 사이즈별
-(`1, 2, 4, 8, 16, 32` 기본값) `torch.cuda.max_memory_allocated()` 최대 메모리를 표로 출력하는
-스크립트입니다. Colab/Kaggle 노트북에서 GPU 런타임으로 바로 돌릴 수 있게 단일 파일로
-작성했습니다:
-
-```bash
-!pip install -e "third_party/lerobot[smolvla,peft]"
-!python scripts/profile_memory.py
-```
-
-`--no-lora`, `--no-bf16`, `--no-grad-checkpoint`, `--no-ard`로 각 기법을 개별적으로
-끄고 비교할 수 있고, 배치 사이즈 도중 OOM이 나도 스크립트가 죽지 않고 해당 칸을 "OOM"으로
-표시한 뒤 나머지 배치 사이즈를 계속 시도합니다.
-
-LoRA는 기존에 있던 `PreTrainedPolicy.wrap_with_peft()`를 그대로 사용합니다 — 다만
-SmolVLA의 기본 LoRA 타겟(`lm_expert`의 attention projection들)에는 ARD의
-`stabilizer_head`/`actuator_head`가 포함되지 않아서, `wrap_with_peft()`가 나머지 전부를
-얼린 뒤 ARD head를 명시적으로 다시 `requires_grad_(True)`로 풀어줍니다 (그렇지 않으면
-ARD head가 통째로 학습에서 빠집니다).
-
-기본 실행은 SmolVLA의 레이어 프루닝(`num_vlm_layers`로 SmolLM2를 앞쪽 몇 개 레이어만 쓰도록
-자르는 것) 적용 여부를 **둘 다** 프로파일링해서 표를 두 개 냅니다 — "적용 O"는
-`--num-vlm-layers`(기본 16)로 자른 기본 SmolVLA 설정, "적용 X"는 원본 SmolLM2 레이어 수를
-그대로 쓰는 모델입니다. 원본 레이어 수 쪽은 `num_expert_layers`가 기본 `-1`이라 action
-expert도 VLM 레이어 수를 따라가며 같이 커지므로 메모리를 훨씬 많이 쓰고 더 빨리 OOM이 날 수
-있습니다. `--layer-pruning-mode pruned` 또는 `unpruned`를 주면 그중 하나만 돌려서 시간을
-아낄 수 있습니다.
-
-`--vlm-layer-indices`를 주면 "앞쪽 N개"라는 기본 규칙 대신 임의의 원본 레이어 인덱스 조합을
-그대로 써서 ARD-VLA를 빌드하고, "기본(pruned)" vs "사용자 지정(custom)" 두 표를 비교
-출력합니다 (이때는 `--layer-pruning-mode`가 무시됩니다). `scripts/layer_importance.py`가
-코사인 유사도 기준으로 골라준 레이어들을 그대로 넣어서 실제로 문제없이 빌드/학습되는지
-확인하는 용도입니다 — 레이어 개수가 같으면(기본 16개) 메모리 자체는 어차피 거의 동일하게
-나올 걸로 예상됩니다(레이어들이 전부 동형 구조라 메모리는 "몇 개냐"로 결정되지 "어떤
-인덱스냐"와는 무관하기 때문). 예:
-
-```bash
-!python scripts/layer_importance.py   # 레이어별 중요도 순위 확인
-!python scripts/profile_memory.py --vlm-layer-indices 2 3 4 7 8 9 10 11 12 14 15 16 20 21 25 26
-```
-
-이 스크립트는 실제 Colab GPU 런타임에서 검증했습니다. 처음 실행할 때 두 가지 문제가
-나올 수 있는데(둘 다 이 레포/스크립트 버그는 아니고 Colab 환경 특성입니다):
-- `pip install -e ...`가 torch/torchvision을 재설치하면서 "You must restart the runtime"
-  경고가 뜨면, 재시작 후 새 셀에서 `%cd`부터 다시 하고 스크립트만 실행하세요 (설치를 다시 할
-  필요는 없습니다).
-- `wrap_with_peft()`가 peft의 `dispatch_torchao` 단계에서 `ImportError: Found an
-  incompatible version of torchao`를 던지면, Colab에 미리 깔린 `torchao`가 peft 요구
-  버전과 안 맞아서입니다 — 저희는 양자화를 안 쓰니 `!pip uninstall -y torchao`로 지우고
-  다시 실행하면 됩니다.
-
-## 기본 SmolVLA vs ARD-VLA 비교 (`scripts/compare_smolvla_ard.py`)
-
-`profile_memory.py`와 같은 패턴(LoRA + bf16 + gradient checkpointing 기본 켜짐)으로, 이번엔
-"레이어 프루닝 O/X"가 아니라 **모델 두 개**를 같은 배치 사이즈(`1, 4, 16, 32` 기본값)로 비교합니다:
-
-- **기본 SmolVLA**: 단일팔 7 DoF, `use_ard=False` — 원본 액션 헤드만 사용
-- **ARD-VLA**: bimanual 14 DoF, `use_ard=True` — `AsymmetricResidualHeads` 적용
-
-```bash
-!python scripts/compare_smolvla_ard.py
-```
-
-출력은 표 두 개입니다: (1) 변형별 전체 파라미터 수 / LoRA 학습 대상 파라미터 수, (2) 배치
-사이즈별 두 변형의 peak memory(GB)와 forward pass 시간(ms)을 나란히 놓은 비교표. 메모리는
-`profile_memory.py`와 동일하게 forward+backward 기준(실제 학습 스텝의 메모리 최고점을 반영),
-시간은 backward를 뺀 forward 단독 기준입니다 — 이 둘을 같은 배치에서 한 번에 재느라, 시간
-쪽엔 별도 warmup이 없어서 첫 호출(특히 batch_size=1)은 CUDA 커널 초기화 비용이 섞여 다소
-부풀려질 수 있습니다.
-
-`--variants base` 또는 `--variants ard`로 한쪽만 돌릴 수 있고, 나머지 옵션(`--no-lora`,
-`--no-bf16`, `--no-grad-checkpoint`, `--lora-r`/`--lora-alpha`, `--batch-sizes` 등)은
-`profile_memory.py`와 동일하게 동작합니다.
-
-이 스크립트는 `profile_memory.py`와 같은 검증된 패턴을 그대로 재사용했지만, 스크립트 자체를
-실제 GPU에서 돌려보지는 못했습니다 — `py_compile`/CLI 파싱 확인 외에, 표 출력 로직(OOM 셀
-처리 포함)은 가짜 데이터로 직접 검증했습니다.
-
-## 레이어 중요도 분석 (`scripts/layer_importance.py`)
-
-SmolVLA는 SmolLM2 백본(보통 원본 32레이어)에서 `config.num_vlm_layers`(기본 16)개만 남기고
-쓰는데, 그 선택은 `smolvlm_with_expert.py`의 `text_model.layers[:num_vlm_layers]` — 그냥
-**앞쪽 절반만 남기고 뒤쪽을 통째로 버리는** 슬라이싱입니다. 이 스크립트는 "정말 뒤쪽 16개가
-가장 안 중요한 레이어가 맞는지"를 직접 측정해서 확인합니다.
-
-방법은 ShortGPT류 레이어 중복성 분석과 같습니다: 더미 이미지+언어 토큰으로 SmolVLA가 실제
-쓰는 `embed_image()`/`embed_language_tokens()`를 통해 대표 시퀀스를 만들고, 원본(트림 안 한)
-SmolLM2 전체 레이어에 forward hook을 걸어 레이어별 입력/출력 hidden state의 코사인 유사도를
-잰 뒤 `중요도 점수 = 1 - 평균 코사인 유사도`로 순위를 매깁니다 (유사도가 1에 가까울수록 그
-레이어는 입력을 거의 안 바꾼다는 뜻이라 중요도가 낮음).
-
-```bash
-!python scripts/layer_importance.py
-```
-
-출력은 (1) 전체 레이어 중요도 순위표, (2) "코사인 유사도 기준 중요도 하위 N개(N=SmolVLA가
-실제로 버리는 레이어 수)"와 "SmolVLA가 실제로 스킵 중인 레이어" 두 목록의 overlap 비율 및
-차이 나는 레이어 목록입니다.
-
-이 스크립트도 GPU/Hub 접근이 없는 이 샌드박스에서 실행은 못 해봤습니다 — 다만 핵심 로직(forward
-hook으로 레이어 입출력을 뽑는 부분, 중요도 계산, overlap 비교)은 실제 `transformers` 라이브러리의
-`LlamaDecoderLayer`(SmolLM2가 쓰는 것과 같은 클래스) 소스를 직접 읽고 시그니처를 맞췄고, 그
-호출 관례(`GradientCheckpointingLayer.__call__`이 `super().__call__()`으로 위임해서 forward
-hook이 정상 동작하는 것, 레이어가 튜플이 아니라 텐서를 그대로 반환하는 것)를 그대로 흉내 낸
-가짜 레이어 스택으로 hook 캡처 → 점수 계산 → 순위/overlap 로직까지 전부 직접 검증했습니다
-(direction-flip 레이어는 중요도가 높게, 항등에 가까운 레이어는 낮게 나오는 것 확인). 실제
-SmolVLM2 모델의 `text_model` 클래스가 다른 시그니처를 쓸 가능성만 실행 전까지 확신할 수 없습니다.
-
-여기서 나온 레이어 조합을 실제로 ARD-VLA에 적용해보려면(예: "앞쪽 16개" 대신 이 스크립트가
-추천한 16개), `SmolVLAConfig(vlm_layer_indices=[...])`를 쓰면 됩니다 — `num_vlm_layers`가
-"앞에서부터 N개"만 고정으로 자르는 것과 달리, `vlm_layer_indices`는 원본 레이어 중 임의의
-인덱스 조합을 그대로 선택합니다(깊이 순서 보존을 위해 내부적으로 오름차순 정렬해서 사용).
-`scripts/profile_memory.py --vlm-layer-indices ...`로 바로 프로파일링해볼 수 있습니다
-(자세한 건 위 "메모리 프로파일링" 절 참고).
-
-## 비전 토큰 프루닝 (`--use-token-pruning`, EfficientVLA식)
-
-SmolVLA는 프레임 하나를 SigLIP 인코더 + pixel shuffle(`transformers`의
-`SmolVLMConnector.pixel_shuffle`, `scale_factor=2`) + modality projection을 거쳐 고정 개수의
-비전 토큰(보통 64개)으로 만듭니다 (`SmolVLMWithExpertModel.embed_image()`,
-`smolvlm_with_expert.py`). `lerobot/policies/smolvla/token_pruning.py`(신규)가 이 토큰
-집합을 Task-Relevance and Diversity-Driven 방식(EfficientVLA, Yang et al. 2025의 설명을
-바탕으로 직접 구현 — 논문 원문을 옮긴 게 아닙니다)으로 줄입니다:
-
-1. 언어 지시문 토큰을 쿼리, 비전 토큰을 키로 한 (파라미터 없는) scaled dot-product
-   cross-attention으로 토큰별 "태스크 관련성 점수"를 매깁니다 (`compute_task_relevance_scores`).
-2. 관련성 상위 `token_pruning_k_key`개(기본 6, 논문 권장 4~8)는 핵심 세트로 무조건 남깁니다.
-3. 남은 예산의 절반은 관련성 순위대로, 절반은 이미 뽑힌 토큰과 코사인 거리가 최대인(=가장 다른)
-   토큰을 그리디하게 골라 채웁니다 — 다양성 확보 (`select_tokens`).
-
-`SmolVLAConfig(use_token_pruning=True, token_pruning_k_final=32, token_pruning_k_key=6)`처럼
-켜면 `VLAFlowMatching.embed_prefix()`가 이미지별로 자동 적용합니다 (학습/추론 양쪽 다 이
-메서드 하나를 거치므로 별도 처리가 필요 없습니다). `token_pruning_k_final`이 실험 변수입니다 —
-64에서 얼마나 더 줄일지 자유롭게 바꿔볼 수 있습니다.
-
-`tests/test_token_pruning.py`(오프라인, 13개 통과 — 핵심 세트 보장, 다양성 채우기가 실제로
-코사인 거리 최대 토큰을 고르는지, gather 기반이라 선택된 토큰에만 정확히 gradient가 흐르는지
-등)에 더해, 실제 코드 경로(`SmolVLAPolicy.forward()` → `embed_prefix()`)를 소형 합성
-SmolVLM 백본(Hub 접근 없이 `AutoConfig`/`AutoProcessor.from_pretrained`만 몽키패치, vision
-`image_size=128`·`patch_size=8`로 pixel shuffle 후 정확히 64토큰/프레임이 되도록 맞춤)으로
-K_final=32/48/64 각각 5스텝 돌려 확인했습니다 — 전부 정상 종료, loss 전부 유한.
-
-한 가지 중요한 발견: 이 소형 합성 백본에서는 64개 토큰의 relevance score가 사실상 균일했습니다
-(표준편차가 평균 대비 0.06% 수준) — 프루닝 로직의 결함이 아니라, 무작위 초기화된 백본은
-비전-언어 임베딩 사이에 학습된 의미적 정렬이 전혀 없어서 고차원 랜덤 벡터의 내적이 다 비슷하게
-나오기 때문입니다. 이 실험은 **코드 경로(선택 로직·gradient 흐름·K_final 스윕)가 정상
-작동한다**는 것만 증명하며, "실제로 태스크 관련 토큰을 골라내는지"는 사전학습된 진짜 SmolVLM2
-가중치로만 확인할 수 있습니다 — GPU/Hub 접근이 생기면 재확인이 필요합니다.
+## 파라미터/메모리 프로파일링 도구
+
+`scripts/count_params.py`(구성 요소별 파라미터 집계), `gradient_checkpointing_enable()`,
+`scripts/profile_memory.py`(LoRA+bf16+grad checkpoint 조합 메모리 측정),
+`scripts/compare_smolvla_ard.py`(base/ard/symmetric 변형 간 파라미터·메모리·속도 비교),
+`scripts/layer_importance.py`(SmolLM2 레이어 중요도 분석) — 전부
+**[docs/profiling_tools.md](docs/profiling_tools.md)** 에 사용법과 검증 기록이 있습니다.
 
 ## Layout
 
-- `requirements.txt` — research tooling installed on top of lerobot (notebook/plotting deps). torch and lerobot itself are installed by `scripts/install.sh`, not listed here.
+- `requirements.txt` — research tooling installed on top of lerobot (notebook/plotting deps, including `pytest`). torch and lerobot itself are installed by `scripts/install.sh`, not listed here.
 - `scripts/install.sh` — environment setup: CPU/GPU-aware torch install, editable `lerobot[smolvla]` install from `third_party/lerobot`, then `requirements.txt`.
-- `scripts/check_env.py` — import + CPU-fallback smoke test.
-- `tests/test_ard.py` — offline unit tests for the ARD modification.
+- `scripts/check_env.py` — import + CPU-fallback smoke test (standalone; not under `tests/`, see [docs/ard.md](docs/ard.md) note below).
 - `scripts/train_ard.py` — SmolVLA(+ARD) 전용 최소 학습 스크립트 (lerobot의 범용 학습 CLI 대체).
 - `scripts/count_params.py` — 구성 요소별 파라미터 집계 + 해상도별 이미지 토큰 수 실측.
+- `scripts/profile_memory.py` — LoRA/bf16/gradient-checkpointing 조합 메모리 프로파일링.
+- `scripts/compare_smolvla_ard.py` — base/ard/symmetric 변형 간 파라미터·메모리·속도 비교.
+- `scripts/compare_bridge_attention.py` — Bridge Attention on/off loss 곡선 비교.
+- `scripts/layer_importance.py` — SmolLM2 백본 레이어 중요도(코사인 유사도 기반) 분석.
 - `third_party/lerobot/` — vendored, editable LeRobot/SmolVLA source.
+  - `src/lerobot/policies/smolvla/ard.py` — ARD heads/losses, `ForceHead`, GradNorm, Bridge Attention, 대칭 대조군 손실.
+  - `src/lerobot/policies/smolvla/freq_policy.py` — FreqPolicy 주파수 일관성 손실.
+  - `src/lerobot/policies/smolvla/token_pruning.py` — 비전 토큰 프루닝.
+  - `src/lerobot/policies/smolvla/configuration_smolvla.py` / `modeling_smolvla.py` — 위 기능들을 켜고 끄는 config 플래그와 forward/추론 연결 지점.
+- `tests/` — pytest 테스트 전부(`test_ard.py`, `test_ard_integration.py`, `test_freq_policy.py`, `test_token_pruning.py`, `test_env.py`, `conftest.py`의 합성 SmolVLM fixture 포함).
+- `pytest.ini` — `pytest` 루트 실행 설정(`testpaths=tests`, `requires_hub` 마커).
+- `.github/workflows/tests.yml` — CPU 전용 pytest CI.
+- `docs/` — 기능별 상세 설계/사용법/검증 기록(`ard.md`, `bridge_attention.md`, `freq_policy.md`, `token_pruning.md`, `profiling_tools.md`).
+- `PROGRESS.md` — 멀티세션 작업 진행 기록(사용량 한도로 세션이 끊겨도 다음 세션이 이어갈 수 있도록).
