@@ -202,7 +202,11 @@ def apply_lora(policy: SmolVLAPolicy, args) -> SmolVLAPolicy:
         for p in policy.model.ard_heads.parameters():
             p.requires_grad_(True)
             n += p.numel()
-        logging.info("LoRA 적용 후 AsymmetricResidualHeads %d개 파라미터를 다시 학습 가능하게 풀었습니다.", n)
+        if policy.model.ard_force_head is not None:
+            for p in policy.model.ard_force_head.parameters():
+                p.requires_grad_(True)
+                n += p.numel()
+        logging.info("LoRA 적용 후 AsymmetricResidualHeads(+ForceHead) %d개 파라미터를 다시 학습 가능하게 풀었습니다.", n)
 
     # print_trainable_parameters()는 반드시 위 ARD head 재활성화 *이후*에 호출한다 — 먼저
     # 부르면(예전 코드가 그랬음) LoRA 타겟만 반영된 숫자가 찍혀서, use_bridge_attention=True일 때

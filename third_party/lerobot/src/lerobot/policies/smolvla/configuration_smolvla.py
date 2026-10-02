@@ -134,6 +134,15 @@ class SmolVLAConfig(PreTrainedConfig):
     # 영향을 줄인다 — "none"(기본값)이면 가중치 없이(기존과 완전히 동일하게) 그냥 평균낸다.
     ard_reg_time_weighting: str = "none"  # "none" 또는 "one_minus_t"
 
+    # 기존 force_loss는 actuator_traj_pred(x0_hat 기반 액션 추정치)의 마지막 채널(관절 위치/
+    # 속도 채널)을 힘의 대용값으로 재활용했는데, 의미가 맞지 않는다. ard_use_force_head=True면
+    # suffix_out -> 스칼라 힘을 예측하는 별도 ForceHead(lerobot.policies.smolvla.ard 참고)를
+    # 만들어서 force_loss를 거기서 계산한다. 기본값 False면 기존 "force_target이 없으면
+    # force_loss=0" 동작과 완전히 동일하다 — 단, force_target이 주어졌는데 이 플래그가 꺼져
+    # 있으면(즉 힘을 예측할 방법이 없으면) 과거처럼 엉뚱한 채널을 쓰는 대신 경고 후 0으로
+    # 처리한다(ard.py의 compute_ard_losses 참고).
+    ard_use_force_head: bool = False
+
     # --- VLA-Adapter(Wang et al., 2025)식 Bridge Attention — ARD head가 suffix_out(마지막 지점)
     # 하나만이 아니라 SmolLM2 백본의 여러 중간 레이어 특징도 cross-attention으로 조건받게 함 ---
     use_bridge_attention: bool = False  # use_ard=True일 때만 의미가 있다
@@ -217,6 +226,8 @@ class SmolVLAConfig(PreTrainedConfig):
                 )
         if self.use_gradnorm and not self.use_ard:
             raise ValueError("`use_gradnorm`은 `use_ard=True`일 때만 의미가 있습니다.")
+        if self.ard_use_force_head and not self.use_ard:
+            raise ValueError("`ard_use_force_head`는 `use_ard=True`일 때만 의미가 있습니다.")
         if self.use_bridge_attention:
             if not self.use_ard:
                 raise ValueError("`use_bridge_attention`은 `use_ard=True`일 때만 의미가 있습니다.")

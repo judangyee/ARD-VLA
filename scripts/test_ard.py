@@ -12,12 +12,14 @@ Actuator 팔은 config로 고정된다(`ard_default_actuator_arm`, 기본값 "ri
 """
 
 import sys
+import warnings
 
 import torch
 
 from lerobot.policies.smolvla.ard import (
     AsymmetricResidualHeads,
     BridgeAttention,
+    ForceHead,
     GradNormLambdas,
     combine_by_role,
     compute_ard_losses,
@@ -62,6 +64,15 @@ def test_config_validation():
         check("잘못된 ard_reg_time_weighting 값을 거부한다", False)
     except ValueError:
         check("잘못된 ard_reg_time_weighting 값을 거부한다", True)
+
+    check("ard_use_force_head 기본값은 False다", SmolVLAConfig().ard_use_force_head is False)
+    cfg_force_head = SmolVLAConfig(use_ard=True, ard_use_force_head=True)
+    check("ard_use_force_head=True가 정상 생성된다", cfg_force_head.ard_use_force_head is True)
+    try:
+        SmolVLAConfig(use_ard=False, ard_use_force_head=True)
+        check("use_ard=False인데 ard_use_force_head=True면 거부한다", False)
+    except ValueError:
+        check("use_ard=False인데 ard_use_force_head=True면 거부한다", True)
 
 
 def test_resolve_actuator_is_first_is_fixed():
@@ -230,6 +241,26 @@ def test_asymmetric_residual_heads_with_bridge_attention():
         check("use_bridge_attention=True인데 vlm_hidden_size가 없으면 거부한다", True)
 
 
+def test_force_head():
+    torch.manual_seed(0)
+    batch, chunk, expert_hidden = 3, 6, 32
+    head = ForceHead(expert_hidden_size=expert_hidden)
+    suffix_out = torch.randn(batch, chunk, expert_hidden, requires_grad=True)
+
+    out = head(suffix_out)
+    check("ForceHead 출력 shape이 (batch, chunk_size)이다", out.shape == (batch, chunk))
+    check("ForceHead 출력은 유한한 값이다", torch.isfinite(out).all().item())
+
+    loss = (out - torch.randn_like(out)).pow(2).mean()
+    loss.backward()
+    check(
+        "ForceHead가 suffix_out까지 포함해 gradient를 정상적으로 받는다 (GradNorm의 shared_activation=suffix_out과의 연결 확인)",
+        suffix_out.grad is not None and suffix_out.grad.abs().sum().item() > 0,
+    )
+    head_grad_norm = sum(p.grad.abs().sum().item() for p in head.parameters() if p.grad is not None)
+    check("ForceHead 자체 파라미터도 gradient를 받는다", head_grad_norm > 0)
+
+
 def test_compute_ard_losses():
     torch.manual_seed(0)
     batch, chunk, arm_dim = 4, 6, 7
@@ -276,7 +307,33 @@ def test_compute_ard_losses():
     # force_target이 없으면 force_loss는 정확히 0이어야 한다.
     check("force_target이 없으면 force_loss는 0이다", stab_only.force_loss.item() == 0.0)
 
-    with_force = compute_ard_losses(
+    # force_target은 주어졌는데 force_pred가 없으면(= ard_use_force_head=False) 힘을 예측할
+    # 방법이 없으므로, 과거처럼 엉뚱한 채널을 쓰지 않고 경고 후 force_loss=0으로 처리해야 한다.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        force_target_without_head = compute_ard_losses(
+            per_element_loss=per_element_loss.detach(),
+            stabilizer_traj_pred=stabilizer_traj_pred.detach(),
+            actuator_traj_pred=actuator_traj_pred.detach(),
+            actuator_is_first=actuator_is_first,
+            arm_dim=arm_dim,
+            alpha=0.3,
+            beta=0.7,
+            lambda_smooth=1.0,
+            lambda_force=1.0,
+            lambda_traj=1.0,
+            force_target=torch.zeros(batch),
+        )
+    check(
+        "force_target은 있는데 force_pred(ForceHead 출력)가 없으면 force_loss는 0이다(과거처럼 엉뚱한 채널을 쓰지 않음)",
+        force_target_without_head.force_loss.item() == 0.0,
+    )
+    check(
+        "force_target은 있는데 force_pred가 없으면 경고가 한 번 뜬다",
+        len(caught) == 1 and "ard_use_force_head" in str(caught[0].message),
+    )
+
+    with_force_head = compute_ard_losses(
         per_element_loss=per_element_loss.detach(),
         stabilizer_traj_pred=stabilizer_traj_pred.detach(),
         actuator_traj_pred=actuator_traj_pred.detach(),
@@ -288,8 +345,12 @@ def test_compute_ard_losses():
         lambda_force=1.0,
         lambda_traj=1.0,
         force_target=torch.zeros(batch),
+        force_pred=torch.randn(batch, chunk),
     )
-    check("force_target을 주면 force_loss가 0이 아니게 된다", with_force.force_loss.item() > 0.0)
+    check(
+        "force_target과 force_pred(ForceHead 출력)가 둘 다 있으면 force_loss가 0이 아니게 된다",
+        with_force_head.force_loss.item() > 0.0,
+    )
 
 
 def _compute_x0_hat(noise: torch.Tensor, actions: torch.Tensor, time: torch.Tensor, v_t: torch.Tensor) -> torch.Tensor:
@@ -591,6 +652,56 @@ def test_gradnorm_lambdas():
     check("gradnorm을 안 주면(기존 고정 lambda 방식) grad_loss는 None이다", fixed.grad_loss is None)
 
 
+def test_gradnorm_force_head_connection():
+    """GradNorm이 force 항을 ForceHead 경로로 제대로 연결해서 보는지 확인한다 —
+    modeling_smolvla.py가 실제로 하는 것과 동일하게, ForceHead(suffix_out)으로 force_pred를
+    만들어서 넘긴다(shared_activation도 동일한 suffix_out)."""
+    torch.manual_seed(0)
+    batch, chunk, arm_dim, hidden = 4, 10, 7, 16
+    actuator_is_first = resolve_actuator_is_first("right", batch_size=batch, device="cpu")
+    gradnorm = GradNormLambdas(alpha=1.5, init_value=1.0)
+    force_head = ForceHead(expert_hidden_size=hidden)
+
+    suffix_out = torch.randn(batch, chunk, hidden, requires_grad=True)
+    per_element_loss = suffix_out[..., : 2 * arm_dim] ** 2
+    stabilizer_traj_pred = suffix_out[..., :arm_dim]
+    actuator_traj_pred = suffix_out[..., arm_dim : 2 * arm_dim]
+    force_pred = force_head(suffix_out)  # ForceHead의 입력이 정확히 shared_activation(suffix_out)이다.
+    force_target = torch.randn(batch)
+
+    out = compute_ard_losses(
+        per_element_loss=per_element_loss,
+        stabilizer_traj_pred=stabilizer_traj_pred,
+        actuator_traj_pred=actuator_traj_pred,
+        actuator_is_first=actuator_is_first,
+        arm_dim=arm_dim,
+        alpha=0.3,
+        beta=0.7,
+        lambda_smooth=1.0,
+        lambda_force=1.0,
+        lambda_traj=1.0,
+        force_target=force_target,
+        force_pred=force_pred,
+        gradnorm=gradnorm,
+        shared_activation=suffix_out,
+    )
+    check(
+        "ForceHead 경로로 연결된 force_loss는 shared_activation(suffix_out)과 끊기지 않은 상태라 grad_loss를 만들 수 있다",
+        out.grad_loss is not None and torch.isfinite(out.grad_loss).item(),
+    )
+
+    # out.force_loss는 ARDLossOutput 안에서 이미 .detach()된 값이라 직접 backward할 수 없다 —
+    # compute_ard_losses 내부와 동일한 식(절댓값 평균)을 그대로 재구성해서, 이게 정말
+    # suffix_out까지 끊기지 않고 연결되어 있는지(= ForceHead가 shared_activation과 같은
+    # 입력을 쓰는지) 직접 확인한다.
+    force_loss_live = (force_pred - force_target.unsqueeze(-1)).abs().mean()
+    (force_grad,) = torch.autograd.grad(force_loss_live, suffix_out, retain_graph=True, allow_unused=True)
+    check(
+        "force_loss의 shared_activation(suffix_out)에 대한 그래디언트가 0이 아니다 (ForceHead가 suffix_out과 연결되어 있음)",
+        force_grad is not None and force_grad.abs().sum().item() > 0,
+    )
+
+
 def main():
     test_config_validation()
     test_resolve_actuator_is_first_is_fixed()
@@ -599,11 +710,13 @@ def main():
     test_resolve_bridge_layer_indices()
     test_bridge_attention_zero_init()
     test_asymmetric_residual_heads_with_bridge_attention()
+    test_force_head()
     test_compute_ard_losses()
     test_ard_smooth_traj_loss_use_denoised_action_not_velocity()
     test_ard_smooth_traj_loss_zero_for_constant_trajectory()
     test_ard_reg_time_weighting_one_minus_t()
     test_gradnorm_lambdas()
+    test_gradnorm_force_head_connection()
 
     print()
     if FAILURES:

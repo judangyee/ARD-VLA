@@ -25,6 +25,7 @@ ARD는 선두 `2 * ard_arm_dim`개 액션 채널을 Stabilizer 블록과 Actuato
 (이 프로젝트에서는 항상 오른팔 — `resolve_actuator_is_first` 참고).
 """
 
+import warnings
 from dataclasses import dataclass
 
 import torch
@@ -140,6 +141,51 @@ def resolve_bridge_layer_indices(num_vlm_layers: int, requested: list[int] | Non
         return list(range(num_vlm_layers))
     quarter = max(num_vlm_layers // 4, 1)
     return sorted({quarter, num_vlm_layers // 2, (3 * num_vlm_layers) // 4, num_vlm_layers - 1})
+
+
+class ForceHead(nn.Module):
+    """`suffix_out`(액션 전문가 트랜스포머의 projection 이전 출력)으로부터 스칼라 접촉력/토크
+    추정치를 예측하는 보조(auxiliary) MLP head.
+
+    기존 설계는 `actuator_traj_pred[..., -1]`(actuator 블록의 마지막 "액션" 채널, 즉 보통
+    그리퍼/마지막 관절의 속도 또는 x0_hat 기반 위치 추정치)을 힘의 대용값으로 재활용했는데,
+    이건 의미가 맞지 않는다 — 그 채널은 실제로는 관절 위치/속도 채널이지 힘 센서 신호가
+    아니다. `ard_use_force_head=True`면 이 클래스가 `suffix_out`에서 별도의 전용 스칼라
+    출력을 직접 예측하도록 분리한다.
+
+    중요 — 이 head의 출력은 액션 채널에 더해지지 않는 순수 보조(auxiliary) 출력이다:
+    `compute_ard_losses`의 `force_loss` 계산에만 쓰이고, `v_t`/최종 액션 예측에는 전혀
+    관여하지 않는다. 그래서 추론 경로(`sample_actions`/`denoise_step`)에서는 아예 호출되지
+    않는다 — 학습 때(`VLAFlowMatching.forward`)만 쓰인다.
+
+    GradNorm과의 연결: `GradNormLambdas.compute_grad_loss`는 `shared_activation`(=`suffix_out`)에
+    대한 각 손실 항의 그래디언트 norm을 잰다. 이 head의 입력이 정확히 `suffix_out`이므로,
+    `force_loss`가 `suffix_out`까지 역전파로 이어지는 계산 그래프를 자연스럽게 갖는다 —
+    과거 설계(`actuator_traj_pred` 경유)도 결국 `suffix_out`까지 이어지긴 했지만, 의미가
+    맞지 않는 채널을 거쳐서였다. 이 클래스를 쓰면 그 경로가 "진짜 force 예측"을 거치게 된다.
+
+    주의 — 기존 ARD head(`AsymmetricResidualHeads`)와 달리 **zero-init을 쓰지 않는다**.
+    `AsymmetricResidualHeads`의 zero-init은 "사전학습된 공유 projection 위에 처음엔 아무
+    영향도 주지 않는 항등(identity)으로 시작한다"는 구조적 이유(그 출력이 `v_t`에 더해지기
+    때문)가 있지만, `ForceHead`의 출력은 애초에 어디에도 더해지지 않는 독립 보조 출력이라
+    "항등"이라는 개념 자체가 없다. 오히려 마지막 레이어를 0으로 초기화하면 `suffix_out`까지
+    역전파되는 그래디언트가 초기화 시점에 정확히 0이 되어(zero 가중치 행렬을 통과하므로),
+    GradNorm이 학습 첫 스텝부터 force 항의 그래디언트 norm을 제대로 못 보는 문제가 생긴다 —
+    그래서 PyTorch 기본 초기화(Kaiming uniform)를 그대로 쓴다.
+    """
+
+    def __init__(self, expert_hidden_size: int, mlp_hidden_dim: int | None = None):
+        super().__init__()
+        mlp_hidden_dim = mlp_hidden_dim or max(expert_hidden_size // 2, 1)
+        self.net = nn.Sequential(
+            nn.Linear(expert_hidden_size, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Linear(mlp_hidden_dim, 1),
+        )
+
+    def forward(self, suffix_out: Tensor) -> Tensor:
+        """suffix_out: (batch, chunk_size, expert_hidden_size) -> (batch, chunk_size)."""
+        return self.net(suffix_out).squeeze(-1)
 
 
 class AsymmetricResidualHeads(nn.Module):
@@ -375,6 +421,7 @@ def compute_ard_losses(
     gradnorm: GradNormLambdas | None = None,
     shared_activation: Tensor | None = None,
     reg_time_weights: Tensor | None = None,
+    force_pred: Tensor | None = None,
 ) -> ARDLossOutput:
     """베이스 flow-matching 회귀 손실에 ARD의 역할별 정규화 항들을 결합한다.
 
@@ -410,6 +457,12 @@ def compute_ard_losses(
         `t`가 클수록(거의 순수 노이즈에 가까운 샘플일수록) 오차/분산이 커지는 경향이 있어서,
         smooth_loss/traj_loss에서 그런 샘플의 영향을 줄이는 용도다. None이면(기본) 기존과
         완전히 동일하게 가중치 없는 평균을 쓴다(`_reduce_reg_loss` 참고).
+    force_pred: (batch, chunk_size) 또는 None. `config.ard_use_force_head=True`일 때
+        `modeling_smolvla.py`가 `ForceHead(suffix_out)`의 출력을 넘긴다 — `force_target`과
+        비교해 `force_loss`를 만드는 데 쓰인다. `force_target`은 주어졌는데 `force_pred`가
+        None이면(즉 `ard_use_force_head=False`인데 `force_target`이 들어온 경우) 힘을 예측할
+        방법이 없으므로 경고를 한 번 띄우고 `force_loss`를 0으로 처리한다 — 과거처럼 관절
+        속도/위치 채널을 대신 쓰지 않는다.
     """
     if gradnorm is not None and shared_activation is None:
         raise ValueError("gradnorm을 쓰려면 shared_activation(예: suffix_out)도 같이 넘겨야 합니다.")
@@ -435,17 +488,27 @@ def compute_ard_losses(
         traj_loss = actuator_traj_pred.new_zeros(())
 
     # L_force: 예를 들어 Isaac Sim의 접촉 센서 등에서 얻는 선택적 접촉력/토크 추적 항.
-    # 현재 이 레포의 어떤 데이터셋에도 없는 신호라 기본값은 0이다 — 실제 force 신호 연결은
-    # 향후 과제다 (ARD-VLA 연구계획서의 "실물 실증" 참고). 이 항은 별도 이슈로 다룰 예정이라
-    # 로직 자체는 그대로 두었다 — 입력이 velocity(v_t)에서 x0_hat 기반 액션 추정치로 바뀐 것
-    # 자체는 shape/동작에 영향이 없다(아래 force_pred는 여전히 "actuator 블록의 마지막 채널"을
-    # 그대로 가리킨다).
-    if force_target is not None:
-        force_pred = actuator_traj_pred[..., -1]  # (batch, chunk_size): actuator의 마지막 채널을 force 대용값으로 사용
+    # 현재 이 레포의 어떤 데이터셋에도 없는 신호라 force_target이 없으면 항상 0이다.
+    # force_pred는 ard_use_force_head=True일 때 modeling_smolvla.py가 ForceHead(suffix_out)로
+    # 계산해서 넘긴다 — 과거처럼 actuator_traj_pred의 마지막 채널(관절 위치/속도 채널이지
+    # 힘 센서 신호가 아니다)을 대신 쓰지 않는다.
+    if force_target is not None and force_pred is not None:
         target = force_target.to(force_pred.dtype)
         if target.ndim == 1:  # (batch,) -> chunk 전체에 동일한 타겟을 브로드캐스트
             target = target.unsqueeze(-1)
         force_loss = (force_pred - target).abs().mean()
+    elif force_target is not None and force_pred is None:
+        # ard_use_force_head=False인데 force_target이 들어온 경우 — 힘을 예측할 방법이 없다.
+        # 과거처럼 관절 속도/위치 채널을 대신 쓰지 않고, 경고 후 0으로 처리한다. warnings.warn은
+        # 기본 필터("default")가 동일한 (메시지, 위치) 조합을 프로세스당 한 번만 보여주므로,
+        # 매 학습 스텝마다 호출돼도 자연스럽게 "한 번만" 출력된다.
+        warnings.warn(
+            "force_target이 주어졌지만 ard_use_force_head=False라 힘을 예측할 방법이 없습니다 — "
+            "force_loss를 0으로 처리합니다. 힘 추적 손실을 쓰려면 ard_use_force_head=True로 "
+            "ForceHead를 활성화하세요.",
+            stacklevel=2,
+        )
+        force_loss = actuator_traj_pred.new_zeros(())
     else:
         force_loss = actuator_traj_pred.new_zeros(())
 

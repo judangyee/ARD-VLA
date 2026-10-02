@@ -109,7 +109,11 @@ def apply_lora(policy: SmolVLAPolicy, args) -> None:
     for p in policy.model.ard_heads.parameters():
         p.requires_grad_(True)
         n += p.numel()
-    logging.info("LoRA 적용 후 ARD head(Bridge Attention 포함) %d개 파라미터를 다시 학습 가능하게 풀었습니다.", n)
+    if policy.model.ard_force_head is not None:
+        for p in policy.model.ard_force_head.parameters():
+            p.requires_grad_(True)
+            n += p.numel()
+    logging.info("LoRA 적용 후 ARD head(Bridge Attention/ForceHead 포함) %d개 파라미터를 다시 학습 가능하게 풀었습니다.", n)
     if hasattr(peft_model, "print_trainable_parameters"):
         peft_model.print_trainable_parameters()
 

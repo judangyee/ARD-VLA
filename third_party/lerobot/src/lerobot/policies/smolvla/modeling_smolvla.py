@@ -67,6 +67,7 @@ from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.smolvla.ard import (
     ARD_FORCE_TARGET,
     AsymmetricResidualHeads,
+    ForceHead,
     GradNormLambdas,
     combine_by_role,
     compute_ard_losses,
@@ -435,6 +436,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 gradnorm=self.model.ard_gradnorm,
                 shared_activation=ard_extras["shared_activation"] if self.model.ard_gradnorm is not None else None,
                 reg_time_weights=ard_extras["reg_time_weights"],
+                force_pred=ard_extras["force_pred"],
             )
             loss = ard_out.total
             if self.config.use_freq_policy:
@@ -663,6 +665,7 @@ class VLAFlowMatching(nn.Module):
         # ARD: 비대칭 역할 분리 (자세한 내용은 lerobot.policies.smolvla.ard 참고)
         self.ard_heads = None
         self.ard_gradnorm = None
+        self.ard_force_head = None
         self.bridge_layer_indices: list[int] | None = None
         if self.config.use_ard:
             if self.config.use_bridge_attention:
@@ -687,6 +690,8 @@ class VLAFlowMatching(nn.Module):
             )
             if self.config.use_gradnorm:
                 self.ard_gradnorm = GradNormLambdas(alpha=self.config.gradnorm_alpha)
+            if self.config.ard_use_force_head:
+                self.ard_force_head = ForceHead(expert_hidden_size=self.vlm_with_expert.expert_hidden_size)
 
         # Compile model if requested
         if config.compile_model:
@@ -981,11 +986,19 @@ class VLAFlowMatching(nn.Module):
             reg_time_weights = None
             if self.config.ard_reg_time_weighting == "one_minus_t":
                 reg_time_weights = (1 - time).to(dtype=x0_hat.dtype)
+            # ForceHead는 액션 채널에 전혀 관여하지 않는 순수 보조 출력이다 — suffix_out에서
+            # 직접 스칼라 힘을 예측해서 force_loss 계산에만 쓰인다(ard.py의 ForceHead 참고).
+            # ard_use_force_head=False면(기본) force_pred는 None으로 남고, compute_ard_losses가
+            # force_target이 와도 과거처럼 엉뚱한 채널을 쓰지 않고 경고 후 0으로 처리한다.
+            force_pred = None
+            if self.ard_force_head is not None:
+                force_pred = self.ard_force_head(suffix_out)
             ard_extras.update({
                 "actuator_is_first": actuator_is_first,
                 "stabilizer_traj_pred": stabilizer_traj_pred,
                 "actuator_traj_pred": actuator_traj_pred,
                 "reg_time_weights": reg_time_weights,
+                "force_pred": force_pred,
                 # GradNorm 전용: actuator/stabilizer head 바로 직전의 공유 표현 — action_out_proj와
                 # ard_heads가 둘 다 이 텐서를 입력으로 받는다. use_gradnorm=False면 안 쓰인다.
                 "shared_activation": suffix_out,
