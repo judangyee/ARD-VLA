@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -143,6 +144,18 @@ class SmolVLAConfig(PreTrainedConfig):
     # 처리한다(ard.py의 compute_ard_losses 참고).
     ard_use_force_head: bool = False
 
+    # --- 대칭 대조군(symmetric ablation) 모드 — ARD의 "팔마다 다른 정규화" 가정 자체가 실제로
+    # 도움이 되는지 공정하게 비교하기 위한 ablation용 코드. 켜면 head 구조/파라미터 수는 ARD와
+    # 동일하게 유지한 채(AsymmetricResidualHeads를 그대로 재사용), 손실 "결합 방식"만 바뀐다:
+    # 양팔 모두 L_pos + lambda_smooth*L_smooth + lambda_traj*L_traj를 동일하게 적용하고
+    # (ARD처럼 stabilizer=smooth만/actuator=force+traj로 쪼개지 않음), alpha/beta는 항상
+    # 0.5/0.5로 강제된다(사용자가 다르게 줬으면 경고 후 덮어씀). force 항은 ARD 모드와
+    # 동일하게 actuator 쪽에만 둔다 — 접촉력/토크는 도구를 조작하는 팔에만 물리적으로 의미가
+    # 있는 신호라서(Stabilizer는 작업물을 붙잡고 있을 뿐이라 힘 추적이라는 과제 자체가 성립
+    # 안 함), smooth/traj와 달리 대칭으로 만들지 않기로 판단했다(lerobot.policies.smolvla.ard의
+    # compute_symmetric_losses 참고).
+    ard_symmetric: bool = False
+
     # --- VLA-Adapter(Wang et al., 2025)식 Bridge Attention — ARD head가 suffix_out(마지막 지점)
     # 하나만이 아니라 SmolLM2 백본의 여러 중간 레이어 특징도 cross-attention으로 조건받게 함 ---
     use_bridge_attention: bool = False  # use_ard=True일 때만 의미가 있다
@@ -228,6 +241,17 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError("`use_gradnorm`은 `use_ard=True`일 때만 의미가 있습니다.")
         if self.ard_use_force_head and not self.use_ard:
             raise ValueError("`ard_use_force_head`는 `use_ard=True`일 때만 의미가 있습니다.")
+        if self.ard_symmetric:
+            if not self.use_ard:
+                raise ValueError("`ard_symmetric`은 `use_ard=True`일 때만 의미가 있습니다.")
+            if self.ard_alpha != 0.5 or self.ard_beta != 0.5:
+                logging.warning(
+                    "`ard_symmetric=True`에서는 alpha/beta가 항상 0.5/0.5로 강제됩니다 — "
+                    "직접 지정하신 ard_alpha=%s, ard_beta=%s는 무시되고 0.5/0.5로 덮어씁니다.",
+                    self.ard_alpha, self.ard_beta,
+                )
+            self.ard_alpha = 0.5
+            self.ard_beta = 0.5
         if self.use_bridge_attention:
             if not self.use_ard:
                 raise ValueError("`use_bridge_attention`은 `use_ard=True`일 때만 의미가 있습니다.")

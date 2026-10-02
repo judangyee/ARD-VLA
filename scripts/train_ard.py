@@ -142,6 +142,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     ard_group.add_argument("--ard-bridge-num-heads", type=int, default=4, help="Bridge Attention cross-attention 헤드 수")
+    ard_group.add_argument(
+        "--ard-symmetric",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "대칭 대조군(ablation) 모드 — ARD의 '팔마다 다른 정규화' 가정을 빼고, 양팔 모두 "
+            "L_pos + lambda_smooth*L_smooth + lambda_traj*L_traj를 동일하게 적용한다. "
+            "alpha/beta는 항상 0.5/0.5로 강제된다(--ard-alpha/--ard-beta를 직접 줘도 무시되고 "
+            "경고와 함께 덮어씀). head 구조/파라미터 수는 --use-ard와 동일하다 — 손실 결합 "
+            "방식만 바뀐다(비교 실험용 플래그, 기본은 꺼져 있어 기존과 동일하게 동작)."
+        ),
+    )
 
     freq_group = parser.add_argument_group("FreqPolicy")
     freq_group.add_argument(
@@ -259,14 +271,15 @@ def main() -> None:
         use_bridge_attention=args.use_bridge_attention,
         ard_bridge_layer_indices=args.ard_bridge_layer_indices,
         ard_bridge_num_heads=args.ard_bridge_num_heads,
+        ard_symmetric=args.ard_symmetric,
         use_freq_policy=args.use_freq_policy,
         freq_lambda=args.freq_lambda,
         freq_decay=args.freq_decay,
     )
     device = torch.device(config.device)
     logging.info(
-        "device=%s use_ard=%s use_bridge_attention=%s use_freq_policy=%s",
-        device, config.use_ard, config.use_bridge_attention, config.use_freq_policy,
+        "device=%s use_ard=%s ard_symmetric=%s use_bridge_attention=%s use_freq_policy=%s",
+        device, config.use_ard, config.ard_symmetric, config.use_bridge_attention, config.use_freq_policy,
     )
 
     # SmolVLA는 flow-matching으로 chunk_size 길이의 액션 시퀀스 전체를 한 번에 예측한다
@@ -359,6 +372,7 @@ def main() -> None:
             msg = f"step {step}/{args.steps}  loss={loss_dict['loss']:.4f}  grad_norm={float(grad_norm):.3f}"
             if config.use_ard:
                 msg += (
+                    f"  mode={loss_dict['ard_mode']}"
                     f"  stab={loss_dict['ard_stabilizer_loss']:.4f}"
                     f"  act={loss_dict['ard_actuator_loss']:.4f}"
                     f"  smooth={loss_dict['ard_smooth_loss']:.4f}"

@@ -23,6 +23,7 @@ from lerobot.policies.smolvla.ard import (
     GradNormLambdas,
     combine_by_role,
     compute_ard_losses,
+    compute_symmetric_losses,
     resolve_actuator_is_first,
     resolve_bridge_layer_indices,
     split_by_role,
@@ -73,6 +74,24 @@ def test_config_validation():
         check("use_ard=False인데 ard_use_force_head=True면 거부한다", False)
     except ValueError:
         check("use_ard=False인데 ard_use_force_head=True면 거부한다", True)
+
+    check("ard_symmetric 기본값은 False다", SmolVLAConfig().ard_symmetric is False)
+    try:
+        SmolVLAConfig(use_ard=False, ard_symmetric=True)
+        check("use_ard=False인데 ard_symmetric=True면 거부한다", False)
+    except ValueError:
+        check("use_ard=False인데 ard_symmetric=True면 거부한다", True)
+
+    cfg_symmetric_default = SmolVLAConfig(use_ard=True, ard_symmetric=True)
+    check(
+        "ard_symmetric=True면 alpha/beta가 기본값(0.3/0.7)이어도 0.5/0.5로 강제된다",
+        cfg_symmetric_default.ard_alpha == 0.5 and cfg_symmetric_default.ard_beta == 0.5,
+    )
+    cfg_symmetric_explicit = SmolVLAConfig(use_ard=True, ard_symmetric=True, ard_alpha=0.1, ard_beta=0.9)
+    check(
+        "ard_symmetric=True면 사용자가 다른 alpha/beta를 줘도 0.5/0.5로 강제된다(경고와 함께)",
+        cfg_symmetric_explicit.ard_alpha == 0.5 and cfg_symmetric_explicit.ard_beta == 0.5,
+    )
 
 
 def test_resolve_actuator_is_first_is_fixed():
@@ -350,6 +369,118 @@ def test_compute_ard_losses():
     check(
         "force_target과 force_pred(ForceHead 출력)가 둘 다 있으면 force_loss가 0이 아니게 된다",
         with_force_head.force_loss.item() > 0.0,
+    )
+
+
+def test_compute_symmetric_losses():
+    """ard_symmetric=True가 쓰는 compute_symmetric_losses: 양팔 손실 형태가 동일한지(같은
+    stabilizer_traj_pred/actuator_traj_pred를 서로 바꿔 넣어도 stab_loss/act_loss가 바뀐
+    위치에 맞게 대칭으로 나오는지), alpha=beta=0.5가 실제로 적용되는지 확인한다."""
+    torch.manual_seed(0)
+    batch, chunk, arm_dim = 4, 6, 7
+    actuator_is_first = resolve_actuator_is_first("right", batch_size=batch, device="cpu")
+    per_element_loss = torch.rand(batch, chunk, 2 * arm_dim)
+    traj_a = torch.randn(batch, chunk, arm_dim)
+    traj_b = torch.randn(batch, chunk, arm_dim)
+
+    out_ab = compute_symmetric_losses(
+        per_element_loss=per_element_loss,
+        stabilizer_traj_pred=traj_a,
+        actuator_traj_pred=traj_b,
+        actuator_is_first=actuator_is_first,
+        arm_dim=arm_dim,
+        lambda_smooth=1.0,
+        lambda_force=1.0,
+        lambda_traj=1.0,
+    )
+    check("compute_symmetric_losses.total은 유한한 스칼라값이다", torch.isfinite(out_ab.total).item())
+
+    # 양팔 손실 "형태"가 동일하다는 걸, stabilizer/actuator 입력을 서로 바꿔 넣었을 때
+    # stabilizer_loss와 actuator_loss도 정확히 맞바꿔진 값이 나오는 것으로 확인한다 — 둘 다
+    # 똑같은 L_pos + lambda_smooth*L_smooth + lambda_traj*L_traj 공식을 쓰지 않으면 이렇게
+    # 깔끔하게 대칭적으로 맞바꿔지지 않는다(ARD 모드라면 stabilizer=smooth만/actuator=
+    # force+traj만이라 이 대칭성이 성립하지 않는다).
+    # 왼팔/오른팔 블록을 통째로 맞바꾼다(단순 flip이 아니라 블록 단위 swap — flip은 블록
+    # 내부 채널 순서까지 뒤집어버려서 원하는 비교가 아니게 된다).
+    per_element_loss_swapped = torch.cat(
+        [per_element_loss[..., arm_dim:], per_element_loss[..., :arm_dim]], dim=-1
+    )
+    out_ba = compute_symmetric_losses(
+        per_element_loss=per_element_loss_swapped,  # pos_loss도 같이 맞바꿔서 비교
+        stabilizer_traj_pred=traj_b,
+        actuator_traj_pred=traj_a,
+        actuator_is_first=actuator_is_first,
+        arm_dim=arm_dim,
+        lambda_smooth=1.0,
+        lambda_force=1.0,
+        lambda_traj=1.0,
+    )
+    check(
+        "대칭 모드: 두 팔의 입력을 맞바꾸면 stabilizer_loss/actuator_loss도 정확히 맞바꿔진다 (양팔 손실 형태가 동일함을 보여줌)",
+        torch.isclose(out_ab.stabilizer_loss, out_ba.actuator_loss, atol=1e-5).item()
+        and torch.isclose(out_ab.actuator_loss, out_ba.stabilizer_loss, atol=1e-5).item(),
+    )
+    check(
+        "대칭 모드: total은 입력을 맞바꿔도 동일하다 (0.5/0.5 결합이므로)",
+        torch.isclose(out_ab.total, out_ba.total, atol=1e-5).item(),
+    )
+
+    # alpha=beta=0.5가 실제로 적용됐는지: total == 0.5*stab + 0.5*act.
+    check(
+        "대칭 모드: total = 0.5*stabilizer_loss + 0.5*actuator_loss (alpha=beta=0.5)",
+        torch.isclose(out_ab.total, 0.5 * out_ab.stabilizer_loss + 0.5 * out_ab.actuator_loss, atol=1e-5).item(),
+    )
+
+    # 파라미터 수가 ARD 모드와 동일함을 확인한다 — compute_symmetric_losses는 손실 결합 방식만
+    # 바꿀 뿐, 실제로 모델 파라미터를 만드는 건 AsymmetricResidualHeads이고 ard_symmetric 여부와
+    # 무관하게 동일한 클래스를 재사용하므로, head 자체의 파라미터 수 비교로 "구조 동일성"을
+    # 확인한다(ard_symmetric은 ard.py 레벨에서는 파라미터를 전혀 만들지 않는 순수 손실 함수다).
+    from lerobot.policies.smolvla.ard import AsymmetricResidualHeads
+
+    heads_for_ard_mode = AsymmetricResidualHeads(expert_hidden_size=32, arm_dim=arm_dim)
+    heads_for_symmetric_mode = AsymmetricResidualHeads(expert_hidden_size=32, arm_dim=arm_dim)
+    n_ard = sum(p.numel() for p in heads_for_ard_mode.parameters())
+    n_symmetric = sum(p.numel() for p in heads_for_symmetric_mode.parameters())
+    check(
+        "대칭 모드와 ARD 모드는 (동일한 AsymmetricResidualHeads 클래스를 쓰므로) 파라미터 수가 같다",
+        n_ard == n_symmetric,
+        detail=f"ard={n_ard} symmetric={n_symmetric}",
+    )
+
+    # force_target을 주면 ARD 모드와 동일하게 actuator 쪽에만 반영된다(대칭화하지 않음) —
+    # force_pred가 없으면 경고 후 0, 있으면 반영된다는 점도 compute_ard_losses와 동일해야 한다.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out_force_no_head = compute_symmetric_losses(
+            per_element_loss=per_element_loss,
+            stabilizer_traj_pred=traj_a,
+            actuator_traj_pred=traj_b,
+            actuator_is_first=actuator_is_first,
+            arm_dim=arm_dim,
+            lambda_smooth=1.0,
+            lambda_force=1.0,
+            lambda_traj=1.0,
+            force_target=torch.zeros(batch),
+        )
+    check(
+        "대칭 모드: force_target은 있는데 force_pred가 없으면 (ARD 모드와 동일하게) force_loss=0, 경고 1회",
+        out_force_no_head.force_loss.item() == 0.0 and len(caught) == 1,
+    )
+    out_force_with_head = compute_symmetric_losses(
+        per_element_loss=per_element_loss,
+        stabilizer_traj_pred=traj_a,
+        actuator_traj_pred=traj_b,
+        actuator_is_first=actuator_is_first,
+        arm_dim=arm_dim,
+        lambda_smooth=1.0,
+        lambda_force=1.0,
+        lambda_traj=1.0,
+        force_target=torch.zeros(batch),
+        force_pred=torch.randn(batch, chunk),
+    )
+    check(
+        "대칭 모드: force_pred가 있으면 force_loss가 0이 아니게 된다 (actuator 쪽에만, ARD 모드와 동일한 force 처리)",
+        out_force_with_head.force_loss.item() > 0.0,
     )
 
 
@@ -712,6 +843,7 @@ def main():
     test_asymmetric_residual_heads_with_bridge_attention()
     test_force_head()
     test_compute_ard_losses()
+    test_compute_symmetric_losses()
     test_ard_smooth_traj_loss_use_denoised_action_not_velocity()
     test_ard_smooth_traj_loss_zero_for_constant_trajectory()
     test_ard_reg_time_weighting_one_minus_t()

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """기본 SmolVLA(단일팔 7 DoF, 원본 액션 헤드) vs ARD-VLA(bimanual 14 DoF,
-AsymmetricResidualHeads 적용)를 같은 배치 사이즈로 나란히 비교 프로파일링한다.
+AsymmetricResidualHeads, 비대칭 손실) vs 대칭 대조군(동일 head 구조, 대칭 손실)을 같은
+배치 사이즈로 나란히 비교 프로파일링한다. `--variants`로 세 변형 중 원하는 조합만 고를 수
+있다(기본 'base,ard'는 이 3변형 지원이 추가되기 전과 동일하게 동작한다).
 
 `scripts/profile_memory.py`를 참고해서 만들었다 — LoRA + bf16 autocast + gradient
 checkpointing이 기본으로 켜져있는 것도 동일하다. 차이는 "레이어 프루닝 O/X"가 아니라
-"기본 SmolVLA vs ARD-VLA" 두 모델 설정을 비교한다는 점이다. 비교 항목:
+모델/손실 설정 자체를 비교한다는 점이다. 비교 항목:
   - 전체 파라미터 수
   - LoRA 학습 대상(trainable) 파라미터 수
   - 배치 사이즈별([1, 4, 16, 32] 기본값) forward+backward 최대 메모리(GB)
@@ -12,8 +14,11 @@ checkpointing이 기본으로 켜져있는 것도 동일하다. 차이는 "레�
     (실제 학습 스텝의 메모리 최고점은 backward에서 나오는 게 보통이라 메모리는 계속
     forward+backward 기준으로 재고, 시간만 forward 단독으로 잰다)
 
-두 변형은 액션/상태 차원과 ARD 사용 여부가 달라서 모델 구조 자체가 다르다 — 정책을 공유할 수
-없어 변형마다 새로 빌드하고, 끝나면 GPU 메모리를 비우고 다음 변형으로 넘어간다.
+base는 액션/상태 차원 자체가 다르고(단일팔 7 DoF), ard/symmetric은 같은 bimanual 14 DoF +
+AsymmetricResidualHeads 구조를 쓰지만 손실 결합 방식(alpha/beta, smooth/traj를 어느 팔에
+거는지)만 다르다 — 그래서 ard와 symmetric은 파라미터 수가 정확히 같다(공정 비교 목적).
+정책을 공유할 수 없어 변형마다 새로 빌드하고, 끝나면 GPU 메모리를 비우고 다음 변형으로
+넘어간다.
 
 Colab/Kaggle 셀 예시:
     !git clone <이 레포 URL> ARD-VLA
@@ -44,19 +49,32 @@ from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 
 VARIANTS = {
-    "base_smolvla": {
+    "base": {
         "label": "기본 SmolVLA (단일팔 7 DoF, 원본 액션 헤드)",
         "short_label": "기본 SmolVLA",
         "state_dim": 7,
         "action_dim": 7,
         "use_ard": False,
+        "ard_symmetric": False,
     },
-    "ard_vla": {
-        "label": "ARD-VLA (bimanual 14 DoF, AsymmetricResidualHeads)",
+    "ard": {
+        "label": "ARD-VLA (bimanual 14 DoF, AsymmetricResidualHeads, 비대칭 손실)",
         "short_label": "ARD-VLA",
         "state_dim": 14,
         "action_dim": 14,
         "use_ard": True,
+        "ard_symmetric": False,
+    },
+    "symmetric": {
+        # 대칭 대조군(ablation) — ARD와 똑같은 head 구조/파라미터 수(AsymmetricResidualHeads를
+        # 그대로 재사용)를 쓰되, 손실 결합 방식만 compute_symmetric_losses로 바꾼 것. "ARD의
+        # 비대칭 정규화 자체가 도움이 되는가"를 공정하게 비교하기 위한 세 번째 변형이다.
+        "label": "대칭 대조군 (bimanual 14 DoF, AsymmetricResidualHeads, 대칭 손실)",
+        "short_label": "Symmetric",
+        "state_dim": 14,
+        "action_dim": 14,
+        "use_ard": True,
+        "ard_symmetric": True,
     },
 }
 
@@ -79,9 +97,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-grad-checkpoint", dest="use_grad_checkpoint", action="store_false")
     parser.add_argument(
         "--variants",
-        choices=["both", "base", "ard"],
-        default="both",
-        help="'both'(기본)면 두 변형을 모두 돌려서 비교표를 낸다. 'base'/'ard'면 그중 하나만 실행한다.",
+        type=str,
+        default="base,ard",
+        help=(
+            "쉼표로 구분된 변형 목록 — base/ard/symmetric 중 골라서 조합한다(예: "
+            "'base,ard,symmetric', 'ard,symmetric'). symmetric은 ard_symmetric=True인 대칭 "
+            "대조군(ablation)이다. 기본값 'base,ard'는 기존(이 플래그 추가 전)과 동일하게 "
+            "동작한다 — symmetric은 새 기능이라 기본에는 포함되지 않는다."
+        ),
     )
     parser.set_defaults(use_lora=True, use_bf16=True, use_grad_checkpoint=True)
     return parser.parse_args()
@@ -108,6 +131,7 @@ def build_policy_for_variant(args, variant_key: str) -> SmolVLAPolicy:
         pretrained_path=args.vlm_model_name if args.use_lora else None,  # PEFT의 "from-scratch 경고" 통과용
         use_ard=variant["use_ard"],
         ard_arm_dim=args.ard_arm_dim,
+        ard_symmetric=variant["ard_symmetric"],
         tokenizer_max_length=args.lang_seq_len,
         device="cuda",
     )
@@ -269,11 +293,12 @@ def main() -> None:
             "Colab/Kaggle에서 런타임을 GPU로 설정했는지 확인하세요."
         )
 
-    variant_keys = []
-    if args.variants in ("both", "base"):
-        variant_keys.append("base_smolvla")
-    if args.variants in ("both", "ard"):
-        variant_keys.append("ard_vla")
+    variant_keys = [v.strip() for v in args.variants.split(",") if v.strip()]
+    unknown = [v for v in variant_keys if v not in VARIANTS]
+    if unknown:
+        raise SystemExit(
+            f"알 수 없는 --variants 값: {unknown} (가능한 값: {', '.join(VARIANTS)}, 쉼표로 여러 개 조합 가능)"
+        )
 
     logging.info(
         "설정: LoRA=%s(r=%d) bf16=%s grad_checkpoint=%s batch_sizes=%s variants=%s",

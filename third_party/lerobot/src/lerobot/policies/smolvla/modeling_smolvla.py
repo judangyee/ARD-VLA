@@ -71,6 +71,7 @@ from lerobot.policies.smolvla.ard import (
     GradNormLambdas,
     combine_by_role,
     compute_ard_losses,
+    compute_symmetric_losses,
     resolve_actuator_is_first,
     resolve_bridge_layer_indices,
     split_by_role,
@@ -421,14 +422,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
             return per_sample_loss, loss_dict
 
         if self.config.use_ard and ard_extras is not None:
-            ard_out = compute_ard_losses(
+            common_ard_kwargs = dict(
                 per_element_loss=ard_extras["per_element_loss"],
                 stabilizer_traj_pred=ard_extras["stabilizer_traj_pred"],
                 actuator_traj_pred=ard_extras["actuator_traj_pred"],
                 actuator_is_first=ard_extras["actuator_is_first"],
                 arm_dim=self.config.ard_arm_dim,
-                alpha=self.config.ard_alpha,
-                beta=self.config.ard_beta,
                 lambda_smooth=self.config.ard_lambda_smooth,
                 lambda_force=self.config.ard_lambda_force,
                 lambda_traj=self.config.ard_lambda_traj,
@@ -438,11 +437,24 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 reg_time_weights=ard_extras["reg_time_weights"],
                 force_pred=ard_extras["force_pred"],
             )
+            if self.config.ard_symmetric:
+                # 대칭 대조군(ablation) 모드 — ARD의 "팔마다 다른 정규화" 가정을 빼고 양팔에
+                # 동일한 손실 형태를 적용한다. alpha=beta=0.5는 compute_symmetric_losses 내부에
+                # 고정돼 있다(configuration_smolvla.py의 __post_init__도 이미 0.5/0.5로 강제함).
+                ard_out = compute_symmetric_losses(**common_ard_kwargs)
+            else:
+                ard_out = compute_ard_losses(
+                    alpha=self.config.ard_alpha, beta=self.config.ard_beta, **common_ard_kwargs
+                )
             loss = ard_out.total
             if self.config.use_freq_policy:
                 loss = loss + self.config.freq_lambda * ard_extras["freq_loss"]
                 loss_dict["freq_consistency_loss"] = ard_extras["freq_loss"].item()
             loss_dict["loss"] = loss.item()
+            # 로깅 키에 모드가 구분되게: ARD(비대칭)/대칭 대조군이 같은 loss_dict 스키마를
+            # 공유하되(train_ard.py 등 기존 로깅 코드를 그대로 쓸 수 있도록), ard_mode로 어느
+            # 쪽인지 구분한다.
+            loss_dict["ard_mode"] = "symmetric" if self.config.ard_symmetric else "asymmetric"
             loss_dict["ard_stabilizer_loss"] = ard_out.stabilizer_loss.item()
             loss_dict["ard_actuator_loss"] = ard_out.actuator_loss.item()
             loss_dict["ard_pos_loss"] = ard_out.pos_loss.item()

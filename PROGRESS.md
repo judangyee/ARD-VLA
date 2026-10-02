@@ -11,14 +11,14 @@
       ("none" 기본 | "one_minus_t") 옵션을 추가했다.
 - [x] 2. ForceHead — `ard_use_force_head`(기본 False), 별도 MLP, GradNorm/옵티마이저/PEFT
       unfreeze 연결.
-- [ ] 3. 대칭 대조군 모드 — `ard_symmetric`(기본 False), train_ard.py/compare_smolvla_ard.py/
+- [x] 3. 대칭 대조군 모드 — `ard_symmetric`(기본 False), train_ard.py/compare_smolvla_ard.py/
       compare_bridge_attention.py CLI 연결.
 - [ ] 4. 테스트를 `tests/`로 이전 + pytest 설정 + CPU 전용 CI.
 - [ ] 5. README 요약/가설 추가 + 새 옵션 문서화 + Layout 갱신 + docs/ 분리.
 
 ## 현재 상태
 
-1~2단계 완료.
+1~3단계 완료.
 
 1단계: `configuration_smolvla.py`에 `ard_reg_time_weighting`("none" 기본 |
 "one_minus_t") 필드 + 검증 추가. `ard.py`에 `_reduce_reg_loss` 헬퍼(가중치 없으면
@@ -41,9 +41,27 @@ GradNorm이 초기 그래디언트를 못 봐서 일부러 안 씀) 추가, `con
 추가. `scripts/test_ard.py`에 config 검증 3개, `ForceHead` 단위 테스트, force_pred
 유무에 따른 경고/0-처리 테스트, GradNorm-ForceHead 연결 테스트 추가.
 
+3단계: `ard.py`에 `compute_symmetric_losses`(ARD 모드 `compute_ard_losses`는 전혀 건드리지
+않고, 새 함수로 분리) 추가 — 양팔 모두 `L_pos + lambda_smooth*L_smooth + lambda_traj*L_traj`
+동일 적용, alpha=beta=0.5 고정, force는 ARD와 동일하게 actuator 쪽에만(물리적으로 Actuator
+에만 의미 있는 신호라서 — docstring에 근거 명시). head 구조는 `AsymmetricResidualHeads`를
+그대로 재사용해 ARD와 파라미터 수가 정확히 같음. `configuration_smolvla.py`에
+`ard_symmetric`(기본 False, `use_ard=True` 필요) 추가 — 켜면 `ard_alpha`/`ard_beta`를 항상
+0.5/0.5로 강제하고, 사용자가 다른 값을 줬으면 `logging.warning`. `modeling_smolvla.py`의
+`SmolVLAPolicy.forward()`에서 `ard_symmetric` 여부로 `compute_ard_losses`/
+`compute_symmetric_losses`를 분기(기본 False 경로는 리팩토링 전과 bit-for-bit 동일한 인자로
+`compute_ard_losses` 호출). `loss_dict["ard_mode"]`("asymmetric"/"symmetric")를 추가해 로깅
+키로 모드를 구분할 수 있게 함. `train_ard.py`/`compare_bridge_attention.py`에
+`--ard-symmetric` 플래그 연결. `compare_smolvla_ard.py`는 `--variants`를 쉼표 구분 목록으로
+바꿔 `base,ard,symmetric` 세 변형을 지원하도록 재작성(기본값 `"base,ard"`는 이전 동작과
+동일). `scripts/test_ard.py`에 config 검증(대칭 모드 강제 alpha/beta 등), 양팔 손실 형태
+동일성(입력을 맞바꾸면 stab/act_loss도 맞바꿔짐), 파라미터 수 동일성, force 처리 동일성
+테스트를 추가했다.
+
 `check_env.py`/`test_ard.py`/`test_freq_policy.py`/`test_token_pruning.py` 전부 통과
-확인(실험/probe는 이번 작업 범위 밖이라 실행 안 함).
+확인(실험/probe는 이번 작업 범위 밖이라 실행 안 함). 모든 CLI 스크립트 `--help` 정상 동작
+확인.
 
 ## 다음에 할 일
 
-3단계(대칭 대조군 모드 `ard_symmetric`)부터 시작.
+4단계(scripts/test_*.py를 tests/ 아래 pytest로 이전 + CI)부터 시작.

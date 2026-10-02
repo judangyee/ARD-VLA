@@ -540,3 +540,114 @@ def compute_ard_losses(
         traj_loss=traj_loss.detach(),
         grad_loss=grad_loss,
     )
+
+
+def compute_symmetric_losses(
+    per_element_loss: Tensor,
+    stabilizer_traj_pred: Tensor,
+    actuator_traj_pred: Tensor,
+    actuator_is_first: Tensor,
+    arm_dim: int,
+    lambda_smooth: float,
+    lambda_force: float,
+    lambda_traj: float,
+    force_target: Tensor | None = None,
+    gradnorm: GradNormLambdas | None = None,
+    shared_activation: Tensor | None = None,
+    reg_time_weights: Tensor | None = None,
+    force_pred: Tensor | None = None,
+) -> ARDLossOutput:
+    """`ard_symmetric=True`일 때 쓰는 대칭 대조군(ablation) 손실 결합. `compute_ard_losses`와
+    달리 ARD의 핵심 가정("Stabilizer는 smooth만, Actuator는 force+traj만") 자체를 빼고, 두
+    팔 모두에 똑같은 형태 `L_pos + lambda_smooth*L_smooth + lambda_traj*L_traj`를 적용한다 —
+    즉 smooth(1차 차분)와 traj(2차 차분)를 **양쪽 팔 모두**에 건다(ARD처럼 한쪽에만 걸지
+    않는다). 호출하는 쪽(`alpha=beta=0.5`는 `configuration_smolvla.py`에서 강제됨)이
+    `total = 0.5 * stab_loss + 0.5 * act_loss`로 결합한다고 가정하고, 이 함수 자체도 내부적으로
+    0.5/0.5로 결합한다.
+
+    head 구조/파라미터 수를 ARD와 동일하게 유지하는 건 이 함수의 책임이 아니다 — 호출하는 쪽
+    (`modeling_smolvla.py`)이 `ard_symmetric` 여부와 무관하게 항상 같은 `AsymmetricResidualHeads`
+    인스턴스를 재사용하고, 이 함수는 그 출력(`stabilizer_traj_pred`/`actuator_traj_pred`)을
+    어떻게 손실로 결합할지만 바꾼다 — 그래서 두 모드의 파라미터 수가 정확히 같다.
+
+    force 항은 ARD 모드와 동일하게 actuator 쪽에만 유지한다(대칭으로 만들지 않음) — 접촉력/
+    토크는 도구를 조작하는 Actuator 팔에만 물리적으로 의미가 있는 신호이고, 작업물을 가만히
+    붙잡고 있는 Stabilizer 팔에는 애초에 "힘을 추적한다"는 과제 자체가 성립하지 않는다.
+    smooth/traj(궤적의 일반적인 매끄러움)는 양팔 모두에 자연스럽게 의미가 있는 것과 달리
+    force는 그렇지 않다고 판단해서, 이 항목만큼은 대칭화하지 않기로 결정했다 — 이건 판단이
+    갈릴 수 있는 지점이라 여기 명시해둔다.
+
+    다른 인자들의 의미는 `compute_ard_losses`와 동일하다.
+    """
+    if gradnorm is not None and shared_activation is None:
+        raise ValueError("gradnorm을 쓰려면 shared_activation(예: suffix_out)도 같이 넘겨야 합니다.")
+    stab_pos_per_elem, act_pos_per_elem = split_by_role(per_element_loss, arm_dim, actuator_is_first)
+    stab_pos_loss = stab_pos_per_elem.mean()
+    act_pos_loss = act_pos_per_elem.mean()
+
+    def _smooth(traj_pred: Tensor) -> Tensor:
+        if traj_pred.shape[1] > 1:
+            return _reduce_reg_loss((traj_pred[:, 1:] - traj_pred[:, :-1]).pow(2), reg_time_weights)
+        return traj_pred.new_zeros(())
+
+    def _traj(traj_pred: Tensor) -> Tensor:
+        if traj_pred.shape[1] > 2:
+            second_diff = traj_pred[:, 2:] - 2 * traj_pred[:, 1:-1] + traj_pred[:, :-2]
+            return _reduce_reg_loss(second_diff.pow(2), reg_time_weights)
+        return traj_pred.new_zeros(())
+
+    smooth_stab = _smooth(stabilizer_traj_pred)
+    smooth_act = _smooth(actuator_traj_pred)
+    traj_stab = _traj(stabilizer_traj_pred)
+    traj_act = _traj(actuator_traj_pred)
+
+    # force_loss: compute_ard_losses와 완전히 동일한 로직(actuator 쪽에만, force_pred 필요).
+    if force_target is not None and force_pred is not None:
+        target = force_target.to(force_pred.dtype)
+        if target.ndim == 1:
+            target = target.unsqueeze(-1)
+        force_loss = (force_pred - target).abs().mean()
+    elif force_target is not None and force_pred is None:
+        warnings.warn(
+            "force_target이 주어졌지만 ard_use_force_head=False라 힘을 예측할 방법이 없습니다 — "
+            "force_loss를 0으로 처리합니다. 힘 추적 손실을 쓰려면 ard_use_force_head=True로 "
+            "ForceHead를 활성화하세요.",
+            stacklevel=2,
+        )
+        force_loss = actuator_traj_pred.new_zeros(())
+    else:
+        force_loss = actuator_traj_pred.new_zeros(())
+
+    grad_loss = None
+    if gradnorm is not None:
+        used_lambda_smooth = gradnorm.lambda_smooth.detach()
+        used_lambda_force = gradnorm.lambda_force.detach()
+        used_lambda_traj = gradnorm.lambda_traj.detach()
+        # 대칭 모드에서는 smooth/traj가 양팔 각각에 걸리므로, GradNorm에 넘기는 "대표" smooth/traj
+        # 손실은 양팔 평균을 쓴다 — GradNormLambdas.task_names는 ("smooth", "force", "traj")
+        # 3개 고정이라, ARD 모드와 동일한 인터페이스를 유지하기 위한 선택이다.
+        grad_loss = gradnorm.compute_grad_loss(
+            [(smooth_stab + smooth_act) / 2, force_loss, (traj_stab + traj_act) / 2], shared_activation
+        )
+    else:
+        used_lambda_smooth, used_lambda_force, used_lambda_traj = lambda_smooth, lambda_force, lambda_traj
+
+    stab_loss = stab_pos_loss + used_lambda_smooth * smooth_stab + used_lambda_traj * traj_stab
+    act_loss = (
+        act_pos_loss
+        + used_lambda_smooth * smooth_act
+        + used_lambda_force * force_loss
+        + used_lambda_traj * traj_act
+    )
+    total = 0.5 * stab_loss + 0.5 * act_loss
+
+    return ARDLossOutput(
+        total=total,
+        stabilizer_loss=stab_loss.detach(),
+        actuator_loss=act_loss.detach(),
+        pos_loss=((stab_pos_loss + act_pos_loss) / 2).detach(),
+        smooth_loss=((smooth_stab + smooth_act) / 2).detach(),
+        force_loss=force_loss.detach(),
+        traj_loss=((traj_stab + traj_act) / 2).detach(),
+        grad_loss=grad_loss,
+    )

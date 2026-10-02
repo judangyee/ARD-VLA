@@ -74,6 +74,16 @@ def parse_args() -> argparse.Namespace:
     ard_group.add_argument("--ard-beta", type=float, default=0.7)
     ard_group.add_argument("--ard-bridge-layer-indices", type=int, nargs="+", default=None)
     ard_group.add_argument("--ard-bridge-num-heads", type=int, default=4)
+    ard_group.add_argument(
+        "--ard-symmetric",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "대칭 대조군(ablation) 모드 — 양팔 모두 같은 형태의 정규화(L_pos + lambda_smooth*"
+            "L_smooth + lambda_traj*L_traj)를 적용하고 alpha/beta를 0.5/0.5로 강제한다. "
+            "train_ard.py의 --ard-symmetric과 동일. 기본은 꺼져 있다."
+        ),
+    )
 
     parser.set_defaults(use_lora=True)
     return parser.parse_args()
@@ -97,6 +107,7 @@ def build_config(args, use_bridge_attention: bool, input_features: dict, output_
         use_bridge_attention=use_bridge_attention,
         ard_bridge_layer_indices=args.ard_bridge_layer_indices,
         ard_bridge_num_heads=args.ard_bridge_num_heads,
+        ard_symmetric=args.ard_symmetric,
     )
 
 
