@@ -64,6 +64,17 @@ ARD-VLA 연구계획서(양손 도구 조작 파인튜닝: 한 팔은 작업물�
   (`alpha * L_stab + beta * L_act`, `L_stab = L_pos + λ·L_smooth`, `L_act = L_pos + λ·L_force +
   λ·L_traj` — 연구계획서의 손실 설계를 그대로 따름. `L_pos`는 별도의 L1 항을 다시 계산하지
   않고 베이스 모델 자체의 flow-matching 회귀 손실을 재사용합니다).
+
+  **`L_smooth`/`L_traj`가 거는 대상 — velocity가 아니라 노이즈 제거된 액션 추정치.**
+  `VLAFlowMatching.forward`는 flow-matching의 예측 velocity field `v_t`(목표는
+  `u_t = noise - actions`)를 만든다. 초기 구현은 `L_smooth`(1차 차분)/`L_traj`(2차 차분)를
+  이 `v_t` 자체에 걸었는데, 이건 개념적으로 틀렸다 — `u_t`는 매 타임스텝 독립적으로 샘플된
+  `noise` 때문에 시간축으로 원래 거칠어서, `v_t`에 스무딩 벌점을 주면 "이 velocity는
+  매끄러워야 한다"고 강요하는 셈이 되어 flow-matching 회귀 목표(`u_t`를 맞히는 것) 자체와
+  정면으로 충돌한다. 지금은 직선 보간 `x_t = t·noise + (1-t)·actions`로부터 역산한
+  `x0_hat = x_t - t·v_t`(노이즈 제거된 액션 추정치 — `v_t == u_t`일 때 `x0_hat`이 `actions`와
+  정확히 같아짐을 대수적으로 보장)에 `L_smooth`/`L_traj`를 건다. `compute_ard_losses`의
+  `stabilizer_traj_pred`/`actuator_traj_pred` 인자 이름도 이 의미를 명확히 하도록 바뀌었다.
 - `configuration_smolvla.py` — 새 `use_ard`, `ard_arm_dim`, `ard_alpha`/`ard_beta`,
   `ard_lambda_{smooth,force,traj}`, `ard_default_actuator_arm`(기본값 `"right"`) 필드 추가,
   기본값은 전부 꺼짐 (`use_ard=False`이면 업스트림 SmolVLA와 완전히 동일하게 동작 — 플래그를
@@ -185,8 +196,8 @@ Hub 다운로드 없이 `AutoConfig.from_pretrained`/`AutoProcessor.from_pretrai
 GradNorm 8스텝 후: lambda_smooth 1.00 -> 1.33   lambda_force 1.00 -> 1.00(거의 고정)   lambda_traj 1.00 -> 0.67
 ```
 
-`smooth_loss`/`traj_loss`가 `pos_loss`에 비해 원래 작다는(이전 대화의 "레이어 프루닝"과
-무관한 손실 스케일 실험 참고) 사실과 별개로, GradNorm은 **그래디언트 norm**을 기준으로
+이 실험 당시(아래에서 설명하는 `x0_hat` 수정 전) `smooth_loss`/`traj_loss`가 `pos_loss`에
+비해 원래 작았다는 사실과 별개로, GradNorm은 **그래디언트 norm**을 기준으로
 판단하기 때문에 라벨 그대로의 손실 크기와는 다른 방향으로 조정될 수 있습니다 — 실제로 이
 합성 백본 실험에서 `traj_loss`의 그래디언트 norm이 상대적으로 작게 나와서 GradNorm이
 `lambda_traj`를 오히려 낮췄습니다. 8스텝만에 손실 자체의 비율(smooth/pos, traj/pos)은 고정
@@ -194,6 +205,66 @@ GradNorm 8스텝 후: lambda_smooth 1.00 -> 1.33   lambda_force 1.00 -> 1.00(거
 바꾸는 것이지, 그 순간의 손실값 자체를 바꾸는 게 아니라서 몇 스텝 만에 차이가 크게 벌어지진
 않습니다. 이 실험은 8레이어짜리 무작위 초기화 장난감 백본 기준이라 절대적인 수치나 방향성이
 진짜 SmolVLM2에서도 그대로 재현될지는 실제 GPU 환경에서 다시 확인이 필요합니다.
+
+**주의 — 위 `smooth_loss`/`traj_loss` 스케일 수치는 수정 전(velocity 기반) 설계 기준입니다.**
+`L_smooth`/`L_traj`가 `v_t`(velocity)가 아니라 `x0_hat`(노이즈 제거된 액션 추정치)에 걸리도록
+고친 뒤, 같은 합성 백본으로 8스텝 probe를 수정 전/후 다시 돌려 비교했습니다:
+
+```
+[before-fix] (velocity v_t에 직접 건 경우)
+step |        pos |     smooth |       traj | smooth/pos |   traj/pos
+   1 |    2.68297 |    0.05490 |    0.29448 |      0.020 |      0.110
+   4 |    2.54958 |    0.05027 |    0.21060 |      0.020 |      0.083
+   8 |    2.32579 |    0.04368 |    0.09939 |      0.019 |      0.043
+
+[after-fix] (x0_hat에 건 경우)
+step |        pos |     smooth |       traj | smooth/pos |   traj/pos
+   1 |    2.68297 |    1.02752 |    1.95705 |      0.383 |      0.729
+   4 |    2.53317 |    1.07494 |    3.50039 |      0.424 |      1.382
+   8 |    2.34088 |    0.98089 |    1.82520 |      0.419 |      0.780
+```
+
+(둘 다 8레이어가 아니라 2레이어짜리 무작위 초기화 장난감 SmolVLM 백본, seed=0, 동일한 배치
+시퀀스 기준 — `pos` 열은 거의 그대로인데(ARD 외적인 베이스 flow-matching 손실이라 당연함),
+`smooth`/`traj`는 수정 후 자릿수가 통째로 달라진다. 이건 버그였다는 증거이기도 하다 — 수정
+전 `smooth_loss`/`traj_loss`는 `pos_loss`의 2~11%에 불과해 사실상 거의 기여를 못 했는데
+(위 GradNorm 절의 "원래 작다"는 서술이 이 증상을 가리킨 것), noise가 타임스텝마다 독립
+샘플이라 `v_t` 자체가 원래 거칠다는 걸 감안하면 오히려 더 커야 할 신호였다 — `x0_hat` 기반
+으로 고친 뒤에는 `pos_loss`와 같은 자릿수(38~78% / 73~201%)로 커져서, `alpha`/`beta`/
+`lambda_*` 조정이 실제로 의미 있게 작동할 수 있는 스케일이 됐다.)
+
+**검증된 것**: `scripts/test_ard.py`에 추가한 회귀 테스트로 — (1) `v_t == u_t`(완벽한 예측)일
+때 `x0_hat`이 `noise`/`time`을 무엇으로 샘플하든 `actions`와 대수적으로 정확히 같아짐,
+(2) 그 결과 `smooth_loss`/`traj_loss`가 `noise`와 무관하게 실제 `actions`의 1차/2차 차분과
+정확히 같아짐, (3) 상수 궤적이면 완벽한 예측에서 두 손실이 정확히 0이 됨, (4) 수정 전 방식
+(velocity를 직접 쓰는 대조군)과는 값이 달라짐 — 을 직접 수치로 확인했고, 기존 GradNorm
+테스트 전부와 `force_loss` 로직(입력만 `x0_hat` 기반으로 바뀌었을 뿐 동작은 그대로)도 여전히
+통과합니다.
+
+**측정됨(실제로 문제가 될 수 있다는 쪽)**: `x0_hat = x_t - t·v_t`는 `t`(flow-matching
+타임스텝)가 클수록 오차가 커질 수 있습니다 — `x0_hat - actions = -t·(v_t - u_t)`이므로
+velocity 예측 오차가 `t` 배만큼 그대로 반영되고, 학습 초반/언더피팅 구간에서는 `t`가 1에
+가까운(거의 순수 노이즈인) 샘플일수록 `v_t`의 예측 오차 자체가 실질적으로 더 큰 경향이
+있습니다. 같은 장난감 백본을 8스텝 가볍게 학습시킨 뒤 `t`를 5개 구간으로 고정해서
+`|x0_hat - actions|`의 평균/표준편차를 측정했습니다:
+
+```
+t 구간          | mean|x0_hat-actions| | std|x0_hat-actions|
+[0.00, 0.20)    |                 0.12 |                0.07
+[0.20, 0.40)    |                 0.36 |                0.07
+[0.40, 0.60)    |                 0.60 |                0.08
+[0.60, 0.80)    |                 0.83 |                0.10
+[0.80, 1.00)    |                 1.06 |                0.10
+```
+
+평균 오차가 `t=[0, 0.2)`에서 `t=[0.8, 1.0)`까지 약 8.7배(0.12 → 1.06)로 뚜렷하게 커지는
+걸 확인했습니다 — 우려가 실제 현상임을 이 장난감 백본 기준으로는 확인한 셈입니다. 다만 이게
+진짜 SmolVLM2 규모에서도 학습에 실질적으로 해로운 수준인지(단순히 "큰 t의 샘플일수록
+smooth/traj 신호가 더 시끄럽다" 정도인지, 아니면 학습을 실제로 방해하는지)는 확인되지
+않았습니다 — 실제 GPU 환경에서 다시 측정해봐야 압니다. 문제가 된다면 `(1-t)` 가중(= `t`가
+클수록 smooth/traj 항의 기여를 줄이는 방식) 같은 보정을 추가할 수 있지만, 이번 수정에는
+포함하지 않았습니다(선택적 후속 작업 — 켤지 말지, 가중 함수를 뭘로 할지는 사용자가 실제
+데이터로 확인한 뒤 결정하는 게 낫다고 판단함).
 
 ## Bridge Attention: 백본 여러 레이어를 조건으로 (`--use-bridge-attention`, VLA-Adapter식)
 
