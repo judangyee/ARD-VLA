@@ -422,8 +422,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         if self.config.use_ard and ard_extras is not None:
             ard_out = compute_ard_losses(
                 per_element_loss=ard_extras["per_element_loss"],
-                stabilizer_pred=ard_extras["stabilizer_pred"],
-                actuator_pred=ard_extras["actuator_pred"],
+                stabilizer_traj_pred=ard_extras["stabilizer_traj_pred"],
+                actuator_traj_pred=ard_extras["actuator_traj_pred"],
                 actuator_is_first=ard_extras["actuator_is_first"],
                 arm_dim=self.config.ard_arm_dim,
                 alpha=self.config.ard_alpha,
@@ -961,13 +961,22 @@ class VLAFlowMatching(nn.Module):
             ard_extras["freq_loss"] = compute_frequency_consistency_loss(v_t, u_t, decay=self.config.freq_decay)
 
         if self.config.use_ard:
-            stabilizer_pred, actuator_pred = split_by_role(
-                v_t[..., : 2 * arm_dim], arm_dim, actuator_is_first
+            # smooth_loss/traj_loss(ard.py의 compute_ard_losses)는 "예측된 액션 궤적이 매끄럽다"는
+            # 걸 벌점으로 강제하려는 의도다. 그런데 v_t는 velocity field라서 그 목표(u_t = noise -
+            # actions)가 타임스텝마다 독립 샘플된 noise 때문에 원래 시간축으로 거칠다 — v_t에
+            # 직접 스무딩 벌점을 주면 flow-matching 회귀 목표와 정면으로 충돌한다 (ard.py의
+            # compute_ard_losses docstring 참고). 그래서 v_t가 아니라, 직선 보간
+            # x_t = t*noise + (1-t)*actions로부터 역산한 "노이즈 제거된 액션 추정치"
+            # x0_hat = x_t - t*v_t에 스무딩 벌점을 건다 — v_t == u_t(완벽한 예측)이면
+            # x0_hat == actions가 정확히 성립한다(대수적으로 noise 항이 상쇄됨).
+            x0_hat = x_t - time_expanded * v_t
+            stabilizer_traj_pred, actuator_traj_pred = split_by_role(
+                x0_hat[..., : 2 * arm_dim], arm_dim, actuator_is_first
             )
             ard_extras.update({
                 "actuator_is_first": actuator_is_first,
-                "stabilizer_pred": stabilizer_pred,
-                "actuator_pred": actuator_pred,
+                "stabilizer_traj_pred": stabilizer_traj_pred,
+                "actuator_traj_pred": actuator_traj_pred,
                 # GradNorm 전용: actuator/stabilizer head 바로 직전의 공유 표현 — action_out_proj와
                 # ard_heads가 둘 다 이 텐서를 입력으로 받는다. use_gradnorm=False면 안 쓰인다.
                 "shared_activation": suffix_out,

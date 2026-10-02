@@ -307,7 +307,7 @@ class GradNormLambdas(nn.Module):
         for weight, loss in zip(self.weights, task_losses, strict=True):
             weighted = weight * loss
             # allow_unused=True: force_target이 없으면 force_loss는 shared_activation과 연결되지
-            # 않은 상수 0(actuator_pred.new_zeros(()))이라 그래프에 아예 안 잡힌다 — 그럴 때
+            # 않은 상수 0(actuator_traj_pred.new_zeros(()))이라 그래프에 아예 안 잡힌다 — 그럴 때
             # autograd.grad는 기본적으로 에러를 내므로, "그 항은 그래디언트가 0"으로 명시적으로
             # 처리한다 (실제로 그 항이 shared_activation에 아무 영향을 안 준다는 뜻이므로 맞는 처리).
             (grad,) = torch.autograd.grad(
@@ -349,8 +349,8 @@ class ARDLossOutput:
 
 def compute_ard_losses(
     per_element_loss: Tensor,
-    stabilizer_pred: Tensor,
-    actuator_pred: Tensor,
+    stabilizer_traj_pred: Tensor,
+    actuator_traj_pred: Tensor,
     actuator_is_first: Tensor,
     arm_dim: int,
     alpha: float,
@@ -370,14 +370,24 @@ def compute_ard_losses(
         reduce한다. 이 값이 ARD-VLA 계획서의 L_pos 항 역할을 한다: 네트워크가 목표 궤적을
         추적하도록 실제로 학습시키는 신호이므로, 별도의 L1 위치 손실을 다시 계산하지 않고
         이 값을 재사용한다.
-    stabilizer_pred / actuator_pred: (batch, chunk_size, arm_dim) — 각 샘플에서 이미 해당
-        역할로 라우팅된 채널의 예측 velocity field (`split_by_role` 참고). 아래의 smoothness /
-        trajectory 정규화 항에 사용된다. flow-matching 학습은 diffusion 스텝마다 예측
-        velocity field만 만들어낼 뿐 완전히 노이즈 제거된 액션 시퀀스를 만들지는 않으므로,
-        chunk 구간에 걸친 이 velocity field의 시간적 변화 양상이 "예측된 궤적"에 가장 가까운
-        대용값(proxy)이다.
+    stabilizer_traj_pred / actuator_traj_pred: (batch, chunk_size, arm_dim) — 각 샘플에서 이미
+        해당 역할로 라우팅된 채널의, **노이즈 제거된 액션 궤적 추정치** `x0_hat`(`split_by_role`
+        참고). 아래의 smoothness / trajectory 정규화 항에 사용된다.
+
+        주의 — 과거 버전에서는 여기에 예측 velocity field(`v_t`) 자체를 넘겼는데, 이건
+        개념적으로 틀렸다: flow-matching 목표 velocity `u_t = noise - actions`는 매 타임스텝
+        독립적으로 샘플된 `noise` 때문에 시간축으로 원래 거칠다(스무스해야 할 이유가 없다).
+        `v_t`에 1차/2차 차분 스무딩 벌점을 주면 "이 velocity는 매끄러워야 한다"고 강요하는
+        셈이라, flow-matching 회귀 목표(정답 `u_t`를 맞히는 것) 자체와 정면으로 충돌한다.
+        `x0_hat = x_t - t * v_t`(직선 보간 `x_t = t*noise + (1-t)*actions`이므로, `v_t == u_t`일
+        때 `x0_hat`은 `actions`와 정확히 같아진다)는 velocity가 아니라 "현재 시점에서 모델이
+        추정하는 노이즈 제거된 액션 그 자체"라서, 이 값의 시간적 변화(1차/2차 차분)에 벌점을
+        주는 것이 smooth_loss/traj_loss가 원래 의도한 "예측 궤적이 매끄럽다"는 개념과 실제로
+        들어맞는다. `x0_hat` 계산 자체는 이 함수가 아니라 `modeling_smolvla.py`의
+        `VLAFlowMatching.forward`에서 이뤄진다 — 이 함수는 이미 계산되어 역할별로 라우팅된
+        값만 받는다.
     actuator_is_first: (batch,) bool, `resolve_actuator_is_first`가 반환한 값 — `per_element_loss`를
-        `stabilizer_pred`/`actuator_pred`와 동일한 방식으로 라우팅하기 위해 필요하다.
+        `stabilizer_traj_pred`/`actuator_traj_pred`와 동일한 방식으로 라우팅하기 위해 필요하다.
     gradnorm / shared_activation: 둘 다 주어지면 `lambda_smooth`/`lambda_force`/`lambda_traj`
         인자 대신 `gradnorm.lambda_*`(GradNorm으로 학습되는 값)를 쓴다. `gradnorm`만 주고
         `shared_activation`을 안 주면 에러 — GradNorm 그래디언트 norm 계산에 반드시 필요하다.
@@ -388,31 +398,35 @@ def compute_ard_losses(
     stab_pos_loss = stab_pos_per_elem.mean()
     act_pos_loss = act_pos_per_elem.mean()
 
-    # L_smooth = sum |s_t - s_{t-1}|^2, chunk 구간 내 예측된 stabilizer 궤적에 대한 흔들림 페널티.
-    if stabilizer_pred.shape[1] > 1:
-        smooth_loss = (stabilizer_pred[:, 1:] - stabilizer_pred[:, :-1]).pow(2).mean()
+    # L_smooth = sum |s_t - s_{t-1}|^2, chunk 구간 내 예측된(노이즈 제거된) stabilizer 액션
+    # 궤적 추정치(x0_hat 기반)에 대한 흔들림 페널티.
+    if stabilizer_traj_pred.shape[1] > 1:
+        smooth_loss = (stabilizer_traj_pred[:, 1:] - stabilizer_traj_pred[:, :-1]).pow(2).mean()
     else:
-        smooth_loss = stabilizer_pred.new_zeros(())
+        smooth_loss = stabilizer_traj_pred.new_zeros(())
 
-    # L_traj = sum |a_t - 2a_{t-1} + a_{t-2}|^2, actuator 궤적에 대한 2차 스무딩 페널티
-    # (정밀한 도구 조작 중 급격한 방향 전환에 불이익을 준다).
-    if actuator_pred.shape[1] > 2:
-        second_diff = actuator_pred[:, 2:] - 2 * actuator_pred[:, 1:-1] + actuator_pred[:, :-2]
+    # L_traj = sum |a_t - 2a_{t-1} + a_{t-2}|^2, actuator 액션 궤적 추정치에 대한 2차 스무딩
+    # 페널티(정밀한 도구 조작 중 급격한 방향 전환에 불이익을 준다).
+    if actuator_traj_pred.shape[1] > 2:
+        second_diff = actuator_traj_pred[:, 2:] - 2 * actuator_traj_pred[:, 1:-1] + actuator_traj_pred[:, :-2]
         traj_loss = second_diff.pow(2).mean()
     else:
-        traj_loss = actuator_pred.new_zeros(())
+        traj_loss = actuator_traj_pred.new_zeros(())
 
     # L_force: 예를 들어 Isaac Sim의 접촉 센서 등에서 얻는 선택적 접촉력/토크 추적 항.
     # 현재 이 레포의 어떤 데이터셋에도 없는 신호라 기본값은 0이다 — 실제 force 신호 연결은
-    # 향후 과제다 (ARD-VLA 연구계획서의 "실물 실증" 참고).
+    # 향후 과제다 (ARD-VLA 연구계획서의 "실물 실증" 참고). 이 항은 별도 이슈로 다룰 예정이라
+    # 로직 자체는 그대로 두었다 — 입력이 velocity(v_t)에서 x0_hat 기반 액션 추정치로 바뀐 것
+    # 자체는 shape/동작에 영향이 없다(아래 force_pred는 여전히 "actuator 블록의 마지막 채널"을
+    # 그대로 가리킨다).
     if force_target is not None:
-        force_pred = actuator_pred[..., -1]  # (batch, chunk_size): actuator의 마지막 채널을 force 대용값으로 사용
+        force_pred = actuator_traj_pred[..., -1]  # (batch, chunk_size): actuator의 마지막 채널을 force 대용값으로 사용
         target = force_target.to(force_pred.dtype)
         if target.ndim == 1:  # (batch,) -> chunk 전체에 동일한 타겟을 브로드캐스트
             target = target.unsqueeze(-1)
         force_loss = (force_pred - target).abs().mean()
     else:
-        force_loss = actuator_pred.new_zeros(())
+        force_loss = actuator_traj_pred.new_zeros(())
 
     grad_loss = None
     if gradnorm is not None:
