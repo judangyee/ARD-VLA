@@ -33,6 +33,10 @@ from torch import Tensor, nn
 
 # 데이터셋/환경이 선택적으로 제공할 수 있는 배치 키.
 ARD_FORCE_TARGET = "ard_force_target"  # float, shape (batch,) 또는 (batch, chunk_size): 목표 접촉력/토크
+ARD_JOINT_TORQUE = "observation.joint_torque"  # float, shape (batch, torque_dim): 관절 토크 관측값.
+# `config.ard_use_joint_torque=True`면 `SmolVLAPolicy.prepare_state()`가 이 값을 `observation.state`
+# 뒤에 concat해서 `state_proj`에 넘긴다 — force_target(손실 supervision 타겟)과는 완전히 다른
+# 개념이다: 이건 "모델이 보는 입력"이고, force_target은 "ForceHead 출력이 맞혀야 할 정답"이다.
 
 
 class BridgeAttention(nn.Module):
@@ -406,6 +410,25 @@ def _reduce_reg_loss(sq_diff: Tensor, time_weights: Tensor | None) -> Tensor:
     return (per_sample * time_weights).mean()
 
 
+def _exclude_gripper(traj_pred: Tensor, gripper_dim: int) -> Tensor:
+    """smooth_loss/traj_loss의 1차/2차 차분을 계산하기 전에, 각 팔 블록의 마지막
+    `gripper_dim`개 채널(그리퍼)을 제외한다.
+
+    그리퍼는 "열림/닫힘"에 가까운 bang-bang성 신호라, 관절 채널과 달리 빠르게 전환되는 것이
+    정상적인 동작이다 — 관절 궤적에 적용하는 1차(smooth)/2차(traj) 차분 벌점을 그리퍼 채널에
+    그대로 걸면, 정상적으로 빨리 열고 닫아야 하는 상황에서도 "느리게 움직이라"는 잘못된 신호를
+    준다. `gripper_dim=0`(기본값)이면 과거와 완전히 동일하게 전체 채널에 벌점을 건다 — 이
+    분기는 bit-for-bit 동일성을 위해 절대 건드리지 않는다.
+
+    L_pos(기본 flow-matching 회귀 손실)는 이 함수와 무관하게 전체 채널(그리퍼 포함)에 그대로
+    걸린다 — `compute_ard_losses`/`compute_symmetric_losses`의 `per_element_loss` 처리 참고.
+    즉 그리퍼 채널은 "L_pos만 받고 smooth/traj 추가 벌점은 받지 않는다"는 설계가 된다.
+    """
+    if gripper_dim <= 0:
+        return traj_pred
+    return traj_pred[..., : traj_pred.shape[-1] - gripper_dim]
+
+
 def compute_ard_losses(
     per_element_loss: Tensor,
     stabilizer_traj_pred: Tensor,
@@ -422,6 +445,7 @@ def compute_ard_losses(
     shared_activation: Tensor | None = None,
     reg_time_weights: Tensor | None = None,
     force_pred: Tensor | None = None,
+    gripper_dim: int = 0,
 ) -> ARDLossOutput:
     """베이스 flow-matching 회귀 손실에 ARD의 역할별 정규화 항들을 결합한다.
 
@@ -463,6 +487,11 @@ def compute_ard_losses(
         None이면(즉 `ard_use_force_head=False`인데 `force_target`이 들어온 경우) 힘을 예측할
         방법이 없으므로 경고를 한 번 띄우고 `force_loss`를 0으로 처리한다 — 과거처럼 관절
         속도/위치 채널을 대신 쓰지 않는다.
+    gripper_dim: 각 팔 블록(`arm_dim`개 채널)의 마지막 `gripper_dim`개를 그리퍼로 간주해서
+        smooth_loss/traj_loss 계산에서 제외한다(`_exclude_gripper` 참고). 기본값 0이면 과거와
+        완전히 동일하게 전체 채널에 벌점을 건다. `L_pos`(아래 `stab_pos_loss`/`act_pos_loss`)는
+        이 인자와 무관하게 항상 전체 채널(그리퍼 포함)에 걸린다 — 즉 그리퍼는 "L_pos만 받고
+        smooth/traj 추가 벌점은 받지 않는다".
     """
     if gradnorm is not None and shared_activation is None:
         raise ValueError("gradnorm을 쓰려면 shared_activation(예: suffix_out)도 같이 넘겨야 합니다.")
@@ -471,18 +500,21 @@ def compute_ard_losses(
     act_pos_loss = act_pos_per_elem.mean()
 
     # L_smooth = sum |s_t - s_{t-1}|^2, chunk 구간 내 예측된(노이즈 제거된) stabilizer 액션
-    # 궤적 추정치(x0_hat 기반)에 대한 흔들림 페널티.
-    if stabilizer_traj_pred.shape[1] > 1:
+    # 궤적 추정치(x0_hat 기반)에 대한 흔들림 페널티. gripper_dim>0이면 그리퍼 채널은 제외한다.
+    smooth_input = _exclude_gripper(stabilizer_traj_pred, gripper_dim)
+    if smooth_input.shape[1] > 1:
         smooth_loss = _reduce_reg_loss(
-            (stabilizer_traj_pred[:, 1:] - stabilizer_traj_pred[:, :-1]).pow(2), reg_time_weights
+            (smooth_input[:, 1:] - smooth_input[:, :-1]).pow(2), reg_time_weights
         )
     else:
         smooth_loss = stabilizer_traj_pred.new_zeros(())
 
     # L_traj = sum |a_t - 2a_{t-1} + a_{t-2}|^2, actuator 액션 궤적 추정치에 대한 2차 스무딩
-    # 페널티(정밀한 도구 조작 중 급격한 방향 전환에 불이익을 준다).
-    if actuator_traj_pred.shape[1] > 2:
-        second_diff = actuator_traj_pred[:, 2:] - 2 * actuator_traj_pred[:, 1:-1] + actuator_traj_pred[:, :-2]
+    # 페널티(정밀한 도구 조작 중 급격한 방향 전환에 불이익을 준다). gripper_dim>0이면 그리퍼
+    # 채널은 제외한다.
+    traj_input = _exclude_gripper(actuator_traj_pred, gripper_dim)
+    if traj_input.shape[1] > 2:
+        second_diff = traj_input[:, 2:] - 2 * traj_input[:, 1:-1] + traj_input[:, :-2]
         traj_loss = _reduce_reg_loss(second_diff.pow(2), reg_time_weights)
     else:
         traj_loss = actuator_traj_pred.new_zeros(())
@@ -556,6 +588,7 @@ def compute_symmetric_losses(
     shared_activation: Tensor | None = None,
     reg_time_weights: Tensor | None = None,
     force_pred: Tensor | None = None,
+    gripper_dim: int = 0,
 ) -> ARDLossOutput:
     """`ard_symmetric=True`일 때 쓰는 대칭 대조군(ablation) 손실 결합. `compute_ard_losses`와
     달리 ARD의 핵심 가정("Stabilizer는 smooth만, Actuator는 force+traj만") 자체를 빼고, 두
@@ -577,6 +610,10 @@ def compute_symmetric_losses(
     force는 그렇지 않다고 판단해서, 이 항목만큼은 대칭화하지 않기로 결정했다 — 이건 판단이
     갈릴 수 있는 지점이라 여기 명시해둔다.
 
+    gripper_dim: `compute_ard_losses`와 동일한 의미 — 각 팔 블록의 마지막 `gripper_dim`개
+        채널(그리퍼)을 smooth/traj 계산에서 제외한다(양쪽 팔 모두에 동일하게 적용된다, 대칭
+        모드답게). 기본값 0이면 과거와 완전히 동일하다.
+
     다른 인자들의 의미는 `compute_ard_losses`와 동일하다.
     """
     if gradnorm is not None and shared_activation is None:
@@ -586,13 +623,15 @@ def compute_symmetric_losses(
     act_pos_loss = act_pos_per_elem.mean()
 
     def _smooth(traj_pred: Tensor) -> Tensor:
-        if traj_pred.shape[1] > 1:
-            return _reduce_reg_loss((traj_pred[:, 1:] - traj_pred[:, :-1]).pow(2), reg_time_weights)
+        smooth_input = _exclude_gripper(traj_pred, gripper_dim)
+        if smooth_input.shape[1] > 1:
+            return _reduce_reg_loss((smooth_input[:, 1:] - smooth_input[:, :-1]).pow(2), reg_time_weights)
         return traj_pred.new_zeros(())
 
     def _traj(traj_pred: Tensor) -> Tensor:
-        if traj_pred.shape[1] > 2:
-            second_diff = traj_pred[:, 2:] - 2 * traj_pred[:, 1:-1] + traj_pred[:, :-2]
+        traj_input = _exclude_gripper(traj_pred, gripper_dim)
+        if traj_input.shape[1] > 2:
+            second_diff = traj_input[:, 2:] - 2 * traj_input[:, 1:-1] + traj_input[:, :-2]
             return _reduce_reg_loss(second_diff.pow(2), reg_time_weights)
         return traj_pred.new_zeros(())
 

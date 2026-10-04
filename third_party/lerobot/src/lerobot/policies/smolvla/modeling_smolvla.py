@@ -66,6 +66,7 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.smolvla.ard import (
     ARD_FORCE_TARGET,
+    ARD_JOINT_TORQUE,
     AsymmetricResidualHeads,
     ForceHead,
     GradNormLambdas,
@@ -436,6 +437,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 shared_activation=ard_extras["shared_activation"] if self.model.ard_gradnorm is not None else None,
                 reg_time_weights=ard_extras["reg_time_weights"],
                 force_pred=ard_extras["force_pred"],
+                gripper_dim=self.config.ard_gripper_dim,
             )
             if self.config.ard_symmetric:
                 # 대칭 대조군(ablation) 모드 — ARD의 "팔마다 다른 정규화" 가정을 빼고 양팔에
@@ -550,8 +552,19 @@ class SmolVLAPolicy(PreTrainedPolicy):
         return actions
 
     def prepare_state(self, batch):
-        """Pad state"""
+        """Pad state. `config.ard_use_joint_torque=True`면 패딩 전에 관절 토크
+        (`ARD_JOINT_TORQUE` 배치 키)를 state 뒤에 concat한다 — 학습/추론(predict_action_chunk)
+        양쪽 다 이 메서드를 거치므로 별도 처리가 필요 없다."""
         state = batch[OBS_STATE][:, -1, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
+        if self.config.ard_use_joint_torque:
+            if ARD_JOINT_TORQUE not in batch:
+                raise ValueError(
+                    f"`ard_use_joint_torque=True`인데 배치에 `{ARD_JOINT_TORQUE}` 키가 없습니다 — "
+                    "데이터셋/환경이 관절 토크를 제공하도록 하거나 ard_use_joint_torque=False로 끄세요."
+                )
+            torque = batch[ARD_JOINT_TORQUE]
+            torque = torque[:, -1, :] if torque.ndim > 2 else torque
+            state = torch.cat([state, torque.to(dtype=state.dtype, device=state.device)], dim=-1)
         state = pad_vector(state, self.config.max_state_dim)
         return state
 

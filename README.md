@@ -82,7 +82,8 @@ What's left (`configs/`, `datasets/`, `envs/configs.py` only, `optim/`, `policie
 ## ARD: 비대칭 역할 분리 (Asymmetric Role Decomposition)
 
 SmolVLA의 액션 전문가에 Stabilizer/Actuator 전용 residual head를 추가하는 핵심 기능입니다.
-`use_ard=False`(기본)면 업스트림 SmolVLA와 완전히 동일하게 동작합니다.
+`use_ard=False`(기본)면 업스트림 SmolVLA와 완전히 동일하게 동작합니다. 타겟 로봇은
+OpenArm + 공식 그리퍼로 확정됐습니다(팔당 `ard_arm_dim` 기본값 **8** = 관절7+그리퍼1).
 
 - **핵심 구조/손실**: `AsymmetricResidualHeads`, `compute_ard_losses`(`L_pos`/`L_smooth`/
   `L_force`/`L_traj`를 `alpha`/`beta`로 결합), 고정 왼팔/오른팔 라우팅.
@@ -90,9 +91,15 @@ SmolVLA의 액션 전문가에 Stabilizer/Actuator 전용 residual head를 추�
   많이 섞인(`t`가 큰) 샘플에서 과도하게 시끄러워지는 것을 `(1-t)` 가중으로 완화하는 옵션.
 - **`ard_use_force_head`**(기본 False) — 접촉력/토크를 actuator 채널 재활용 대신 별도
   `ForceHead` MLP로 예측.
+- **`ard_gripper_dim`**(기본 1) — 각 팔의 마지막 N개 채널(그리퍼)을 smooth/traj 벌점에서
+  제외(그리퍼는 `L_pos`만 받음) — bang-bang성 신호에 매끄러움을 강제하지 않기 위함.
+- **`ard_use_joint_torque`**(기본 False) — 관절 토크 관측값을 `observation.state`에 concat
+  해서 모델 입력으로 사용(새 파라미터 없음).
 - **`ard_symmetric`**(기본 False) — 양팔에 동일한 정규화를 거는 공정 비교용 대조군 모드.
 - **GradNorm** (`--use-gradnorm`) — smooth/force/traj lambda를 그래디언트 norm 기준으로
   자동 조정.
+- **Wrist 카메라**: `config.image_features`를 그냥 순회하는 기존 메커니즘이 이름/개수에
+  무관하게 처리하므로 코드 변경 없이 추가 이미지 입력으로 들어갑니다.
 
 자세한 구조 설명, 각 옵션 사용법, 그리고 지금까지의 검증된 것/측정된 것/아직 확인되지 않은 것
 기록은 **[docs/ard.md](docs/ard.md)** 에 있습니다.
@@ -147,9 +154,11 @@ python scripts/train_ard.py \
 
 `--no-use-ard`를 주면 ARD 없이 베이스라인 SmolVLA만 학습합니다. `--ard-symmetric`을 주면
 ARD 대신 [대칭 대조군 모드](docs/ard.md#대칭-대조군-모드-ablation-ard_symmetric)로 학습합니다.
-시작할 때 액션 채널의 왼팔/오른팔 예상 순서를 출력해주니, 실제 로봇 배선과 맞는지 눈으로 한
-번 확인하세요 (ARD는 "앞 `ard_arm_dim`개=왼팔, 다음 `ard_arm_dim`개=오른팔"이라는 관례를
-가정할 뿐, 데이터셋이 실제로 그 순서인지는 검증하지 않습니다).
+`--ard-gripper-dim`(기본 1)/`--ard-use-joint-torque`로
+[그리퍼 손실 분리/관절 토크 입력](docs/ard.md#그리퍼-손실-분리-ard_gripper_dim)을 켜고 끌 수
+있습니다. 시작할 때 액션 채널의 왼팔/오른팔 예상 순서를 출력해주니, 실제 로봇 배선과 맞는지
+눈으로 한 번 확인하세요 (ARD는 "앞 `ard_arm_dim`개=왼팔, 다음 `ard_arm_dim`개=오른팔"이라는
+관례를 가정할 뿐, 데이터셋이 실제로 그 순서인지는 검증하지 않습니다).
 
 `--vlm-layer-indices`로 VLM 레이어를 "앞쪽 N개"가 아니라 특정 인덱스 조합으로 구성해서 학습할
 수도 있습니다 — `scripts/layer_importance.py`가 코사인 유사도 기준으로 골라준 레이어들을 그대로

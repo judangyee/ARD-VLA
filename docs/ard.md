@@ -8,6 +8,12 @@ ARD-VLA 연구계획서(양손 도구 조작 파인튜닝: 한 팔은 작업물�
 역할이 바뀌지 않습니다. `ard_default_actuator_arm`이 그 역할을 맡을 팔을 지정하고, 모든
 샘플에 동일하게 적용됩니다.
 
+**로봇 스펙(2026-10 확정, ARD-Gen).** 실제 타겟 로봇이 OpenArm + 공식 그리퍼로 확정되면서,
+`ard_arm_dim` 기본값이 팔당 **7관절 + 그리퍼 1 = 8 DoF**로 바뀌었습니다(이전 임시값은 7).
+`AsymmetricResidualHeads`/`compute_ard_losses` 등은 애초에 `arm_dim`을 순수 파라미터로만
+받으므로(하드코딩된 7이 어디에도 없었음) 구조 변경 없이 기본값만 바뀐 것입니다 — bimanual
+액션 벡터의 앞 8채널=왼팔, 다음 8채널=오른팔이라는 레이아웃 관례는 그대로입니다.
+
 - `third_party/lerobot/src/lerobot/policies/smolvla/ard.py` (신규 파일) — `AsymmetricResidualHeads`
   (공유 flow-matching 출력 위에서 Stabilizer/Actuator 채널을 특화시키는 zero-init residual
   MLP), `resolve_actuator_is_first`(고정된 왼팔/오른팔 라우팅), `compute_ard_losses`
@@ -233,6 +239,93 @@ python scripts/train_ard.py --dataset-repo-id <...> --ard-use-force-head
 바꿔치기한 뒤 `predict_action_chunk()`를 돌려서, 추론 경로에서 실제로 전혀 호출되지 않음을
 직접 확인했습니다. 실제 SmolVLM2 가중치/실제 force 센서 데이터로는 아직 검증하지 못했습니다
 — 이 레포의 어떤 데이터셋도 `ard_force_target`을 제공하지 않아서입니다.
+
+## 그리퍼 손실 분리 (`ard_gripper_dim`)
+
+**의견/근거.** 그리퍼는 "열림/닫힘"에 가까운 bang-bang성 신호라, 관절(joint) 채널처럼
+부드럽게 이어지는 것이 정상이 아니라 오히려 빠르게 전환되는 것이 정상적인 동작입니다. ARD의
+`L_smooth`(1차 차분)/`L_traj`(2차 차분)는 "예측 궤적이 매끄러워야 한다"는 벌점이라, 이걸
+그리퍼 채널에 그대로 걸면 "그리퍼도 천천히 움직여라"라는 잘못된 신호를 주게 됩니다 — 사용자가
+제안한 "그리퍼는 L_pos만, 관절은 기존 smooth/force/traj 유지"가 올바른 방향이라고 판단해 그
+설계를 그대로 구현했습니다.
+
+`ard_gripper_dim`(기본값 **1**)은 각 팔 `ard_arm_dim`개 채널 중 **마지막** `ard_gripper_dim`개를
+그리퍼로 간주해서, smooth_loss/traj_loss 계산 전에 제외합니다(`ard.py`의 `_exclude_gripper`).
+`L_pos`(베이스 flow-matching 회귀 손실)는 이 값과 무관하게 그리퍼 채널에도 그대로 걸립니다 —
+즉 그리퍼는 "`L_pos`만 받고 smooth/traj 추가 벌점은 받지 않는다"는 설계입니다. `0`으로 주면
+과거처럼 그리퍼도 smooth/traj에 포함됩니다(이전 세션들이 쓰던 동작과 동일).
+
+```bash
+python scripts/train_ard.py --dataset-repo-id <...> --ard-gripper-dim 1   # 기본값, 명시 예시
+python scripts/train_ard.py --dataset-repo-id <...> --ard-gripper-dim 0   # 과거 동작으로 되돌리기
+```
+
+**검증.** `tests/test_ard.py`(`test_gripper_dim_excludes_last_channel_from_smooth_traj`,
+`test_symmetric_losses_gripper_dim_excludes_last_channel`)에서: 관절 채널을 시간축으로 완전히
+상수로 두고 그리퍼 채널만 무작위로 바꾼 합성 입력에 대해, `gripper_dim=0`이면 그 변동이
+smooth/traj_loss에 그대로 반영되고 `gripper_dim=1`이면 정확히 0이 되는지 직접 확인했습니다
+(`compute_ard_losses`/`compute_symmetric_losses` 양쪽 모두). 실제 그리퍼 개폐 패턴으로 학습
+품질이 실제로 개선되는지는 실제 OpenArm 데이터로 학습해봐야 압니다.
+
+## 관절 토크 입력 (`ard_use_joint_torque`)
+
+**의견/근거.** 관절 토크를 모델에 어떻게 넣을지는 최소 두 가지 방향이 있습니다: (a) 기존
+`observation.state` 벡터에 이어붙여서(concat) 이미 있는 범용 선형 projection(`state_proj`)이
+그대로 처리하게 하거나, (b) 토크 전용 인코더/cross-attention 브랜치를 새로 만드는 것. 이번
+구현은 (a) concat 방식을 택했습니다(사용자가 제안한 방향과 동일) — 이유는:
+
+1. `state_proj`가 이미 `max_state_dim`(기본 32)까지 0으로 패딩된 입력을 범용으로 받고
+   있어서, 토크를 그 남는 패딩 공간에 추가로 싣는 것만으로 **새 학습 파라미터가 전혀
+   생기지 않습니다**(`state_proj`의 입력 폭은 항상 `max_state_dim`으로 고정이라, 내용만
+   달라질 뿐 구조는 그대로입니다). 별도 브랜치를 만들면 그만큼 파라미터/메모리가 늘고,
+   아직 실제 토크 데이터로 검증된 적 없는 신호에 그 비용을 투자할 근거가 약합니다.
+2. 데이터셋/정규화 관점에서도 추가 작업이 없습니다 — `NormalizationMode.MEAN_STD`가 이미
+   `observation.state` 전체에 채널별로 적용되므로, 토크 채널의 통계만 데이터셋이 제공하면
+   자동으로 같은 방식으로 정규화됩니다.
+3. 단점/트레이드오프: 토크는 관절 위치와 스케일/분포가 많이 다를 수 있는데, 이 방식은
+   둘을 같은 선형 projection에 동등하게 맡깁니다 — 만약 실제로 이게 부족하다고 판명되면
+   (예: 토크 신호가 묻힘), 토크 전용 작은 MLP를 먼저 통과시킨 뒤 concat하거나, 아예 별도
+   cross-attention 브랜치(Bridge Attention과 비슷한 패턴)로 승격하는 걸 다음 단계로 검토할
+   수 있습니다 — 이번 구현에는 포함하지 않았습니다(실제 토크 데이터 없이 미리 설계하는 건
+   과도하다고 판단).
+
+`ard_use_joint_torque=True`면 `SmolVLAPolicy.prepare_state()`가 배치의
+`ard.ARD_JOINT_TORQUE`(`"observation.joint_torque"`) 키를 `observation.state` **뒤에**
+concat한 뒤 `max_state_dim`까지 패딩합니다 — 학습(`forward`)과 추론
+(`predict_action_chunk`/`sample_actions`) 양쪽 다 이 메서드 하나를 거치므로, 실제 배포 시에도
+매 스텝 최신 토크 값이 그대로 입력됩니다. 키가 없으면(끄는 걸 잊었거나 데이터셋이 토크를 안
+주는 경우) 조용히 무시하지 않고 `ValueError`를 던집니다. `force_target`/`ForceHead`와는 완전히
+다른 개념입니다 — 이건 "모델이 보는 입력"이고, force_target/ForceHead는 "모델이 맞혀야 하는
+보조 출력(정답)"입니다.
+
+```bash
+python scripts/train_ard.py --dataset-repo-id <...> --ard-use-joint-torque
+```
+
+**검증.** `tests/test_ard.py::test_joint_torque_config_validation`에서 `observation.state` +
+토크 피처가 둘 다 `input_features`에 있을 때 `validate_features()`가 concat 후 차원이
+`max_state_dim`을 넘는지 미리 걸러내는지 확인했습니다. `tests/test_ard_integration.py`
+(소형 합성 SmolVLM 백본)에서: (1) 토크 값을 바꾸면 패딩 전 state 벡터의 해당 구간만 바뀌고
+원래 state 채널은 그대로인지, (2) 키가 없으면 명확한 에러가 나는지, (3) 전체
+forward+backward(학습)와 `predict_action_chunk`(추론) 경로가 끝까지 정상 동작하는지 확인했습니다.
+실제 OpenArm 토크 센서 데이터로 학습 품질이 개선되는지는 검증하지 못했습니다 — 이 레포의
+어떤 데이터셋도 아직 관절 토크를 제공하지 않습니다.
+
+## Wrist 카메라 추가 (코드 변경 불필요)
+
+SmolVLA의 이미지 입력 경로(`VLAFlowMatching.embed_prefix`/`prepare_images`)는
+`self.config.image_features`(dict)를 그냥 순회해서 처리하므로, 카메라가 몇 개든 이름이
+무엇이든 **코드 변경 없이** 그대로 들어갑니다 — `configuration_smolvla.py`의 `empty_cameras`
+주석도 원래 "left and right wrist cameras in addition to the top camera"를 언급하고
+있었습니다. 실제 학습(`scripts/train_ard.py`)은 `LeRobotDataset`의 피처를 그대로
+`input_features`로 쓰므로, 데이터셋에 `observation.images.wrist_left`/`wrist_right`같은 키만
+있으면 wrist 카메라가 추가 이미지 입력으로 자동으로 들어갑니다.
+
+실질적인 "config 확장"은 이 레포의 합성 벤치마크/비교 스크립트(`profile_memory.py`,
+`compare_smolvla_ard.py`, `scripts/verify_with_real_weights.py`)들이 쓰던 익명 카메라 이름
+(`cam0`, `cam1`, ...)을 `top`/`wrist_left`/`wrist_right`로 바꾼 것입니다 — 기능적으로는
+동일하지만, wrist 카메라가 실제로 들어간다는 걸 스크립트 출력/코드에서 바로 알 수 있게
+했습니다([프로파일링 도구 문서](profiling_tools.md) 참고).
 
 ## 대칭 대조군 모드 (ablation, `ard_symmetric`)
 

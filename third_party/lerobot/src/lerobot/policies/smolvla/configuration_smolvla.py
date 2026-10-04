@@ -22,7 +22,8 @@ from lerobot.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
 )
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
-from lerobot.utils.constants import OBS_IMAGES
+from lerobot.policies.smolvla.ard import ARD_JOINT_TORQUE
+from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 
 
 @PreTrainedConfig.register_subclass("smolvla")
@@ -121,7 +122,15 @@ class SmolVLAConfig(PreTrainedConfig):
     # 앞쪽 `ard_arm_dim`개는 왼팔, 다음 `ard_arm_dim`개는 오른팔이다. Actuator는 항상
     # `ard_default_actuator_arm`으로 고정되며(샘플별로 바뀌지 않음), 전체 설정에 동일하게 적용된다.
     use_ard: bool = False
-    ard_arm_dim: int = 7  # 팔 하나당 자유도 (예: 관절 6 + 그리퍼 1)
+    # ARD-Gen 확정 스펙(2026-10, OpenArm + 공식 그리퍼): 팔 하나당 7 관절 + 그리퍼 1 = 8 DoF.
+    ard_arm_dim: int = 8  # 팔 하나당 자유도 (관절 7 + 그리퍼 1)
+    # ard_arm_dim개 채널 중 마지막 ard_gripper_dim개를 그리퍼로 간주해서 smooth_loss/traj_loss
+    # (1차/2차 차분 벌점)에서 제외한다 — 그리퍼는 bang-bang성 신호라 빠른 개폐에 매끄러움
+    # 벌점을 거는 게 부적절하다고 판단했다(lerobot.policies.smolvla.ard._exclude_gripper 참고).
+    # L_pos(기본 flow-matching 회귀 손실)는 이 값과 무관하게 그리퍼 채널에도 그대로 걸린다 —
+    # 즉 그리퍼는 "L_pos만 받고 smooth/traj 추가 벌점은 받지 않는다". 0이면 과거와 완전히
+    # 동일하게 그리퍼도 smooth/traj에 포함된다.
+    ard_gripper_dim: int = 1
     ard_default_actuator_arm: str = "right"  # "left" 또는 "right"; 이 팔이 항상 Actuator 역할
     ard_alpha: float = 0.3  # Stabilizer 손실 가중치
     ard_beta: float = 0.7  # Actuator 손실 가중치
@@ -143,6 +152,16 @@ class SmolVLAConfig(PreTrainedConfig):
     # 있으면(즉 힘을 예측할 방법이 없으면) 과거처럼 엉뚱한 채널을 쓰는 대신 경고 후 0으로
     # 처리한다(ard.py의 compute_ard_losses 참고).
     ard_use_force_head: bool = False
+
+    # 관절 토크 관측값을 모델 입력으로 쓸지 여부. 켜면 배치의 `ard.ARD_JOINT_TORQUE`
+    # ("observation.joint_torque") 키를 `observation.state`(그 "뒤에" concat, 기존 상태 채널은
+    # 그대로 둠)에 이어붙여서 `state_proj`에 넘긴다(SmolVLAPolicy.prepare_state 참고) — 별도
+    # 인코더/브랜치를 새로 만들지 않고, 이미 범용 선형 projection으로 처리되는 state 벡터의
+    # 남는 패딩 공간(max_state_dim)에 토크 채널을 추가로 싣는 방식이다. 그래서 새 학습
+    # 파라미터가 전혀 생기지 않는다(state_proj의 입력 폭은 항상 max_state_dim으로 고정돼 있어
+    # 이미 패딩되던 자리가 토크로 채워질 뿐이다). 기본값 False면 기존과 완전히 동일하다 — 켜져
+    # 있는데 배치에 해당 키가 없으면 에러를 낸다(조용히 무시하지 않음).
+    ard_use_joint_torque: bool = False
 
     # --- 대칭 대조군(symmetric ablation) 모드 — ARD의 "팔마다 다른 정규화" 가정 자체가 실제로
     # 도움이 되는지 공정하게 비교하기 위한 ablation용 코드. 켜면 head 구조/파라미터 수는 ARD와
@@ -237,6 +256,11 @@ class SmolVLAConfig(PreTrainedConfig):
                     f"`ard_reg_time_weighting`은 'none' 또는 'one_minus_t'여야 합니다. "
                     f"현재 값: {self.ard_reg_time_weighting!r}"
                 )
+            if not (0 <= self.ard_gripper_dim < self.ard_arm_dim):
+                raise ValueError(
+                    f"`ard_gripper_dim`은 0 이상 `ard_arm_dim`({self.ard_arm_dim}) 미만이어야 "
+                    f"합니다(최소 1개의 관절 채널은 남아야 함). 현재 값: {self.ard_gripper_dim}"
+                )
         if self.use_gradnorm and not self.use_ard:
             raise ValueError("`use_gradnorm`은 `use_ard=True`일 때만 의미가 있습니다.")
         if self.ard_use_force_head and not self.use_ard:
@@ -296,6 +320,24 @@ class SmolVLAConfig(PreTrainedConfig):
                     f"`2 * ard_arm_dim`({2 * self.ard_arm_dim}) 이상이어야, 선두 채널이 왼팔/오른팔 "
                     "블록으로 균등하게 나뉩니다."
                 )
+
+        if self.ard_use_joint_torque:
+            # 데이터셋이 observation.state와 관절 토크를 별도 feature로 제공하는 경우에만 미리
+            # 검증할 수 있다(둘 다 input_features에 등록돼 있을 때) — 토크 차원 자체는 데이터셋
+            # 스펙이라 config 단계에서는 알 수 없으므로, 둘 다 있을 때만 "concat 후
+            # max_state_dim을 넘지 않는지"를 확인한다. 배치에 키가 없는 경우는 런타임에
+            # (SmolVLAPolicy.prepare_state) 걸린다.
+            state_feat = self.input_features.get(OBS_STATE)
+            torque_feat = self.input_features.get(ARD_JOINT_TORQUE)
+            if state_feat is not None and torque_feat is not None:
+                combined_dim = state_feat.shape[0] + torque_feat.shape[0]
+                if combined_dim > self.max_state_dim:
+                    raise ValueError(
+                        f"`ard_use_joint_torque=True`로 관절 토크를 state에 concat하면 실제 "
+                        f"차원이 {combined_dim}(state {state_feat.shape[0]} + torque "
+                        f"{torque_feat.shape[0]})이 되는데, `max_state_dim`이 {self.max_state_dim}"
+                        "밖에 되지 않습니다."
+                    )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(

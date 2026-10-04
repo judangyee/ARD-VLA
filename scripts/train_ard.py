@@ -106,7 +106,20 @@ def parse_args() -> argparse.Namespace:
 
     ard_group = parser.add_argument_group("ARD")
     ard_group.add_argument("--use-ard", action=argparse.BooleanOptionalAction, default=True)
-    ard_group.add_argument("--ard-arm-dim", type=int, default=7, help="팔 하나당 자유도 (기본 6관절+그리퍼1)")
+    ard_group.add_argument(
+        "--ard-arm-dim", type=int, default=8, help="팔 하나당 자유도 (ARD-Gen 확정 스펙: 관절7+그리퍼1=8, OpenArm+공식 그리퍼)"
+    )
+    ard_group.add_argument(
+        "--ard-gripper-dim",
+        type=int,
+        default=1,
+        help=(
+            "ard_arm_dim개 채널 중 마지막 N개를 그리퍼로 간주해서 smooth_loss/traj_loss(1차/2차 "
+            "차분 벌점)에서 제외한다 — 그리퍼는 bang-bang성 신호라 빠른 개폐에 매끄러움 벌점을 "
+            "거는 게 부적절하다고 판단했다. L_pos는 영향 없음(그리퍼도 그대로 받음). 0이면 "
+            "과거처럼 그리퍼도 smooth/traj에 포함된다."
+        ),
+    )
     ard_group.add_argument("--ard-actuator-arm", default="right", choices=["left", "right"])
     ard_group.add_argument("--ard-alpha", type=float, default=0.3, help="Stabilizer 손실 가중치")
     ard_group.add_argument("--ard-beta", type=float, default=0.7, help="Actuator 손실 가중치")
@@ -152,6 +165,17 @@ def parse_args() -> argparse.Namespace:
             "alpha/beta는 항상 0.5/0.5로 강제된다(--ard-alpha/--ard-beta를 직접 줘도 무시되고 "
             "경고와 함께 덮어씀). head 구조/파라미터 수는 --use-ard와 동일하다 — 손실 결합 "
             "방식만 바뀐다(비교 실험용 플래그, 기본은 꺼져 있어 기존과 동일하게 동작)."
+        ),
+    )
+    ard_group.add_argument(
+        "--ard-use-joint-torque",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "관절 토크 관측값을 모델 입력으로 쓴다 — 배치의 'observation.joint_torque' 키를 "
+            "observation.state 뒤에 concat해서 state_proj에 넘긴다(별도 인코더/파라미터 없음, "
+            "SmolVLAPolicy.prepare_state 참고). 데이터셋이 이 키를 제공해야 한다. 기본 False면 "
+            "기존과 완전히 동일하다."
         ),
     )
 
@@ -259,6 +283,8 @@ def main() -> None:
         vlm_layer_indices=args.vlm_layer_indices,
         use_ard=args.use_ard,
         ard_arm_dim=args.ard_arm_dim,
+        ard_gripper_dim=args.ard_gripper_dim,
+        ard_use_joint_torque=args.ard_use_joint_torque,
         ard_default_actuator_arm=args.ard_actuator_arm,
         ard_alpha=args.ard_alpha,
         ard_beta=args.ard_beta,
@@ -278,8 +304,10 @@ def main() -> None:
     )
     device = torch.device(config.device)
     logging.info(
-        "device=%s use_ard=%s ard_symmetric=%s use_bridge_attention=%s use_freq_policy=%s",
-        device, config.use_ard, config.ard_symmetric, config.use_bridge_attention, config.use_freq_policy,
+        "device=%s use_ard=%s ard_arm_dim=%s ard_gripper_dim=%s ard_use_joint_torque=%s "
+        "ard_symmetric=%s use_bridge_attention=%s use_freq_policy=%s",
+        device, config.use_ard, config.ard_arm_dim, config.ard_gripper_dim, config.ard_use_joint_torque,
+        config.ard_symmetric, config.use_bridge_attention, config.use_freq_policy,
     )
 
     # SmolVLA는 flow-matching으로 chunk_size 길이의 액션 시퀀스 전체를 한 번에 예측한다

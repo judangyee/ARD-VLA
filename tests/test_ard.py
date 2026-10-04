@@ -44,6 +44,27 @@ def test_config_validation():
     check("SmolVLAConfig(use_ard=True)가 정상 dims로 생성된다", cfg.use_ard is True)
     check("ard_default_actuator_arm 기본값은 'right'다", cfg.ard_default_actuator_arm == "right")
 
+    # ARD-Gen 확정 스펙(OpenArm + 공식 그리퍼, 2026-10): 팔당 7관절 + 그리퍼1 = 8DoF.
+    default_cfg = SmolVLAConfig(use_ard=True)
+    check("ard_arm_dim 기본값은 8이다 (관절7+그리퍼1, OpenArm 확정 스펙)", default_cfg.ard_arm_dim == 8)
+    check("ard_gripper_dim 기본값은 1이다 (마지막 1채널을 그리퍼로 간주)", default_cfg.ard_gripper_dim == 1)
+    check("ard_use_joint_torque 기본값은 False다", default_cfg.ard_use_joint_torque is False)
+
+    try:
+        SmolVLAConfig(use_ard=True, ard_arm_dim=8, ard_gripper_dim=8)
+        check("ard_gripper_dim이 ard_arm_dim과 같으면(관절이 하나도 안 남음) 거부한다", False)
+    except ValueError:
+        check("ard_gripper_dim이 ard_arm_dim과 같으면(관절이 하나도 안 남음) 거부한다", True)
+
+    try:
+        SmolVLAConfig(use_ard=True, ard_arm_dim=8, ard_gripper_dim=-1)
+        check("음수 ard_gripper_dim을 거부한다", False)
+    except ValueError:
+        check("음수 ard_gripper_dim을 거부한다", True)
+
+    cfg_no_gripper_split = SmolVLAConfig(use_ard=True, ard_arm_dim=8, ard_gripper_dim=0)
+    check("ard_gripper_dim=0은 허용된다(과거처럼 그리퍼도 smooth/traj에 포함)", cfg_no_gripper_split.ard_gripper_dim == 0)
+
     try:
         SmolVLAConfig(use_ard=True, ard_arm_dim=20, max_action_dim=32)
         check("max_action_dim보다 큰 ard_arm_dim을 거부한다", False)
@@ -91,6 +112,43 @@ def test_config_validation():
         "ard_symmetric=True면 사용자가 다른 alpha/beta를 줘도 0.5/0.5로 강제된다(경고와 함께)",
         cfg_symmetric_explicit.ard_alpha == 0.5 and cfg_symmetric_explicit.ard_beta == 0.5,
     )
+
+
+def test_joint_torque_config_validation():
+    """ard_use_joint_torque=True일 때, state(observation.state)와 ARD_JOINT_TORQUE 피처가
+    둘 다 input_features에 있으면 validate_features()가 concat 후 차원이 max_state_dim을
+    넘는지 미리 검증해야 한다(SmolVLAPolicy.prepare_state가 실제로 concat하기 전에, config
+    단계에서 걸러낸다)."""
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.policies.smolvla.ard import ARD_JOINT_TORQUE
+    from lerobot.utils.constants import OBS_STATE
+
+    check("ard_use_joint_torque 기본값은 False다", SmolVLAConfig().ard_use_joint_torque is False)
+
+    too_small = SmolVLAConfig(
+        ard_use_joint_torque=True,
+        max_state_dim=32,
+        input_features={
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(16,)),
+            ARD_JOINT_TORQUE: PolicyFeature(type=FeatureType.STATE, shape=(20,)),
+        },
+    )
+    try:
+        too_small.validate_features()
+        check("state(16)+torque(20) > max_state_dim(32)이면 validate_features가 거부한다", False)
+    except ValueError:
+        check("state(16)+torque(20) > max_state_dim(32)이면 validate_features가 거부한다", True)
+
+    big_enough = SmolVLAConfig(
+        ard_use_joint_torque=True,
+        max_state_dim=36,
+        input_features={
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(16,)),
+            ARD_JOINT_TORQUE: PolicyFeature(type=FeatureType.STATE, shape=(20,)),
+        },
+    )
+    big_enough.validate_features()  # 예외가 안 나야 한다
+    check("state(16)+torque(20) <= max_state_dim(36)이면 validate_features가 통과한다", True)
 
 
 def test_resolve_actuator_is_first_is_fixed():
@@ -371,6 +429,49 @@ def test_compute_ard_losses():
     )
 
 
+def test_gripper_dim_excludes_last_channel_from_smooth_traj():
+    """ard_gripper_dim>0이면 각 팔 블록의 마지막 gripper_dim개 채널(그리퍼)이 smooth_loss/
+    traj_loss(1차/2차 차분)에서 제외돼야 한다 — 그리퍼는 bang-bang성 신호라 매끄러움 벌점이
+    부적절하다는 설계(configuration_smolvla.py의 ard_gripper_dim 주석, ard.py의
+    _exclude_gripper 참고). L_pos는 이 테스트에서 0으로 둬서(per_element_loss=zeros) 영향을
+    분리한다."""
+    torch.manual_seed(0)
+    batch, chunk, arm_dim = 3, 6, 8
+    actuator_is_first = resolve_actuator_is_first("right", batch_size=batch, device="cpu")
+    per_element_loss = torch.zeros(batch, chunk, 2 * arm_dim)
+
+    # 관절(앞 arm_dim-1채널)은 시간축으로 완전히 상수 -> smooth/traj 기여가 0이어야 한다.
+    # 그리퍼(마지막 1채널)만 매 스텝 무작위로 바뀌게 해서, 제외되지 않으면 손실이 0보다 커야 한다.
+    joints = torch.zeros(batch, 1, arm_dim - 1).expand(batch, chunk, arm_dim - 1)
+    gripper = torch.randn(batch, chunk, 1)
+    stabilizer_traj_pred = torch.cat([joints, gripper], dim=-1)
+    actuator_traj_pred = torch.cat([joints, gripper], dim=-1)
+
+    common = dict(
+        per_element_loss=per_element_loss,
+        stabilizer_traj_pred=stabilizer_traj_pred,
+        actuator_traj_pred=actuator_traj_pred,
+        actuator_is_first=actuator_is_first,
+        arm_dim=arm_dim,
+        alpha=0.3,
+        beta=0.7,
+        lambda_smooth=1.0,
+        lambda_force=1.0,
+        lambda_traj=1.0,
+    )
+    out_included = compute_ard_losses(gripper_dim=0, **common)
+    check(
+        "gripper_dim=0(기본값, 과거 동작과 동일)이면 그리퍼 채널의 변동이 smooth/traj_loss에 그대로 반영된다",
+        out_included.smooth_loss.item() > 0.0 and out_included.traj_loss.item() > 0.0,
+    )
+
+    out_excluded = compute_ard_losses(gripper_dim=1, **common)
+    check(
+        "gripper_dim=1이면 그리퍼 채널이 제외되어 상수 관절만 남고 smooth/traj_loss가 정확히 0이다",
+        out_excluded.smooth_loss.item() == 0.0 and out_excluded.traj_loss.item() == 0.0,
+    )
+
+
 def test_compute_symmetric_losses():
     """ard_symmetric=True가 쓰는 compute_symmetric_losses: 양팔 손실 형태가 동일한지(같은
     stabilizer_traj_pred/actuator_traj_pred를 서로 바꿔 넣어도 stab_loss/act_loss가 바뀐
@@ -480,6 +581,40 @@ def test_compute_symmetric_losses():
     check(
         "대칭 모드: force_pred가 있으면 force_loss가 0이 아니게 된다 (actuator 쪽에만, ARD 모드와 동일한 force 처리)",
         out_force_with_head.force_loss.item() > 0.0,
+    )
+
+
+def test_symmetric_losses_gripper_dim_excludes_last_channel():
+    """compute_ard_losses와 동일한 gripper_dim 동작을 compute_symmetric_losses도 양팔 모두에
+    동일하게 적용해야 한다(대칭 모드답게 — stabilizer/actuator 어느 쪽만 제외하지 않음)."""
+    torch.manual_seed(0)
+    batch, chunk, arm_dim = 3, 6, 8
+    actuator_is_first = resolve_actuator_is_first("right", batch_size=batch, device="cpu")
+    per_element_loss = torch.zeros(batch, chunk, 2 * arm_dim)
+    joints = torch.zeros(batch, 1, arm_dim - 1).expand(batch, chunk, arm_dim - 1)
+    gripper = torch.randn(batch, chunk, 1)
+    traj_pred = torch.cat([joints, gripper], dim=-1)
+
+    common = dict(
+        per_element_loss=per_element_loss,
+        stabilizer_traj_pred=traj_pred,
+        actuator_traj_pred=traj_pred,
+        actuator_is_first=actuator_is_first,
+        arm_dim=arm_dim,
+        lambda_smooth=1.0,
+        lambda_force=1.0,
+        lambda_traj=1.0,
+    )
+    out_included = compute_symmetric_losses(gripper_dim=0, **common)
+    check(
+        "대칭 모드 gripper_dim=0(기본): 그리퍼 채널 변동이 smooth/traj_loss에 그대로 반영된다",
+        out_included.smooth_loss.item() > 0.0 and out_included.traj_loss.item() > 0.0,
+    )
+
+    out_excluded = compute_symmetric_losses(gripper_dim=1, **common)
+    check(
+        "대칭 모드 gripper_dim=1: 양팔 모두 그리퍼 채널이 제외되어 smooth/traj_loss가 정확히 0이다",
+        out_excluded.smooth_loss.item() == 0.0 and out_excluded.traj_loss.item() == 0.0,
     )
 
 

@@ -48,7 +48,8 @@ KV 캐시 사용)에는 영향이 없습니다.
 ## 메모리 프로파일링 (`scripts/profile_memory.py`)
 
 LoRA + bf16 autocast + gradient checkpointing을 모두 켠 상태에서, bimanual 액션
-(14 DoF, `chunk_size=50`) 더미 배치로 forward+backward를 한 번 돌려 배치 사이즈별
+(16 DoF = 팔당 8 DoF, OpenArm+그리퍼 확정 스펙, `chunk_size=50`) 더미 배치로 forward+backward를
+한 번 돌려 배치 사이즈별
 (`1, 2, 4, 8, 16, 32` 기본값) `torch.cuda.max_memory_allocated()` 최대 메모리를 표로 출력하는
 스크립트입니다. Colab/Kaggle 노트북에서 GPU 런타임으로 바로 돌릴 수 있게 단일 파일로
 작성했습니다:
@@ -104,9 +105,9 @@ expert도 VLM 레이어 수를 따라가며 같이 커지므로 메모리를 훨
 `profile_memory.py`와 같은 패턴(LoRA + bf16 + gradient checkpointing 기본 켜짐)으로, 이번엔
 "레이어 프루닝 O/X"가 아니라 **모델별**로 같은 배치 사이즈(`1, 4, 16, 32` 기본값)로 비교합니다:
 
-- **base**: 단일팔 7 DoF, `use_ard=False` — 원본 액션 헤드만 사용
-- **ard**: bimanual 14 DoF, `use_ard=True` — `AsymmetricResidualHeads` 적용(비대칭)
-- **symmetric**: bimanual 14 DoF, `use_ard=True, ard_symmetric=True` — 대칭 대조군
+- **base**: 단일팔 8 DoF, `use_ard=False` — 원본 액션 헤드만 사용
+- **ard**: bimanual 16 DoF, `use_ard=True` — `AsymmetricResidualHeads` 적용(비대칭)
+- **symmetric**: bimanual 16 DoF, `use_ard=True, ard_symmetric=True` — 대칭 대조군
   (자세한 건 [ARD 문서의 "대칭 대조군 모드"](ard.md#대칭-대조군-모드-ablation-ard_symmetric) 참고)
 
 ```bash

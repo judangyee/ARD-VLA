@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""기본 SmolVLA(단일팔 7 DoF, 원본 액션 헤드) vs ARD-VLA(bimanual 14 DoF,
+"""기본 SmolVLA(단일팔 8 DoF, 원본 액션 헤드) vs ARD-VLA(bimanual 16 DoF,
 AsymmetricResidualHeads, 비대칭 손실) vs 대칭 대조군(동일 head 구조, 대칭 손실)을 같은
 배치 사이즈로 나란히 비교 프로파일링한다. `--variants`로 세 변형 중 원하는 조합만 고를 수
 있다(기본 'base,ard'는 이 3변형 지원이 추가되기 전과 동일하게 동작한다).
+
+팔 하나당 자유도는 ARD-Gen 확정 스펙(OpenArm + 공식 그리퍼: 관절7 + 그리퍼1 = 8)을 따른다.
 
 `scripts/profile_memory.py`를 참고해서 만들었다 — LoRA + bf16 autocast + gradient
 checkpointing이 기본으로 켜져있는 것도 동일하다. 차이는 "레이어 프루닝 O/X"가 아니라
@@ -14,7 +16,7 @@ checkpointing이 기본으로 켜져있는 것도 동일하다. 차이는 "레�
     (실제 학습 스텝의 메모리 최고점은 backward에서 나오는 게 보통이라 메모리는 계속
     forward+backward 기준으로 재고, 시간만 forward 단독으로 잰다)
 
-base는 액션/상태 차원 자체가 다르고(단일팔 7 DoF), ard/symmetric은 같은 bimanual 14 DoF +
+base는 액션/상태 차원 자체가 다르고(단일팔 8 DoF), ard/symmetric은 같은 bimanual 16 DoF +
 AsymmetricResidualHeads 구조를 쓰지만 손실 결합 방식(alpha/beta, smooth/traj를 어느 팔에
 거는지)만 다르다 — 그래서 ard와 symmetric은 파라미터 수가 정확히 같다(공정 비교 목적).
 정책을 공유할 수 없어 변형마다 새로 빌드하고, 끝나면 GPU 메모리를 비우고 다음 변형으로
@@ -50,18 +52,18 @@ from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LAN
 
 VARIANTS = {
     "base": {
-        "label": "기본 SmolVLA (단일팔 7 DoF, 원본 액션 헤드)",
+        "label": "기본 SmolVLA (단일팔 8 DoF, 원본 액션 헤드)",
         "short_label": "기본 SmolVLA",
-        "state_dim": 7,
-        "action_dim": 7,
+        "state_dim": 8,
+        "action_dim": 8,
         "use_ard": False,
         "ard_symmetric": False,
     },
     "ard": {
-        "label": "ARD-VLA (bimanual 14 DoF, AsymmetricResidualHeads, 비대칭 손실)",
+        "label": "ARD-VLA (bimanual 16 DoF, AsymmetricResidualHeads, 비대칭 손실)",
         "short_label": "ARD-VLA",
-        "state_dim": 14,
-        "action_dim": 14,
+        "state_dim": 16,
+        "action_dim": 16,
         "use_ard": True,
         "ard_symmetric": False,
     },
@@ -69,10 +71,10 @@ VARIANTS = {
         # 대칭 대조군(ablation) — ARD와 똑같은 head 구조/파라미터 수(AsymmetricResidualHeads를
         # 그대로 재사용)를 쓰되, 손실 결합 방식만 compute_symmetric_losses로 바꾼 것. "ARD의
         # 비대칭 정규화 자체가 도움이 되는가"를 공정하게 비교하기 위한 세 번째 변형이다.
-        "label": "대칭 대조군 (bimanual 14 DoF, AsymmetricResidualHeads, 대칭 손실)",
+        "label": "대칭 대조군 (bimanual 16 DoF, AsymmetricResidualHeads, 대칭 손실)",
         "short_label": "Symmetric",
-        "state_dim": 14,
-        "action_dim": 14,
+        "state_dim": 16,
+        "action_dim": 16,
         "use_ard": True,
         "ard_symmetric": True,
     },
@@ -84,9 +86,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 16, 32])
     parser.add_argument("--chunk-size", type=int, default=50, help="action chunk length (horizon)")
     parser.add_argument(
-        "--ard-arm-dim", type=int, default=7, help="ARD-VLA 변형에서 팔 하나당 자유도 (2*ard_arm_dim=action_dim)"
+        "--ard-arm-dim",
+        type=int,
+        default=8,
+        help="ARD-VLA 변형에서 팔 하나당 자유도 (2*ard_arm_dim=action_dim, OpenArm+그리퍼 확정 스펙: 관절7+그리퍼1)",
     )
-    parser.add_argument("--cameras", type=int, default=3, help="top + 좌손목 + 우손목")
+    parser.add_argument("--cameras", type=int, default=3, help="top + 좌손목(wrist_left) + 우손목(wrist_right)")
     parser.add_argument("--image-size", type=int, default=128, help="더미 이미지 한 변 길이 (resize_imgs_with_padding이 어차피 재조정함)")
     parser.add_argument("--lang-seq-len", type=int, default=48, help="config.tokenizer_max_length 기본값과 동일")
     parser.add_argument("--vlm-model-name", default="HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
@@ -115,8 +120,12 @@ def build_policy_for_variant(args, variant_key: str) -> SmolVLAPolicy:
     input_features = {
         "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(variant["state_dim"],)),
     }
+    # top + 좌/우 손목(wrist) 카메라 이름으로 명시한다 — SmolVLA는 image_features(dict)를 그냥
+    # 순회해서 처리하므로 이름/개수에 코드 변경이 필요 없다(scripts/profile_memory.py와 동일 패턴).
+    camera_names = ["top", "wrist_left", "wrist_right"]
     for i in range(args.cameras):
-        input_features[f"observation.images.cam{i}"] = PolicyFeature(
+        name = camera_names[i] if i < len(camera_names) else f"cam{i}"
+        input_features[f"observation.images.{name}"] = PolicyFeature(
             type=FeatureType.VISUAL, shape=(3, args.image_size, args.image_size)
         )
     output_features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(variant["action_dim"],))}

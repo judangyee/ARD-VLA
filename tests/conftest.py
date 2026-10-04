@@ -88,7 +88,7 @@ def build_tiny_policy(tiny_smolvlm_monkeypatch):
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
     from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
 
-    def _build(arm_dim: int = 7, num_vlm_layers: int = 2, chunk_size: int = 8, **config_overrides):
+    def _build(arm_dim: int = 8, num_vlm_layers: int = 2, chunk_size: int = 8, **config_overrides):
         input_features = {
             OBS_IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)),
             OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(2 * arm_dim,)),
@@ -118,7 +118,7 @@ def build_tiny_batch():
     """합성 배치를 만드는 팩토리 함수를 반환한다."""
     from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 
-    def _build(batch_size: int = 2, arm_dim: int = 7, chunk: int = 8, lang_len: int = 6) -> dict:
+    def _build(batch_size: int = 2, arm_dim: int = 8, chunk: int = 8, lang_len: int = 6) -> dict:
         return {
             OBS_IMAGE: torch.rand(batch_size, 3, 64, 64),
             OBS_STATE: torch.randn(batch_size, 2 * arm_dim),

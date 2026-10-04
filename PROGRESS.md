@@ -119,8 +119,89 @@ Layout 섹션을 `tests/`/`docs/`/`.github/workflows/`/`pytest.ini`/`PROGRESS.md
 `pytest`(35개 전부 통과), `python scripts/check_env.py` 재확인(문서/README만 바꾼
 변경이라 코드 동작에 영향 없음을 재확인하는 목적).
 
-## 다음에 할 일
+## 다음에 할 일 (5단계 기준)
 
 없음 — 5단계까지 전부 완료. 사용자가 요청한 5단계 작업(코드 수정 + 단위 테스트 + 문서)은
 전부 끝났고, 실제 GPU/Hub 환경에서의 실험(probe/학습/메모리 측정)은 이번 작업 범위 밖이라
 그대로 남겨뒀다 — 각 docs/*.md의 "측정됨"/"아직 확인되지 않은 것" 절 참고.
+
+---
+
+# OpenArm 8DoF 확정 반영 (2026-10, 후속 작업)
+
+로봇이 OpenArm + 공식 그리퍼로 확정되어 액션 차원이 팔당 7→8DoF(관절7+그리퍼1)로 바뀌었다.
+요청 범위: (1) arm_dim 7→8, (2) 그리퍼 손실 분리 검토+구현, (3) joint_torque 입력 경로,
+(4) wrist 카메라 config 확장, (5) 테스트/스크립트를 새 차원으로 갱신. GPU 실측은 미검증.
+
+## 단계 목록
+
+- [x] 1. `ard_arm_dim` 기본값 7→8 + 모든 스크립트(`train_ard.py`/`profile_memory.py`/
+      `count_params.py`/`compare_smolvla_ard.py`/`compare_bridge_attention.py`/
+      `verify_with_real_weights.py`) CLI 기본값/라벨 갱신.
+- [x] 2. 그리퍼 손실 분리 — `ard_gripper_dim`(기본 1) 추가, `ard.py`에 `_exclude_gripper`.
+- [x] 3. joint_torque 입력 — `ARD_JOINT_TORQUE` 배치 키 + `ard_use_joint_torque` config,
+      `SmolVLAPolicy.prepare_state()`에서 concat.
+- [x] 4. wrist 카메라 — 기존 `image_features` 메커니즘이 이미 범용이라 코드 변경 불필요임을
+      확인, 합성 스크립트들의 카메라 이름을 `top`/`wrist_left`/`wrist_right`로 명시.
+- [x] 5. 테스트 갱신 + `docs/ard.md` 문서화 + Ponytail 스킬(별도 요청, 별도 커밋)까지 pytest
+      통과 확인.
+
+## 현재 상태
+
+**의견 먼저(사용자가 요청한 부분) — 둘 다 사용자가 제안한 방향을 그대로 채택했다:**
+- 그리퍼: 그리퍼는 bang-bang성 신호라 smooth/traj(매끄러움 벌점)를 걸면 정상적인 빠른
+  개폐를 방해한다 — `L_pos`만 받고 smooth/traj는 제외하는 게 맞다고 판단. `ard_gripper_dim`
+  기본값을 1로 둬서(과거의 "모든 새 기능 기본 off" 관례와 달리) 새 하드웨어 스펙에 맞는
+  올바른 동작이 기본이 되게 했다 — `0`으로 주면 과거 동작으로 되돌릴 수 있다.
+- joint_torque: 별도 인코더 브랜치 대신 `observation.state`에 concat하는 방식을 채택 — 이미
+  범용 패딩(`max_state_dim`)을 쓰는 `state_proj`가 그대로 처리해서 새 파라미터가 전혀
+  생기지 않고, 정규화(MEAN_STD)도 추가 작업 없이 자동 적용된다. 트레이드오프(토크가 묻힐
+  수 있음)와 대안(별도 브랜치로 승격)은 docs/ard.md에 명시. 기본값은 False(끄면 완전히
+  기존과 동일) — 이건 학습 파이프라인에 새 데이터 키가 필요한 기능이라 관례대로 opt-in.
+
+**1단계**: `ard_arm_dim`은 애초에 모든 코드에서 순수 파라미터로만 쓰여서(하드코딩 없음)
+기본값만 7→8로 바꾸면 됐다. `AsymmetricResidualHeads`/`compute_ard_losses` 등 구조 변경 없음.
+각 스크립트의 `--action-dim`/`--state-dim`/`--ard-arm-dim` 기본값과 `compare_smolvla_ard.py`의
+`VARIANTS` 딕셔너리(base: 7→8, ard/symmetric: 14→16)도 갱신.
+
+**2단계**: `ard.py`에 `_exclude_gripper(traj_pred, gripper_dim)` 헬퍼 추가 — `gripper_dim<=0`이면
+그대로 반환(과거와 bit-for-bit 동일), 아니면 마지막 `gripper_dim`개 채널을 잘라낸다.
+`compute_ard_losses`/`compute_symmetric_losses`에 `gripper_dim: int = 0` 파라미터 추가(기본값은
+0 — 함수 자체의 하위호환). `configuration_smolvla.py`의 `ard_gripper_dim`(기본 1) + 검증
+(`0 <= ard_gripper_dim < ard_arm_dim`). `modeling_smolvla.py`의 `common_ard_kwargs`에
+`gripper_dim=self.config.ard_gripper_dim` 연결.
+
+**3단계**: `ard.py`에 `ARD_JOINT_TORQUE = "observation.joint_torque"` 상수 추가.
+`configuration_smolvla.py`에 `ard_use_joint_torque`(기본 False) + `validate_features()`에서
+state+torque 합산 차원이 `max_state_dim`을 넘는지 사전 검증. `modeling_smolvla.py`의
+`SmolVLAPolicy.prepare_state()`에서 concat(키가 없으면 `ValueError`, 조용히 무시하지 않음) —
+학습(`forward`)과 추론(`predict_action_chunk`) 양쪽 다 이 메서드를 거치므로 자동으로 적용됨.
+
+**4단계**: SmolVLA의 이미지 입력(`embed_prefix`/`prepare_images`)이 `config.image_features`
+dict를 그냥 순회해서 카메라 이름/개수에 코드 변경이 필요 없음을 확인(실제 학습은
+`LeRobotDataset`의 피처를 그대로 씀). `profile_memory.py`/`compare_smolvla_ard.py`/
+`verify_with_real_weights.py`의 합성 카메라 이름을 `cam{i}` → `top`/`wrist_left`/
+`wrist_right`로 바꿔서 이 사실을 명시적으로 드러냄.
+
+**5단계**: `tests/conftest.py`의 `build_tiny_policy`/`build_tiny_batch` 기본 `arm_dim`을
+7→8로 갱신. `tests/test_ard_integration.py`의 bit-exact 회귀 테스트
+(`test_all_new_flags_off_matches_pre_change_baseline`)는 `ard_gripper_dim=0`을 명시적으로
+넘겨서 ae09269 비교 취지를 그대로 유지(값은 그대로 유효). 신규 테스트: 그리퍼 제외
+동작(`test_gripper_dim_excludes_last_channel_from_smooth_traj`,
+`test_symmetric_losses_gripper_dim_excludes_last_channel`), joint_torque concat/에러/전체
+forward 경로(`test_joint_torque_*`, 3개), config validation(`test_joint_torque_config_validation`,
+`test_config_validation`에 신규 assert 추가). `docs/ard.md`에 "그리퍼 손실 분리"/"관절 토크
+입력"/"Wrist 카메라 추가" 세 섹션 신설, README 요약 갱신.
+
+사용자가 중간에 별도 요청한 Ponytail 스킬 설치(DietrichGebert/ponytail, MIT)는
+`.claude/skills/`+`CLAUDE.md`로 완전히 분리된 커밋(`039726d`)으로 처리했다 — 이 작업의
+변경사항과 섞이지 않음.
+
+`pytest`(41개 전부 통과), `python scripts/check_env.py`, 모든 수정된 스크립트의 `--help`
+정상 동작 확인. GPU/Hub 실측(실제 학습, 메모리 프로파일)은 요청대로 범위 밖 — 미검증으로
+남김.
+
+## 다음에 할 일
+
+없음 — 요청한 5개 항목 전부 완료, 커밋 예정(기능별로 분리: arm_dim/gripper/joint_torque+camera
+문서/테스트). 실제 GPU/OpenArm 하드웨어로의 검증은 범위 밖으로 남겨뒀다.

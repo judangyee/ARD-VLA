@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-alpha", type=int, default=16)
 
     ard_group = parser.add_argument_group("ARD")
-    ard_group.add_argument("--ard-arm-dim", type=int, default=7)
+    ard_group.add_argument("--ard-arm-dim", type=int, default=8, help="OpenArm+그리퍼 확정 스펙: 관절7+그리퍼1")
     ard_group.add_argument("--ard-actuator-arm", default="right", choices=["left", "right"])
     ard_group.add_argument("--ard-alpha", type=float, default=0.3)
     ard_group.add_argument("--ard-beta", type=float, default=0.7)

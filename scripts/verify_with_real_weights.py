@@ -228,8 +228,10 @@ def task_gradnorm(args, device, real_image_01, lang_tokens, lang_mask) -> None:
     input_features = {
         "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(args.state_dim,)),
     }
+    camera_names = ["top", "wrist_left", "wrist_right"]
     for i in range(args.cameras):
-        input_features[f"observation.images.cam{i}"] = PolicyFeature(
+        name = camera_names[i] if i < len(camera_names) else f"cam{i}"
+        input_features[f"observation.images.{name}"] = PolicyFeature(
             type=FeatureType.VISUAL, shape=(3, args.image_height, args.image_width)
         )
     output_features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(args.action_dim,))}
@@ -473,9 +475,9 @@ def parse_args() -> argparse.Namespace:
     gn_group.add_argument("--gradnorm-batch-size", type=int, default=4)
     gn_group.add_argument("--gradnorm-alpha", type=float, default=1.5)
     gn_group.add_argument("--gradnorm-lr", type=float, default=0.025)
-    gn_group.add_argument("--ard-arm-dim", type=int, default=7)
-    gn_group.add_argument("--action-dim", type=int, default=14, help="bimanual: 7 left + 7 right")
-    gn_group.add_argument("--state-dim", type=int, default=14)
+    gn_group.add_argument("--ard-arm-dim", type=int, default=8, help="OpenArm+그리퍼 확정 스펙: 관절7+그리퍼1")
+    gn_group.add_argument("--action-dim", type=int, default=16, help="bimanual: 8 left + 8 right")
+    gn_group.add_argument("--state-dim", type=int, default=16)
     gn_group.add_argument("--chunk-size", type=int, default=50)
 
     tp_group = parser.add_argument_group("3. 비전 토큰 프루닝")

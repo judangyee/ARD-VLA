@@ -30,7 +30,7 @@ def main() -> None:
     parser.add_argument("--vlm-model-name", default="HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
     parser.add_argument("--num-vlm-layers", type=int, default=16, help="SmolVLAConfig 기본값과 동일")
     parser.add_argument("--expert-width-multiplier", type=float, default=0.75, help="SmolVLAConfig 기본값과 동일")
-    parser.add_argument("--ard-arm-dim", type=int, default=7)
+    parser.add_argument("--ard-arm-dim", type=int, default=8, help="OpenArm+그리퍼 확정 스펙: 관절7+그리퍼1")
     parser.add_argument("--max-state-dim", type=int, default=32, help="SmolVLAConfig 기본값과 동일")
     parser.add_argument("--max-action-dim", type=int, default=32, help="SmolVLAConfig 기본값과 동일")
     parser.add_argument(

@@ -70,10 +70,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32])
     parser.add_argument("--chunk-size", type=int, default=50, help="action chunk length (horizon)")
-    parser.add_argument("--action-dim", type=int, default=14, help="bimanual: 7 left + 7 right")
-    parser.add_argument("--state-dim", type=int, default=14)
-    parser.add_argument("--ard-arm-dim", type=int, default=7)
-    parser.add_argument("--cameras", type=int, default=3, help="top + 좌손목 + 우손목")
+    parser.add_argument(
+        "--action-dim", type=int, default=16, help="bimanual: 8 left + 8 right (OpenArm+그리퍼 확정 스펙)"
+    )
+    parser.add_argument("--state-dim", type=int, default=16)
+    parser.add_argument("--ard-arm-dim", type=int, default=8)
+    parser.add_argument("--cameras", type=int, default=3, help="top + 좌손목(wrist_left) + 우손목(wrist_right)")
     parser.add_argument("--image-size", type=int, default=128, help="더미 이미지 한 변 길이 (resize_imgs_with_padding이 어차피 재조정함)")
     parser.add_argument("--lang-seq-len", type=int, default=48, help="config.tokenizer_max_length 기본값과 동일")
     parser.add_argument("--vlm-model-name", default="HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
@@ -139,8 +141,14 @@ def build_policy(args, mode: str) -> SmolVLAPolicy:
     input_features = {
         "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(args.state_dim,)),
     }
+    # top + 좌/우 손목(wrist) 카메라가 OpenArm 바이매뉴얼 셋업의 실제 구성이다 — 이 이름으로
+    # 명시해서 "wrist 카메라가 추가 이미지 입력으로 들어간다"는 걸 더 분명하게 한다. SmolVLA는
+    # self.config.image_features(dict)를 그냥 순회하므로 카메라가 몇 개든, 이름이 뭐든 코드
+    # 변경 없이 처리된다 — 여기서 쓰는 이름은 순수 라벨이다.
+    camera_names = ["top", "wrist_left", "wrist_right"]
     for i in range(args.cameras):
-        input_features[f"observation.images.cam{i}"] = PolicyFeature(
+        name = camera_names[i] if i < len(camera_names) else f"cam{i}"
+        input_features[f"observation.images.{name}"] = PolicyFeature(
             type=FeatureType.VISUAL, shape=(3, args.image_size, args.image_size)
         )
     output_features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(args.action_dim,))}
