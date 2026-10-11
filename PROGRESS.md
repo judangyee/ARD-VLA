@@ -205,3 +205,92 @@ forward 경로(`test_joint_torque_*`, 3개), config validation(`test_joint_torqu
 
 없음 — 요청한 5개 항목 전부 완료, 커밋 예정(기능별로 분리: arm_dim/gripper/joint_torque+camera
 문서/테스트). 실제 GPU/OpenArm 하드웨어로의 검증은 범위 밖으로 남겨뒀다.
+
+---
+
+# 폐루프(closed-loop) 구조 구현 (branch: closed-loop-structure)
+
+SmolVLM2 백본 prefix 계산을 한 번만 공유해 Judge(성공 판정)/Selector(다음 서브태스크
+선택)/Action expert(행동) 세 갈래로 쓰는 구조. 이번 작업은 **구조 구현만** — 데이터 생성/실제
+학습/캘리브레이션 실측은 범위 밖.
+
+## 단계 목록
+
+- [x] 1. 코드 흐름 추적 (수정 없음)
+- [ ] 2. Judge/Selector 헤드 + 단일 prefix 추론 API
+- [ ] 3. 학습 손실 연결
+- [ ] 4. decision_logic.py
+- [ ] 5. closed_loop.py 러너
+- [ ] 6. 테스트 + 문서 + 최종 보고
+
+## 현재 상태
+
+브랜치 `closed-loop-structure`를 `claude/smolvla-research-setup-x29mi7`(OpenArm 8DoF 작업
+커밋 `b15191b`)에서 분기. 1단계(코드 수정 없이 추적만) 완료, 5개 항목 결과:
+
+1. **`sample_actions()`의 prefix forward 버려지는 첫 반환값**:
+   `modeling_smolvla.py:1065` `_, past_key_values = self.vlm_with_expert.forward(...)`.
+   `smolvlm_with_expert.py`의 `forward()`를 직접 읽어서 확인 — `outputs_embeds`는
+   `[final_norm(vlm_hidden), None]`이다(118-591행, "final norm" 블록이
+   `inputs_embeds[0]`에 `models[0].norm()`을 적용). 즉 버려지는 값은 prefix의 **마지막
+   레이어, post-norm** hidden state, shape `(batch, prefix_seq_len, vlm_hidden_size)` —
+   `judge_feature_layer=-1`(기본값) 케이스에 추가 연산 없이 바로 쓸 수 있다.
+2. **Bridge Attention의 `collect_layer_indices`/`last_collected_prefix_layers` 재사용
+   가능 여부**: 가능. 같은 `forward()`의 레이어 인터리브 루프 안에서
+   `collect_set`/`collected[layer_idx] = inputs_embeds[0]`로 캡처(580행 부근, **final
+   norm 적용 전** 시점)하고 루프가 끝나면 `self.last_collected_prefix_layers`에 저장한다.
+   단, 이 캡처값은 **pre-norm**이라 (1)의 post-norm 마지막 레이어 값과 스케일이
+   다르다 — `judge_feature_layer=-1`과 `judge_feature_layer=<중간 레이어>`를 같은
+   파이프라인으로 넣으려면 `judge.py`의 pooling 다음에 자체 `LayerNorm`을 둬서 이
+   불일치를 흡수하는 쪽으로 설계(2단계에서 반영). 또한 Bridge Attention과 Judge가 같은
+   `forward()` 호출에서 각자 다른 레이어를 요청할 수 있으므로, 호출부(`sample_actions`,
+   학습 경로의 동일 호출, 신규 `predict_action_chunk_with_decisions`)에서
+   `collect_layer_indices`를 **두 요청의 합집합**으로 넘기고 각자 자기 인덱스만 꺼내 쓰도록
+   2단계에서 구현한다.
+3. **prefix 시퀀스 배치(이미지→언어→state)와 `prefix_pad_masks`로 masked mean pooling
+   가능 여부**: 가능, 확인됨. `embed_prefix()`(750-856행)가 정확히 이미지 임베딩들 →
+   언어 임베딩 → state 임베딩 순서로 `torch.cat`하고, 동일한 순서로 `pad_masks`를
+   이어붙여 `self.prefix_length`까지 우측 제로패딩한다. 반환값은
+   `return embs, pad_masks, att_masks`(856행) — `pad_masks`가 그대로
+   `sample_actions()`의 `prefix_pad_masks`가 되어 `judge.py`의 masked mean pooling
+   (`(hidden * mask).sum(1) / mask.sum(1)`)에 바로 쓸 수 있다.
+4. **지시문 문자열이 토큰화되는 지점**: `processor_smolvla.py`의
+   `make_smolvla_pre_post_processors()` 전처리 파이프라인. 흐름은
+   `complementary_data["task"]`(평문 문자열 또는 문자열 리스트) →
+   `SmolVLANewLineProcessor`(끝에 `\n` 보장) → `TokenizerProcessorStep`(HF 토크나이저,
+   `config.vlm_model_name`/`config.pad_language_to`/`config.tokenizer_max_length`)이
+   `lang_tokens`/`lang_masks`로 변환 → 이후 `OBS_LANGUAGE_TOKENS`/
+   `OBS_LANGUAGE_ATTENTION_MASK` 배치 키로 `_get_action_chunk()`에 들어간다. 이 전처리는
+   **정책 바깥(호출자 쪽)에서** 돈다 — `SmolVLAPolicy.predict_action_chunk`/
+   `select_action`은 이미 토큰화된 배치를 받는다. 따라서 decision_logic이 만든 지시문
+   문자열(목표+현재 서브태스크+완료 단계)은 5단계 `closed_loop.py` 러너가
+   `observe()`로 받은 관측치의 `complementary_data["task"]`에 꽂아 넣고 같은 전처리
+   파이프라인(`make_smolvla_pre_post_processors`)을 통과시키는 방식으로 연결한다 —
+   `predict_action_chunk_with_decisions` 자체는 토큰화를 신경 쓰지 않는다(기존
+   `predict_action_chunk`와 동일한 전제).
+5. **`select_action()`의 `self._queues[ACTION]` 드레인이 RTC/freq-policy 포함해서 안전하게
+   비워지는지**: 안전함, 확인됨. `self._queues[ACTION]`은 `SmolVLAPolicy.reset()`에서
+   `deque(maxlen=self.config.n_action_steps)`로 만드는 **ACTION 전용** 큐이고(265-269행),
+   `_check_get_actions_condition()`이 비었을 때만 새로 채운다(372-373행). RTC는
+   `select_action()` 자체에서 `assert not self._rtc_enabled()`로 막혀 있어 RTC 경로와는
+   아예 안 겹치고, RTC가 쓰이는 `predict_action_chunk`(+`prev_chunk_left_over` 같은 RTC
+   상태)는 전부 **호출자가 매 호출 인자로 넘기는 값**이라 `RTCProcessor`
+   (`modeling_rtc.py`) 자신은 청크 간에 상태를 들고 있지 않다(`self.tracker`는 디버그
+   기록용일 뿐 큐와 무관). `freq_policy`는 학습 손실 항(`freq_loss`)일 뿐 추론 큐와 전혀
+   상호작용하지 않는다. 결론: `cancel_pending_actions()`는 단순히
+   `self._queues[ACTION].clear()`만 하면 되고, 호출자(`closed_loop.py`)가 재시도 시
+   `prev_chunk_left_over`를 넘기지 않으면 RTC 쪽도 자동으로 깨끗하게 끊긴다.
+
+**설계에 미치는 영향(2단계 반영 예정)**:
+- `judge.py`의 pooling 출력에 `LayerNorm`을 추가해 pre-norm(중간 레이어)/post-norm(-1)
+  불일치를 흡수.
+- `predict_action_chunk_with_decisions`/`sample_actions`/학습 경로 forward 호출부 모두
+  `collect_layer_indices=sorted(set(bridge_indices or []) | ({judge_layer} if judge_layer
+  != -1 else set()))` 형태로 합집합 처리.
+- `cancel_pending_actions()`는 `self._queues[ACTION].clear()` 한 줄.
+
+## 다음에 할 일
+
+2단계(Judge/Selector 헤드 + `predict_action_chunk_with_decisions` + `cancel_pending_actions`)
+진행 — `configuration_smolvla.py` 플래그 추가 → `policies/smolvla/judge.py` 신규 → 위 설계로
+`modeling_smolvla.py` 연결 → pytest 전체 통과 → 커밋/푸시 → 이 파일 갱신.
