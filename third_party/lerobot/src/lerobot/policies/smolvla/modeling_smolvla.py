@@ -79,6 +79,7 @@ from lerobot.policies.smolvla.ard import (
 )
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.freq_policy import compute_frequency_consistency_loss
+from lerobot.policies.smolvla.judge import Judge
 from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
 from lerobot.policies.smolvla.token_pruning import compute_task_relevance_scores, select_tokens
 from lerobot.policies.utils import (
@@ -340,6 +341,53 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         actions = self._get_action_chunk(batch, noise, **kwargs)
         return actions
+
+    @torch.no_grad()
+    def predict_action_chunk_with_decisions(
+        self,
+        batch: dict[str, Tensor],
+        selector_mask: Tensor | None = None,
+        noise: Tensor | None = None,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """`predict_action_chunk`과 동일하지만 prefix forward를 정확히 한 번만 계산해서 Judge/
+        Selector 판정(`decisions`)도 함께 반환한다 — 폐루프 러너(closed_loop.py)가 매 서브태스크
+        종료 시점에 쓴다. `use_judge=use_selector=False`면 `decisions`는 빈 dict이고 액션은
+        `predict_action_chunk`와 수치적으로 동일하다."""
+        self.eval()
+
+        batch = self._prepare_batch(batch)
+        self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
+
+        for k in batch:
+            if k in self._queues and k != ACTION:
+                batch[k] = torch.stack(list(self._queues[k]), dim=1)
+
+        images, img_masks = self.prepare_images(batch)
+        state = self.prepare_state(batch)
+        lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
+        lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+
+        actions, decisions = self.model.sample_actions_with_decisions(
+            images, img_masks, lang_tokens, lang_masks, state,
+            noise=noise, selector_mask=selector_mask, **kwargs,
+        )
+
+        original_action_dim = self.config.action_feature.shape[0]
+        actions = actions[:, :, :original_action_dim]
+        if self.config.adapt_to_pi_aloha:
+            actions = self._pi_aloha_encode_actions(actions)
+
+        return actions, decisions
+
+    def cancel_pending_actions(self) -> None:
+        """현재 큐에 남아 있는(아직 실행하지 않은) 액션 청크를 전부 버린다 — 폐루프 러너가 Judge가
+        실패를 판정했을 때 호출한다. `self._queues[ACTION]`은 ACTION 전용 deque라
+        (SmolVLAPolicy.reset 참고) 비우는 것만으로 충분히 안전하다 — RTC는 `prev_chunk_left_over`
+        등 상태를 매 호출 인자로 호출자가 넘기므로(RTCProcessor 자신은 청크 간 상태를 들고
+        있지 않음) 다음 재시도에서 그 인자를 넘기지 않으면 자동으로 끊기고, freq_policy는 학습
+        손실 항일 뿐 추론 큐와 무관하다(PROGRESS.md 폐루프 1단계 추적 기록의 항목 5 참고)."""
+        self._queues[ACTION].clear()
 
     @torch.no_grad()
     def select_action(
@@ -718,6 +766,27 @@ class VLAFlowMatching(nn.Module):
             if self.config.ard_use_force_head:
                 self.ard_force_head = ForceHead(expert_hidden_size=self.vlm_with_expert.expert_hidden_size)
 
+        # 폐루프 구조: Judge(성공 판정)/Selector(다음 서브태스크 선택) head — 둘 다 기본 off라서
+        # self.judge가 None이면 predict_action_chunk_with_decisions도 decisions={}만 반환하고
+        # 그 외 경로(sample_actions/forward)는 전혀 건드리지 않는다.
+        self.judge: Judge | None = None
+        if self.config.use_judge or self.config.use_selector:
+            if self.config.judge_feature_layer != -1 and self.config.judge_feature_layer >= self.vlm_with_expert.num_vlm_layers:
+                raise ValueError(
+                    f"`judge_feature_layer`({self.config.judge_feature_layer})가 트림된 VLM 레이어 수"
+                    f"({self.vlm_with_expert.num_vlm_layers})를 넘습니다."
+                )
+            self.judge = Judge(
+                vlm_hidden_size=self.vlm_with_expert.config.text_config.hidden_size,
+                hidden_dim=self.config.judge_hidden_dim,
+                use_judge=self.config.use_judge,
+                num_failure_types=self.config.judge_num_failure_types,
+                use_progress=self.config.judge_use_progress,
+                use_selector=self.config.use_selector,
+                selector_num_options=self.config.selector_num_options,
+                detach_features=self.config.judge_detach_features,
+            )
+
         # Compile model if requested
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
@@ -1081,6 +1150,23 @@ class VLAFlowMatching(nn.Module):
                 self.config.ard_default_actuator_arm, batch_size=bsize, device=device
             )
 
+        return self._denoise_loop(
+            noise, prefix_pad_masks, past_key_values, bridge_kv_layers, actuator_is_first, **kwargs
+        )
+
+    def _denoise_loop(
+        self,
+        noise,
+        prefix_pad_masks,
+        past_key_values,
+        bridge_kv_layers,
+        actuator_is_first,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> Tensor:
+        """`sample_actions`/`sample_actions_with_decisions`가 공유하는 flow-matching denoise
+        루프 — prefix forward(및 Judge/Selector 계산)가 이미 끝난 뒤의 부분만 담당한다."""
+        bsize = noise.shape[0]
+        device = noise.device
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
 
@@ -1121,6 +1207,92 @@ class VLAFlowMatching(nn.Module):
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
         return x_t
+
+    @staticmethod
+    def _merge_collect_layer_indices(
+        bridge_layer_indices: list[int] | None, judge_layer: int | None
+    ) -> list[int] | None:
+        """Bridge Attention과 Judge가 같은 `vlm_with_expert.forward(collect_layer_indices=...)`
+        호출에서 서로 다른 중간 레이어를 요청할 수 있으므로 합집합으로 합친다(PROGRESS.md
+        폐루프 1단계 추적 기록 참고). `judge_layer=-1`(prefix 마지막 레이어)은 별도 캡처가
+        필요 없어 포함하지 않는다."""
+        indices = set(bridge_layer_indices) if bridge_layer_indices else set()
+        if judge_layer is not None and judge_layer != -1:
+            indices.add(judge_layer)
+        return sorted(indices) if indices else None
+
+    def sample_actions_with_decisions(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        noise=None,
+        selector_mask: Tensor | None = None,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """`sample_actions()`와 동일한 denoise 루프를 쓰지만, prefix forward를 정확히 한 번만
+        계산해서 그 결과를 Judge/Selector와 action expert가 공유한다(ARD-VLA 폐루프 구조,
+        docs/closed_loop.md 참고). `self.judge`가 None(use_judge=use_selector=False)이면
+        decisions는 빈 dict다 — 그 경우 `sample_actions()`와 수치적으로 동일하다."""
+        bsize = state.shape[0]
+        device = state.device
+
+        if noise is None:
+            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        judge_layer = self.config.judge_feature_layer if self.judge is not None else None
+        collect_layer_indices = self._merge_collect_layer_indices(self.bridge_layer_indices, judge_layer)
+
+        # prefix forward — 이 한 번의 호출 결과(outputs_embeds[0]=prefix 마지막 레이어 hidden
+        # state, past_key_values, 그리고 collect_layer_indices로 캡처한 중간 레이어들)를 Judge/
+        # Selector/action expert(denoise 루프)가 전부 공유한다.
+        prefix_outputs_embeds, past_key_values = self.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+            collect_layer_indices=collect_layer_indices,
+        )
+
+        bridge_kv_layers = None
+        if self.bridge_layer_indices is not None:
+            collected = self.vlm_with_expert.last_collected_prefix_layers
+            bridge_kv_layers = [collected[i].to(dtype=torch.float32) for i in self.bridge_layer_indices]
+
+        decisions: dict[str, Tensor] = {}
+        if self.judge is not None:
+            if judge_layer == -1:
+                judge_hidden = prefix_outputs_embeds[0]
+            else:
+                judge_hidden = self.vlm_with_expert.last_collected_prefix_layers[judge_layer]
+            judge_out = self.judge(
+                judge_hidden.to(dtype=torch.float32), prefix_pad_masks, allowed_mask=selector_mask
+            )
+            for key in ("success_prob", "failure_probs", "progress", "selector_probs"):
+                if key in judge_out:
+                    decisions[key] = judge_out[key]
+
+        actuator_is_first = None
+        if self.config.use_ard:
+            actuator_is_first = resolve_actuator_is_first(
+                self.config.ard_default_actuator_arm, batch_size=bsize, device=device
+            )
+
+        x_t = self._denoise_loop(
+            noise, prefix_pad_masks, past_key_values, bridge_kv_layers, actuator_is_first, **kwargs
+        )
+        return x_t, decisions
 
     def denoise_step(
         self,

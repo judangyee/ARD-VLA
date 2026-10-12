@@ -215,6 +215,27 @@ class SmolVLAConfig(PreTrainedConfig):
     # 최저 주파수 bin의 exp(-decay)배가 되도록 정규화되어 있다(예: decay=2 -> 약 13.5%).
     freq_decay: float = 2.0
 
+    # --- 폐루프(closed-loop) 구조 — Judge(성공 판정)/Selector(다음 서브태스크 선택) head.
+    # 하나의 prefix(이미지+언어+state) forward를 Judge/Selector/action expert가 공유한다
+    # (lerobot.policies.smolvla.judge.Judge, SmolVLAPolicy.predict_action_chunk_with_decisions
+    # 참고). 이번 작업은 구조 구현만 — 데이터 생성/실제 학습/캘리브레이션 실측은 범위 밖.
+    use_judge: bool = False
+    judge_hidden_dim: int = 256
+    # -1이면 prefix 마지막 레이어(post-norm, sample_actions()가 버리던 반환값을 재사용 —
+    # 추가 연산 없음). 그 외 값이면 Bridge Attention과 같은 `collect_layer_indices` 경로로
+    # 뽑은 중간 레이어(pre-norm) — 상한(트림된 num_vlm_layers)은 실제 모델을 로드해야 알 수
+    # 있어서 modeling_smolvla.py의 VLAFlowMatching.__init__에서 검증한다.
+    judge_feature_layer: int = -1
+    judge_num_failure_types: int = 0  # 0이면 실패 유형 분류 head 없음
+    judge_use_progress: bool = False  # 진행도(0~1) 회귀 head 추가 여부
+    # Judge/Selector 손실이 백본/action expert로 역전파되지 않게 pooled feature를 detach한다
+    # — 1차 연구에서는 백본을 고정한 채로만 Judge/Selector를 다루는 게 전제라서 기본 True.
+    judge_detach_features: bool = True
+    use_selector: bool = False
+    selector_num_options: int = 0  # use_selector=True면 1 이상이어야 함
+    judge_loss_weight: float = 1.0
+    selector_loss_weight: float = 1.0
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -302,6 +323,27 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError(f"`freq_lambda`는 음수일 수 없습니다. 현재 값: {self.freq_lambda}")
             if self.freq_decay < 0:
                 raise ValueError(f"`freq_decay`는 음수일 수 없습니다. 현재 값: {self.freq_decay}")
+        if self.judge_feature_layer != -1 and self.judge_feature_layer < 0:
+            raise ValueError(
+                f"`judge_feature_layer`는 -1(마지막 레이어) 또는 0 이상이어야 합니다. "
+                f"현재 값: {self.judge_feature_layer}"
+            )
+        if self.use_judge or self.use_selector:
+            if self.judge_hidden_dim <= 0:
+                raise ValueError(f"`judge_hidden_dim`은 양수여야 합니다. 현재 값: {self.judge_hidden_dim}")
+        if self.judge_num_failure_types > 0 and not self.use_judge:
+            raise ValueError("`judge_num_failure_types`는 `use_judge=True`일 때만 의미가 있습니다.")
+        if self.judge_use_progress and not self.use_judge:
+            raise ValueError("`judge_use_progress`는 `use_judge=True`일 때만 의미가 있습니다.")
+        if self.use_judge and self.judge_num_failure_types < 0:
+            raise ValueError(f"`judge_num_failure_types`는 음수일 수 없습니다. 현재 값: {self.judge_num_failure_types}")
+        if self.use_selector and self.selector_num_options < 1:
+            raise ValueError(
+                f"`use_selector=True`면 `selector_num_options`가 1 이상이어야 합니다. "
+                f"현재 값: {self.selector_num_options}"
+            )
+        if not self.use_selector and self.selector_num_options != 0:
+            raise ValueError("`selector_num_options`는 `use_selector=True`일 때만 설정할 수 있습니다.")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

@@ -217,7 +217,7 @@ SmolVLM2 백본 prefix 계산을 한 번만 공유해 Judge(성공 판정)/Selec
 ## 단계 목록
 
 - [x] 1. 코드 흐름 추적 (수정 없음)
-- [ ] 2. Judge/Selector 헤드 + 단일 prefix 추론 API
+- [x] 2. Judge/Selector 헤드 + 단일 prefix 추론 API
 - [ ] 3. 학습 손실 연결
 - [ ] 4. decision_logic.py
 - [ ] 5. closed_loop.py 러너
@@ -289,8 +289,60 @@ SmolVLM2 백본 prefix 계산을 한 번만 공유해 Judge(성공 판정)/Selec
   != -1 else set()))` 형태로 합집합 처리.
 - `cancel_pending_actions()`는 `self._queues[ACTION].clear()` 한 줄.
 
+## 2단계: Judge/Selector 헤드 + 단일 prefix 추론 API
+
+`configuration_smolvla.py`에 플래그 추가(전부 기본 off): `use_judge`, `judge_hidden_dim`(256),
+`judge_feature_layer`(-1), `judge_num_failure_types`(0), `judge_use_progress`(False),
+`judge_detach_features`(True, 1차 연구는 백본 고정 전제), `use_selector`, `selector_num_options`
+(0). `judge_loss_weight`/`selector_loss_weight`(둘 다 1.0, 3단계에서 실제로 손실에 쓰임)도
+미리 같이 추가했다 — 필드 추가 자체는 비활성이라 2단계 bit-exact에 영향 없음. `__post_init__`
+검증: `judge_feature_layer`는 -1 또는 0 이상(상한은 트림된 `num_vlm_layers`를 알아야 해서
+`VLAFlowMatching.__init__`에서 확인, `ard_bridge_layer_indices`와 동일한 이유), `use_judge=False`
+인데 `judge_num_failure_types>0`/`judge_use_progress=True`면 에러, `use_selector=True`면
+`selector_num_options>=1` 필수(반대로 `use_selector=False`인데 0이 아니면도 에러).
+
+신규 `policies/smolvla/judge.py`의 `Judge(nn.Module)`: `prefix_pad_masks` 기준 masked mean
+pooling + `LayerNorm`(1단계 추적에서 결정한 pre/post-norm 불일치 흡수용) 다음에, 서로 완전히
+분리된(trunk 공유 없음) 작은 MLP head 4개 — `success_head`(1, `use_judge`일 때만),
+`failure_head`(K, `use_judge` and `judge_num_failure_types>0`), `progress_head`(1, `use_judge`
+and `judge_use_progress`), `selector_head`(N, `use_selector` and `selector_num_options>0`).
+`forward(prefix_hidden, prefix_pad_masks, allowed_mask=None)`가 `success_logit`/`success_prob`
+(=`sigmoid(logit/T)`, `T`=학습되지 않는 buffer `temperature`, 기본 1.0 — 실제 캘리브레이션
+fitting은 범위 밖, 슬롯만), `failure_logits`/`failure_probs`, `progress`(0~1 sigmoid 단일값),
+`selector_logits`/`selector_probs`(allowed_mask로 비허용 옵션을 `-inf` 마스킹 후 softmax)를
+있는 head만 채워서 dict로 반환. `detach_features=True`면 pooled feature를 `.detach()`해서
+Judge/Selector 손실이 백본으로 역전파되지 않게 한다.
+
+`modeling_smolvla.py`: `VLAFlowMatching.__init__`에 `self.judge`(둘 다 off면 `None`) 추가,
+`judge_feature_layer` 상한을 `num_vlm_layers`로 런타임 검증. 기존 `sample_actions()`의 denoise
+루프(`for step in range(num_steps): ...` 블록)를 동작을 전혀 바꾸지 않고 `_denoise_loop()`
+헬퍼로 추출(순수 리팩터링 — pytest 41개가 수치까지 그대로 통과하는 것으로 확인). 신규
+`sample_actions_with_decisions()`가 prefix forward를 **정확히 한 번** 호출해서(Bridge
+Attention의 `collect_layer_indices`와 Judge의 `judge_feature_layer`를 `_merge_collect_layer_indices()`
+로 합집합 처리) 그 결과(prefix 마지막 레이어 hidden state 또는 `last_collected_prefix_layers`의
+중간 레이어, `past_key_values`, `bridge_kv_layers`)를 Judge와 `_denoise_loop()` 양쪽에
+공유한다. `SmolVLAPolicy`에 `predict_action_chunk_with_decisions(batch, selector_mask=None) ->
+(actions, decisions)`(`predict_action_chunk`과 동일한 배치 전처리 + 큐 갱신 후
+`sample_actions_with_decisions` 호출)과 `cancel_pending_actions()`(1단계 추적 결론대로
+`self._queues[ACTION].clear()` 한 줄) 추가.
+
+테스트: `tests/test_judge.py`(신규, `test_ard.py`와 같은 순수 단위 테스트 스타일) —
+`Judge`가 `use_judge`/`use_selector`에 따라 필요한 head만 만드는지, 출력 shape/확률 범위,
+masked mean pooling이 패딩 구간을 무시하는지, temperature 스케일링, selector
+`allowed_mask`가 비허용 옵션 확률을 0으로 만드는지, `detach_features`에 따른 그래디언트
+차단/통과, config 검증 6개. `tests/test_ard_integration.py`에 통합 테스트 6개 추가 — 플래그
+모두 off면 `predict_action_chunk_with_decisions`의 액션이 `predict_action_chunk`과
+bit-for-bit 동일하고 `decisions=={}`인지, prefix forward(`fill_kv_cache=True`)가 정확히
+한 번만 호출되는지(래핑해서 호출 횟수 직접 확인), `judge_feature_layer=-1`이 Bridge
+Attention 없이도 동작하는지, selector mask가 실제 정책 경로에서도 비허용 옵션을 0으로
+만드는지, `cancel_pending_actions()`가 `select_action()`이 채운 큐를 비우는지.
+
+`pytest`(58개 전부 통과 — 기존 41 + 신규 17). 커밋 예정, 이어서 3단계(학습 손실 연결) 진행.
+
 ## 다음에 할 일
 
-2단계(Judge/Selector 헤드 + `predict_action_chunk_with_decisions` + `cancel_pending_actions`)
-진행 — `configuration_smolvla.py` 플래그 추가 → `policies/smolvla/judge.py` 신규 → 위 설계로
-`modeling_smolvla.py` 연결 → pytest 전체 통과 → 커밋/푸시 → 이 파일 갱신.
+3단계(학습 손실 연결) 진행 — `SmolVLAPolicy.forward()`에 `judge_success`/
+`judge_failure_type`/`judge_progress`/`selector_target`+`selector_mask` 손실 추가(키 없으면
+0, 기존 `ard_force_target` 패턴과 동일), `judge_detach_features=True`일 때 백본으로 그래디언트가
+안 가는지 확인하는 테스트 추가, `profile_memory.py` 등 PEFT 수동 unfreeze 루프에 Judge/Selector
+head 추가 → pytest 전체 통과 → 커밋/푸시 → 이 파일 갱신.

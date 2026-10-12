@@ -175,3 +175,97 @@ def test_joint_torque_flows_through_full_forward_pass(build_tiny_policy, build_t
     with torch.no_grad():
         actions = policy.predict_action_chunk(dict(batch))
     assert torch.isfinite(actions).all()
+
+
+# --- 폐루프 구조(Judge/Selector, predict_action_chunk_with_decisions) 통합 테스트 ---
+# 순수 텐서 단위 테스트(Judge 모듈 자체, config 검증)는 tests/test_judge.py에 있다. 여기서는
+# 실제 SmolVLAPolicy 전체(prefix forward 1회 공유, use_judge/use_selector가 전부 꺼졌을 때의
+# bit-exact 여부)를 확인한다.
+
+
+def test_judge_flags_off_matches_predict_action_chunk(build_tiny_policy, build_tiny_batch):
+    """use_judge=use_selector=False(기본)면 predict_action_chunk_with_decisions의 액션이
+    predict_action_chunk과 bit-for-bit 동일해야 하고, decisions는 빈 dict여야 한다."""
+    torch.manual_seed(3)
+    policy = build_tiny_policy(num_steps=2)
+    policy.eval()
+    assert policy.model.judge is None
+
+    batch = build_tiny_batch(batch_size=2, chunk=8, lang_len=6)
+
+    torch.manual_seed(4)
+    with torch.no_grad():
+        actions_plain = policy.predict_action_chunk(dict(batch))
+    torch.manual_seed(4)
+    with torch.no_grad():
+        actions_decisions, decisions = policy.predict_action_chunk_with_decisions(dict(batch))
+
+    assert decisions == {}
+    assert torch.equal(actions_plain, actions_decisions)
+
+
+def test_predict_action_chunk_with_decisions_calls_prefix_forward_exactly_once(build_tiny_policy, build_tiny_batch):
+    """prefix forward(fill_kv_cache=True 호출)가 정확히 한 번만 일어나야 한다 — Judge/Selector가
+    별도의 prefix forward를 추가로 돌리면 안 된다(stage 2 요구사항)."""
+    policy = build_tiny_policy(use_judge=True, judge_num_failure_types=3, judge_use_progress=True, num_steps=2)
+    policy.eval()
+
+    original_forward = policy.model.vlm_with_expert.forward
+    call_count = {"fill_kv_cache": 0}
+
+    def _counting_forward(*args, **kwargs):
+        if kwargs.get("fill_kv_cache"):
+            call_count["fill_kv_cache"] += 1
+        return original_forward(*args, **kwargs)
+
+    policy.model.vlm_with_expert.forward = _counting_forward
+
+    batch = build_tiny_batch(batch_size=2, chunk=8, lang_len=6)
+    with torch.no_grad():
+        actions, decisions = policy.predict_action_chunk_with_decisions(dict(batch))
+
+    assert call_count["fill_kv_cache"] == 1
+    assert torch.isfinite(actions).all()
+    assert set(decisions) == {"success_prob", "failure_probs", "progress"}
+    assert torch.all((decisions["success_prob"] >= 0) & (decisions["success_prob"] <= 1))
+
+
+def test_predict_action_chunk_with_decisions_judge_feature_layer_minus_one_reuses_discarded_value(
+    build_tiny_policy, build_tiny_batch
+):
+    """judge_feature_layer=-1(기본)이면 Judge가 prefix 마지막 레이어(sample_actions()가 버리던
+    반환값)를 그대로 쓴다 — Bridge Attention 없이도(collect_layer_indices=None) 동작해야 한다."""
+    policy = build_tiny_policy(use_judge=True, num_steps=2)
+    assert policy.model.judge is not None
+    policy.eval()
+
+    batch = build_tiny_batch(batch_size=2, chunk=8, lang_len=6)
+    with torch.no_grad():
+        _, decisions = policy.predict_action_chunk_with_decisions(dict(batch))
+
+    assert decisions["success_prob"].shape == (2,)
+
+
+def test_predict_action_chunk_with_decisions_selector_mask_zeroes_disallowed(build_tiny_policy, build_tiny_batch):
+    policy = build_tiny_policy(use_selector=True, selector_num_options=4, num_steps=2)
+    policy.eval()
+
+    batch = build_tiny_batch(batch_size=2, chunk=8, lang_len=6)
+    selector_mask = torch.tensor([True, True, False, False])
+    with torch.no_grad():
+        _, decisions = policy.predict_action_chunk_with_decisions(dict(batch), selector_mask=selector_mask)
+
+    assert torch.allclose(decisions["selector_probs"][:, 2:], torch.zeros(2, 2), atol=1e-7)
+
+
+def test_cancel_pending_actions_clears_action_queue(build_tiny_policy, build_tiny_batch):
+    policy = build_tiny_policy(num_steps=2)
+    policy.eval()
+    batch = build_tiny_batch(batch_size=1, chunk=8, lang_len=6)
+
+    with torch.no_grad():
+        policy.select_action(dict(batch))
+    assert len(policy._queues["action"]) > 0
+
+    policy.cancel_pending_actions()
+    assert len(policy._queues["action"]) == 0
