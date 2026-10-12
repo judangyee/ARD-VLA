@@ -220,7 +220,7 @@ SmolVLM2 백본 prefix 계산을 한 번만 공유해 Judge(성공 판정)/Selec
 - [x] 2. Judge/Selector 헤드 + 단일 prefix 추론 API
 - [x] 3. 학습 손실 연결
 - [x] 4. decision_logic.py
-- [ ] 5. closed_loop.py 러너
+- [x] 5. closed_loop.py 러너
 - [ ] 6. 테스트 + 문서 + 최종 보고
 
 ## 현재 상태
@@ -424,14 +424,57 @@ Selector가 **허용되지 않은** 옵션을 고르면 안전 규칙이 거부�
 
 `pytest`(73개 전부 통과 — 61 + 신규 12). 커밋 예정, 이어서 5단계(closed_loop.py 러너) 진행.
 
+## 5단계: closed_loop.py 러너
+
+신규 `policies/smolvla/closed_loop.py` — `ClosedLoopEnv`(`typing.Protocol`, duck typing만
+문서화 — 상속 강제 없음)로 환경을 받는 `run_closed_loop(policy, env, decision_logic, goal,
+start_node, preprocessor=None, max_iterations=50, pre_chunk=None, per_step=None,
+post_decision=None) -> dict` 하나로 구현했다.
+
+**루프 설계(spec의 모호한 지점에 대한 내 설계 결정, PROGRESS.md에 명시)**: "실행 → 종료 시
+재관측 → judge" 순서를 글자 그대로 "매 iteration마다 두 번 모델을 호출"하는 것으로 읽지
+않았다 — 대신 `predict_action_chunk_with_decisions`를 **iteration마다 한 번만** 불러서, 이번
+iteration의 관측치에 대한 "액션 청크"와 "Judge 판정"을 동시에 받는다(아키텍처 자체가 "하나의
+prefix forward를 세 갈래가 공유"이므로, 이게 실제 구조와 일치). 그래서 각 iteration의
+`decisions`는 사실상 "이전 iteration이 실행+재관측한 결과"를 판정한 값이 된다(첫 iteration은
+초기 관측치를 그대로 판정) — 여러 control cycle에 걸쳐 진행되는 서브태스크를 자연스럽게
+표현한다. 매 iteration: ① `decision_logic.instruction_text(goal, state)`로 지시문 생성 ②
+`env.observe()` + 지시문을 `preprocessor`(기존 `make_smolvla_pre_post_processors` 역할,
+1단계 추적 기록의 항목 4대로 "task" 키에 지시문을 꽂아 넘긴다)로 배치 변환 ③
+`predict_action_chunk_with_decisions(selector_mask=...)` 한 번 호출 ④ 반환된 액션 청크를
+`env.execute()`로 한 스텝씩 실행하다 `env.subtask_finished()`가 True가 되면 멈춤(`_execute_chunk`)
+⑤ `env.settle()` ⑥ 이미 ③에서 받은 `decisions`로 `decision_logic.decide()` 호출 — ADVANCE가
+아니면 `policy.cancel_pending_actions()`로 "남은 청크"를 버린다(ponytail: 이 구현은 청크를
+큐에 쌓지 않고 한 번에 다 실행하므로 이 시점에 실제로 버려질 큐 항목은 없지만, 요구사항을
+문자 그대로 지키고 — 나중에 select_action류의 큐 기반 실시간 실행으로 바꿔도 안전하도록 —
+항상 호출한다. 업그레이드 경로: `_execute_chunk`를 `_queues[ACTION]`을 직접 채우고 매 스텝
+popleft하는 방식으로 바꾸면 이 호출이 그 시점부터는 실제로 의미 있는 drain이 된다). 종료
+노드 도달(ADVANCE, target=None) 또는 STOP이면 종료, `max_iterations` 초과도 안전하게
+`safe_stop()`+종료 처리. `pre_chunk(actions, decisions, state)`/`per_step(step, action,
+state)`/`post_decision(decision, decisions, state)` 콜백은 기본 `None`이고 실제 호출은
+있지만(인자까지 전달) 그 안에 어떤 로직도 구현하지 않았다(요청대로 "자리만").
+
+반환하는 에피소드 로그 dict: `decision_history`(각 iteration의 노드/Decision kind/target/
+reason), `judge_probabilities`(각 iteration의 `decisions`를 `.tolist()`로 python 값화한 것),
+`retry_counts`(최종 `EpisodeState.retry_counts`), `termination_reason`
+("task_graph_end"/"stop"/"max_iterations_exceeded").
+
+테스트: 신규 `tests/test_closed_loop.py`(2개) — 가짜 환경(`FakeEnv`, 매 청크 첫 스텝에서 바로
+서브태스크 종료)과 `build_tiny_policy(use_judge=True)`로 만든 tiny policy를 쓰되,
+`predict_action_chunk_with_decisions`만 몽키패치해서 Judge의 랜덤 초기화 출력에 의존하지 않고
+success_prob 시퀀스를 스크립트로 고정했다(1차 실패→2차부터 성공) — stage 6이 요구하는 "실패
+→ 남은 청크 버리고 재시도 → 성공 → 다음 노드로 → 종료" 패스를 `cancel_pending_actions` 호출
+횟수(실패 1번에만)·decision_history(`retry, advance, advance`)·`termination_reason`까지 전부
+확인한다. 두 번째 테스트는 계속 실패하면 재시도 한도를 넘겨 STOP + `env.safe_stop()`으로
+끝나는지 확인.
+
+`pytest`(75개 전부 통과 — 73 + 신규 2). 커밋 예정, 이어서 6단계(테스트+문서+최종 보고) 진행.
+
 ## 다음에 할 일
 
-5단계(`policies/smolvla/closed_loop.py`) 진행 — duck-typed 환경 프로토콜(`observe()`/
-`execute()`/`subtask_finished()`/`settle()`/`safe_stop()`)을 받는 최소 러너. 루프:
-`decision_logic.instruction_text()`로 지시문 생성 → 전처리 파이프라인 통과 →
-`predict_action_chunk_with_decisions(selector_mask=decision_logic.allowed_mask(state))`로
-액션 청크 받아 실행 → 서브태스크 종료 시 `settle()` 후 재관측 → Judge 판정 →
-`decision_logic.decide()` → 실패 시 `cancel_pending_actions()`로 남은 청크 버리고 재시도/
-복구/정지. `pre_chunk`/`per_step`/`post_decision` 콜백은 기본 `None`, 실제로 호출만 하고
-구현은 없음(이번 범위 밖). 종료 시 에피소드 로그 dict 반환 → pytest 통과(가짜 환경 + tiny
-policy) → 커밋/푸시 → 이 파일 갱신.
+6단계(테스트 보강 + `docs/closed_loop.md` + 최종 보고) 진행 — 지금까지 각 단계에서 이미
+테스트를 같이 추가해왔으므로, 6단계에서는 전체 재검토(누락된 stage-6 체크리스트 항목 확인)
++ `docs/closed_loop.md` 신설(구조도, 각 블록 역할, 플래그 표, 검증한 것/못 한 것) + README
+링크 추가 → pytest 전체 통과 → 커밋/푸시 → 최종 보고(추가/수정 파일 목록, 새 config-flag
+표, 테스트 개수 전/후, 설계가 1단계 추적 결과로 달라진 점, 실제 SmolVLM2 가중치로 아직
+검증 안 된 항목) 작성.
