@@ -219,7 +219,7 @@ SmolVLM2 백본 prefix 계산을 한 번만 공유해 Judge(성공 판정)/Selec
 - [x] 1. 코드 흐름 추적 (수정 없음)
 - [x] 2. Judge/Selector 헤드 + 단일 prefix 추론 API
 - [x] 3. 학습 손실 연결
-- [ ] 4. decision_logic.py
+- [x] 4. decision_logic.py
 - [ ] 5. closed_loop.py 러너
 - [ ] 6. 테스트 + 문서 + 최종 보고
 
@@ -381,12 +381,57 @@ Judge/Selector로 실제 파인튜닝할 때 바로 쓸 수 있게만 선반영�
 `pytest`(61개 전부 통과 — 2단계 종료 시점 58개 + 신규 3개). 세 스크립트 `--help` 정상 동작
 확인. 커밋 예정, 이어서 4단계(decision_logic.py) 진행.
 
+## 4단계: decision_logic.py
+
+신규 `policies/smolvla/decision_logic.py` — `import torch`가 전혀 없다(확인:
+`grep "^import\|^from"` 결과에 torch 없음, `tests/test_decision_logic.py`도 torch를 쓰지 않고
+돈다). 구성:
+- `TaskGraphNode`(`id`/`next`/`recoveries`/`max_retries`), `load_task_graph(dict) ->
+  dict[str, TaskGraphNode]` — plain dict(YAML에서 읽은 dict여도 그대로 통과)를 받는다.
+- `EpisodeState`(`current_node`/`completed`/`retry_counts`/`recheck_counts`).
+- `DecisionLogic(task_graph, option_vocab, tau_success=0.7, tau_fail=0.3, max_recheck=3,
+  failure_type_to_recovery=None)` — `tau_success`/`tau_fail`은 생성자 인자이고, docstring/주석에
+  "placeholder, 실제 분리 지점은 실험(Judge 캘리브레이션 곡선)으로 정해야 한다"고 명시했다.
+  `tau_fail > tau_success`면 `__init__`에서 즉시 에러.
+- `decide(decisions, state) -> Decision`(`DecisionKind` = ADVANCE/RETRY/RECOVER/RECHECK/STOP):
+  `success_prob >= tau_success` → ADVANCE(완료 목록에 추가, 다음 노드로 `state.current_node`
+  갱신, `next=None`이면 target=None으로 "종료" 신호), `< tau_fail` → 실패 처리, 그 사이 →
+  RECHECK. 실패 처리는 먼저 재시도 한도(`node.max_retries`) 초과 여부를 보고(초과 시 STOP),
+  아니면 `_choose_recovery`로 복구 동작을 고른다: `selector_probs`가 있으면 그 argmax를
+  `option_vocab`으로 역매핑해서 "안전 규칙"(해당 노드의 `recoveries`에 실제로 속하는지) 통과
+  여부를 **항상** 검사하고, 통과 못 하면(또는 Selector 자체가 없으면) `failure_probs`의
+  argmax를 `failure_type_to_recovery` rule table로 매핑 — 그 결과도 없거나 허용 안 되면
+  RETRY(같은 노드 재시도). RECHECK도 `max_recheck` 한도를 넘으면 STOP.
+- `allowed_mask(state) -> list[bool]` — `option_vocab` 중 현재 노드의 `recoveries`에 속하는
+  것만 True(2단계 `predict_action_chunk_with_decisions(selector_mask=...)`에 넘기기 전에
+  호출부가 `torch.tensor(mask, dtype=torch.bool)`로 감싸야 함 — 이 변환은 torch를 쓰는
+  `closed_loop.py`(5단계) 쪽 책임).
+- `instruction_text(goal, state) -> str` — "goal | current subtask: <node> | completed: <list>"
+  형태 문자열(1단계 추적 기록의 항목 4대로, 이 문자열은 `closed_loop.py`가
+  `complementary_data["task"]`에 넣어 기존 전처리 파이프라인에 통과시키는 용도).
+
+`decisions`/`selector_probs`/`failure_probs` 값은 torch 텐서든 plain list든 모두 받을 수
+있게 `_argmax`/`_scalar` 헬퍼가 `.item()`/`.argmax()`/`.dim()` duck-typing(있으면 쓰고
+없으면 plain list/float로 처리)으로 다룬다 — 이 파일 자체는 torch를 import하지 않는다.
+
+테스트: 신규 `tests/test_decision_logic.py`(12개, torch 미사용) — 3개 임계값 구간(ADVANCE/
+RECHECK/RETRY-or-RECOVER), 종료 노드 도달 시 target=None, 재시도/재관측 한도 초과 시 STOP,
+Selector 없이 rule table만으로 복구 동작을 고르는지, failure_probs 없으면 RETRY로 떨어지는지,
+Selector가 **허용되지 않은** 옵션을 고르면 안전 규칙이 거부하고 rule table로 대체하는지,
+허용된 옵션은 그대로 쓰는지, `allowed_mask`가 노드별 `recoveries`와 일치하는지,
+`instruction_text`에 목표/현재 서브태스크/완료 목록이 다 들어가는지, `success_prob` 없이
+`decide()`를 부르면 에러인지.
+
+`pytest`(73개 전부 통과 — 61 + 신규 12). 커밋 예정, 이어서 5단계(closed_loop.py 러너) 진행.
+
 ## 다음에 할 일
 
-4단계(`policies/smolvla/decision_logic.py`, torch 의존성 없음) 진행 — task graph dict 스키마,
-state(완료 단계/현재 노드/재시도 횟수/재관측 횟수), `decide(decisions, state) -> Decision`
-(ADVANCE/RETRY/RECOVER/RECHECK/STOP, tau_success/tau_fail 임계값은 생성자 인자로 "실험으로
-정할 placeholder"라는 주석 명시), 실패 시 Selector 결과 우선·없으면 rule table, 안전 규칙
-(허용되지 않은 전이 거부+rule table로 대체, 재시도/재관측 한도 초과→STOP), `allowed_mask(state)`,
-`instruction_text(goal, state)` → pytest 통과(새 torch-free 단위 테스트) → 커밋/푸시 → 이 파일
-갱신.
+5단계(`policies/smolvla/closed_loop.py`) 진행 — duck-typed 환경 프로토콜(`observe()`/
+`execute()`/`subtask_finished()`/`settle()`/`safe_stop()`)을 받는 최소 러너. 루프:
+`decision_logic.instruction_text()`로 지시문 생성 → 전처리 파이프라인 통과 →
+`predict_action_chunk_with_decisions(selector_mask=decision_logic.allowed_mask(state))`로
+액션 청크 받아 실행 → 서브태스크 종료 시 `settle()` 후 재관측 → Judge 판정 →
+`decision_logic.decide()` → 실패 시 `cancel_pending_actions()`로 남은 청크 버리고 재시도/
+복구/정지. `pre_chunk`/`per_step`/`post_decision` 콜백은 기본 `None`, 실제로 호출만 하고
+구현은 없음(이번 범위 밖). 종료 시 에피소드 로그 dict 반환 → pytest 통과(가짜 환경 + tiny
+policy) → 커밋/푸시 → 이 파일 갱신.
