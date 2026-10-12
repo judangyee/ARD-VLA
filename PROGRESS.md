@@ -218,7 +218,7 @@ SmolVLM2 백본 prefix 계산을 한 번만 공유해 Judge(성공 판정)/Selec
 
 - [x] 1. 코드 흐름 추적 (수정 없음)
 - [x] 2. Judge/Selector 헤드 + 단일 prefix 추론 API
-- [ ] 3. 학습 손실 연결
+- [x] 3. 학습 손실 연결
 - [ ] 4. decision_logic.py
 - [ ] 5. closed_loop.py 러너
 - [ ] 6. 테스트 + 문서 + 최종 보고
@@ -339,10 +339,54 @@ Attention 없이도 동작하는지, selector mask가 실제 정책 경로에서
 
 `pytest`(58개 전부 통과 — 기존 41 + 신규 17). 커밋 예정, 이어서 3단계(학습 손실 연결) 진행.
 
+## 3단계: 학습 손실 연결
+
+`VLAFlowMatching.forward()`(학습 경로)의 prefix forward 호출(`(_, suffix_out), _ = ...`)도
+추론 경로와 같은 이유로 손을 봤다 — `_`로 버리던 prefix 반환값을 `prefix_out`으로 받고,
+`collect_layer_indices`를 Bridge Attention과 `judge_feature_layer`(2단계의
+`_merge_collect_layer_indices` 재사용)의 합집합으로 넘긴다. `self.judge`가 있으면
+`judge_feature_layer`에 따라 `prefix_out`(마지막 레이어) 또는
+`last_collected_prefix_layers[judge_layer]`(중간 레이어)를 뽑아 `self.judge(...)`를 호출해서
+raw logit을 포함한 `judge_out`을 `ard_extras["judge_out"]`에 담는다 — **추가 prefix forward
+없음**(학습 경로도 2단계 추론 경로와 동일한 "한 번만" 보장). `use_judge=use_selector=False`면
+`judge_layer=None`이라 `_merge_collect_layer_indices`가 기존과 똑같은 `self.bridge_layer_indices`
+만 돌려주고 `judge_out=None`이라 `ard_extras`도 기존과 동일하게 구성된다 — 이 경로는 bit-exact
+회귀 테스트(`test_all_new_flags_off_matches_pre_change_baseline`)가 여전히 통과하는 것으로
+확인했다.
+
+`SmolVLAPolicy`에 `_compute_judge_losses(batch, ard_extras)` 추가 — `ard_force_target`과 같은
+"배치에 키가 있을 때만 계산, 없으면 0" 패턴: `judge_success`(0/1)→BCE(`success_logit`),
+`judge_failure_type`(int, -100 무시)→CE(`failure_logits`), `judge_progress`(0~1)→MSE
+(`progress`), `selector_target`(int)+`selector_mask`(선택, 있으면 비허용 옵션을 -inf로 마스킹
+후)→CE(`selector_logits`). 각각 `judge_loss_weight`/`selector_loss_weight`로 가중합되고,
+계산된 항목만 `loss_dict`에 로그(`judge_success_loss`/`judge_failure_type_loss`/
+`judge_progress_loss`/`selector_loss`/`judge_total_loss`) — 전부 없으면 로그 키 자체가 생기지
+않고 total loss에도 기여하지 않는다. `forward()`의 `use_ard` 분기/기본 분기 양쪽 모두
+`loss = loss + judge_loss`로 합산.
+
+테스트(`tests/test_ard_integration.py`에 3개 추가): judge_*/selector_* 배치 키가 전부
+없으면 관련 loss_dict 키가 하나도 안 생기는지, 전부 있으면(실패 유형 -100 포함, selector_mask
+포함) 전부 유한한 값으로 채워지는지, `judge_detach_features=True`일 때 **실제 backbone forward를
+통과한** judge_out으로 `judge_loss`만 단독 backward해도 `vlm_with_expert`/`action_out_proj`
+파라미터에 그래디언트가 전혀 남지 않는지(Judge 모듈 자체의 detach 단위 테스트는
+tests/test_judge.py에 이미 있어서, 여기서는 "진짜 prefix forward 경로에 꽂았을 때도" 끊기는지만
+확인).
+
+`scripts/profile_memory.py`/`compare_smolvla_ard.py`/`compare_bridge_attention.py`의 LoRA
+적용 후 수동 unfreeze 루프(ForceHead 추가 때 이미 패치됐던 자리)에 `policy.model.judge is not
+None`이면 그 파라미터도 풀어주는 블록을 추가 — 이 스크립트들엔 아직 `--use-judge` 같은 CLI
+플래그가 없어서(요청 범위 밖) 지금은 항상 `judge is None`이라 실행 동작에 변화는 없고, 나중에
+Judge/Selector로 실제 파인튜닝할 때 바로 쓸 수 있게만 선반영했다.
+
+`pytest`(61개 전부 통과 — 2단계 종료 시점 58개 + 신규 3개). 세 스크립트 `--help` 정상 동작
+확인. 커밋 예정, 이어서 4단계(decision_logic.py) 진행.
+
 ## 다음에 할 일
 
-3단계(학습 손실 연결) 진행 — `SmolVLAPolicy.forward()`에 `judge_success`/
-`judge_failure_type`/`judge_progress`/`selector_target`+`selector_mask` 손실 추가(키 없으면
-0, 기존 `ard_force_target` 패턴과 동일), `judge_detach_features=True`일 때 백본으로 그래디언트가
-안 가는지 확인하는 테스트 추가, `profile_memory.py` 등 PEFT 수동 unfreeze 루프에 Judge/Selector
-head 추가 → pytest 전체 통과 → 커밋/푸시 → 이 파일 갱신.
+4단계(`policies/smolvla/decision_logic.py`, torch 의존성 없음) 진행 — task graph dict 스키마,
+state(완료 단계/현재 노드/재시도 횟수/재관측 횟수), `decide(decisions, state) -> Decision`
+(ADVANCE/RETRY/RECOVER/RECHECK/STOP, tau_success/tau_fail 임계값은 생성자 인자로 "실험으로
+정할 placeholder"라는 주석 명시), 실패 시 Selector 결과 우선·없으면 rule table, 안전 규칙
+(허용되지 않은 전이 거부+rule table로 대체, 재시도/재관측 한도 초과→STOP), `allowed_mask(state)`,
+`instruction_text(goal, state)` → pytest 통과(새 torch-free 단위 테스트) → 커밋/푸시 → 이 파일
+갱신.

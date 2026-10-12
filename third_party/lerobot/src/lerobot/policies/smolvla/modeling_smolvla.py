@@ -470,6 +470,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
 
+        judge_loss, judge_log = self._compute_judge_losses(batch, ard_extras)
+        loss_dict.update(judge_log)
+
         if self.config.use_ard and ard_extras is not None:
             common_ard_kwargs = dict(
                 per_element_loss=ard_extras["per_element_loss"],
@@ -500,6 +503,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             if self.config.use_freq_policy:
                 loss = loss + self.config.freq_lambda * ard_extras["freq_loss"]
                 loss_dict["freq_consistency_loss"] = ard_extras["freq_loss"].item()
+            loss = loss + judge_loss
             loss_dict["loss"] = loss.item()
             # 로깅 키에 모드가 구분되게: ARD(비대칭)/대칭 대조군이 같은 loss_dict 스키마를
             # 공유하되(train_ard.py 등 기존 로깅 코드를 그대로 쓸 수 있도록), ard_mode로 어느
@@ -527,8 +531,60 @@ class SmolVLAPolicy(PreTrainedPolicy):
         if self.config.use_freq_policy and ard_extras is not None:
             loss = loss + self.config.freq_lambda * ard_extras["freq_loss"]
             loss_dict["freq_consistency_loss"] = ard_extras["freq_loss"].item()
+        loss = loss + judge_loss
         loss_dict["loss"] = loss.item()
         return loss, loss_dict
+
+    def _compute_judge_losses(self, batch: dict[str, Tensor], ard_extras: dict | None) -> tuple[Tensor, dict]:
+        """`judge_success`/`judge_failure_type`/`judge_progress`/`selector_target`(+
+        `selector_mask`) 배치 키가 있을 때만 해당 손실을 계산한다 — 없으면 0(기존
+        `ard_force_target` 처리와 같은 "키 없으면 0" 패턴). `use_judge`/`use_selector`가 둘 다
+        꺼져 있으면(`ard_extras`에 `judge_out`이 없으면) 항상 0이다."""
+        log: dict[str, float] = {}
+        judge_out = ard_extras.get("judge_out") if ard_extras is not None else None
+        if not judge_out:
+            return torch.zeros((), device=next(self.model.parameters()).device), log
+
+        device = next(iter(judge_out.values())).device
+        total = torch.zeros((), device=device)
+
+        judge_success = batch.get("judge_success")
+        if judge_success is not None and "success_logit" in judge_out:
+            success_logit = judge_out["success_logit"]
+            bce = F.binary_cross_entropy_with_logits(
+                success_logit, judge_success.to(dtype=success_logit.dtype, device=device)
+            )
+            total = total + self.config.judge_loss_weight * bce
+            log["judge_success_loss"] = bce.item()
+
+        judge_failure_type = batch.get("judge_failure_type")
+        if judge_failure_type is not None and "failure_logits" in judge_out:
+            ce = F.cross_entropy(
+                judge_out["failure_logits"], judge_failure_type.to(device=device).long(), ignore_index=-100
+            )
+            total = total + self.config.judge_loss_weight * ce
+            log["judge_failure_type_loss"] = ce.item()
+
+        judge_progress = batch.get("judge_progress")
+        if judge_progress is not None and "progress" in judge_out:
+            progress = judge_out["progress"]
+            mse = F.mse_loss(progress, judge_progress.to(dtype=progress.dtype, device=device))
+            total = total + self.config.judge_loss_weight * mse
+            log["judge_progress_loss"] = mse.item()
+
+        selector_target = batch.get("selector_target")
+        if selector_target is not None and "selector_logits" in judge_out:
+            selector_logits = judge_out["selector_logits"]
+            selector_mask = batch.get("selector_mask")
+            if selector_mask is not None:
+                selector_logits = selector_logits.masked_fill(~selector_mask.to(device=device).bool(), float("-inf"))
+            ce = F.cross_entropy(selector_logits, selector_target.to(device=device).long(), ignore_index=-100)
+            total = total + self.config.selector_loss_weight * ce
+            log["selector_loss"] = ce.item()
+
+        if log:
+            log["judge_total_loss"] = total.item()
+        return total, log
 
     def prepare_images(self, batch):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
@@ -1006,14 +1062,16 @@ class VLAFlowMatching(nn.Module):
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
+        judge_layer = self.config.judge_feature_layer if self.judge is not None else None
+        collect_layer_indices = self._merge_collect_layer_indices(self.bridge_layer_indices, judge_layer)
+        (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
             fill_kv_cache=False,
-            collect_layer_indices=self.bridge_layer_indices,
+            collect_layer_indices=collect_layer_indices,
         )
         bridge_kv_layers = None
         if self.bridge_layer_indices is not None:
@@ -1022,6 +1080,15 @@ class VLAFlowMatching(nn.Module):
             # 백본이 bf16으로 도는 경우(vlm_model_name 로드 시 torch_dtype="bfloat16")를 대비해
             # suffix_out과 동일하게 명시적으로 fp32로 올려준다.
             bridge_kv_layers = [collected[i].to(dtype=torch.float32) for i in self.bridge_layer_indices]
+
+        judge_out = None
+        if self.judge is not None:
+            # 추론 경로(sample_actions_with_decisions)와 동일하게, judge_feature_layer=-1이면
+            # 이 forward가 이미 계산한 prefix 마지막 레이어(post-norm) hidden state를 그대로
+            # 쓰고, 그 외엔 Bridge Attention과 같은 collect_layer_indices 경로로 중간 레이어
+            # (pre-norm)를 뽑는다 — 추가 prefix forward 없음.
+            judge_hidden = prefix_out if judge_layer == -1 else self.vlm_with_expert.last_collected_prefix_layers[judge_layer]
+            judge_out = self.judge(judge_hidden.to(dtype=torch.float32), prefix_pad_masks)
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
@@ -1050,12 +1117,17 @@ class VLAFlowMatching(nn.Module):
         losses = F.mse_loss(u_t, v_t, reduction="none")
 
         # use_ard와 무관하게 켤 수 있으므로, ard_extras가 None이 아니게 되는 조건에
-        # use_freq_policy도 포함시킨다 — SmolVLAPolicy.forward()가 이 dict에서 "freq_loss"
+        # use_freq_policy/judge도 포함시킨다 — SmolVLAPolicy.forward()가 이 dict에서 "freq_loss"
         # 키를 읽어 total loss에 더한다(lerobot.policies.smolvla.freq_policy 참고).
-        if self.config.use_ard or self.config.use_freq_policy:
+        if self.config.use_ard or self.config.use_freq_policy or judge_out is not None:
             ard_extras = {}
         else:
             ard_extras = None
+
+        if judge_out is not None:
+            # Judge/Selector 손실(judge_success/judge_failure_type/judge_progress/
+            # selector_target)이 읽는 raw logit — SmolVLAPolicy.forward() 참고.
+            ard_extras["judge_out"] = judge_out
 
         if self.config.use_freq_policy:
             ard_extras["freq_loss"] = compute_frequency_consistency_loss(v_t, u_t, decay=self.config.freq_decay)

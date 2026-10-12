@@ -269,3 +269,74 @@ def test_cancel_pending_actions_clears_action_queue(build_tiny_policy, build_tin
 
     policy.cancel_pending_actions()
     assert len(policy._queues["action"]) == 0
+
+
+# --- 3단계: 학습 손실 연결(judge_success/judge_failure_type/judge_progress/selector_target) ---
+
+
+def test_judge_losses_absent_when_batch_keys_missing(build_tiny_policy, build_tiny_batch):
+    """use_judge=use_selector=True여도 배치에 judge_*/selector_* 키가 없으면 그 손실들은
+    전혀 기여하지 않아야 한다(기존 ard_force_target과 같은 "키 없으면 0" 패턴) — loss_dict에
+    judge_total_loss 등 관련 키가 아예 생기지 않는다."""
+    policy = build_tiny_policy(
+        use_judge=True, judge_num_failure_types=3, judge_use_progress=True,
+        use_selector=True, selector_num_options=4,
+    )
+    policy.train()
+    batch = build_tiny_batch(batch_size=2, chunk=8, lang_len=6)  # judge_*/selector_* 키 없음
+
+    loss, loss_dict = policy.forward(batch)
+    assert torch.isfinite(loss)
+    for key in ("judge_success_loss", "judge_failure_type_loss", "judge_progress_loss", "selector_loss", "judge_total_loss"):
+        assert key not in loss_dict
+
+
+def test_judge_losses_present_and_finite_when_batch_keys_given(build_tiny_policy, build_tiny_batch):
+    policy = build_tiny_policy(
+        use_judge=True, judge_num_failure_types=3, judge_use_progress=True,
+        use_selector=True, selector_num_options=4,
+    )
+    policy.train()
+    batch = build_tiny_batch(batch_size=2, chunk=8, lang_len=6)
+    batch["judge_success"] = torch.tensor([1.0, 0.0])
+    batch["judge_failure_type"] = torch.tensor([1, -100])  # -100은 무시돼야 함
+    batch["judge_progress"] = torch.tensor([0.8, 0.2])
+    batch["selector_target"] = torch.tensor([0, 2])
+    batch["selector_mask"] = torch.tensor([[True, True, False, False], [True, True, True, True]])
+
+    loss, loss_dict = policy.forward(batch)
+    assert torch.isfinite(loss)
+    for key in ("judge_success_loss", "judge_failure_type_loss", "judge_progress_loss", "selector_loss", "judge_total_loss"):
+        assert key in loss_dict
+        assert loss_dict[key] == loss_dict[key]  # NaN이 아님
+
+
+def test_judge_detach_features_blocks_backbone_gradient(build_tiny_policy, build_tiny_batch):
+    """judge_detach_features=True(기본)면 judge_success 손실 단독의 backward가 백본
+    (vlm_with_expert)/action expert(action_out_proj) 파라미터에 그래디언트를 전혀 남기지
+    않아야 한다. 실제 backbone forward를 통과한(진짜 계산 그래프가 연결된) judge_out으로
+    확인한다 — Judge 모듈 자체의 detach 동작은 tests/test_judge.py에서 이미 합성 텐서로
+    확인했고, 여기서는 "진짜 prefix forward 경로에 꽂았을 때도" 역전파가 끊기는지를 본다."""
+    from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
+
+    policy = build_tiny_policy(use_judge=True, judge_detach_features=True, num_steps=2)
+    policy.train()
+    batch = build_tiny_batch(batch_size=2, chunk=8, lang_len=6)
+    batch["judge_success"] = torch.tensor([1.0, 0.0])
+
+    images, img_masks = policy.prepare_images(batch)
+    state = policy.prepare_state(batch)
+    lang_tokens = batch[OBS_LANGUAGE_TOKENS]
+    lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
+    actions = policy.prepare_action(batch)
+
+    _, ard_extras = policy.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions)
+    judge_loss, judge_log = policy._compute_judge_losses(batch, ard_extras)
+    assert "judge_success_loss" in judge_log
+    assert judge_loss.requires_grad
+
+    policy.zero_grad()
+    judge_loss.backward()
+
+    assert all(p.grad is None for p in policy.model.vlm_with_expert.parameters())
+    assert all(p.grad is None for p in policy.model.action_out_proj.parameters())

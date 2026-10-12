@@ -216,6 +216,15 @@ def apply_lora(policy: SmolVLAPolicy, args) -> SmolVLAPolicy:
                 n += p.numel()
         logging.info("LoRA 적용 후 AsymmetricResidualHeads(+ForceHead) %d개 파라미터를 다시 학습 가능하게 풀었습니다.", n)
 
+    if policy.model.judge is not None:
+        # Judge/Selector head도 ARD head와 같은 이유로 LoRA 기본 target_modules에 없어서 얼어붙는다
+        # — use_judge/use_selector로 프로파일링할 때 다시 풀어준다.
+        n_judge = 0
+        for p in policy.model.judge.parameters():
+            p.requires_grad_(True)
+            n_judge += p.numel()
+        logging.info("LoRA 적용 후 Judge/Selector head %d개 파라미터를 다시 학습 가능하게 풀었습니다.", n_judge)
+
     # print_trainable_parameters()는 반드시 위 ARD head 재활성화 *이후*에 호출한다 — 먼저
     # 부르면(예전 코드가 그랬음) LoRA 타겟만 반영된 숫자가 찍혀서, use_bridge_attention=True일 때
     # BridgeAttention 파라미터(수백만 개)가 통째로 빠진 걸로 착각하기 쉽다.

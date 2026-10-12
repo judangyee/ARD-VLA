@@ -169,6 +169,13 @@ def apply_lora(policy: SmolVLAPolicy, args, use_ard: bool) -> None:
                 n += p.numel()
         logging.info("LoRA 적용 후 AsymmetricResidualHeads(+ForceHead) %d개 파라미터를 다시 학습 가능하게 풀었습니다.", n)
 
+    if policy.model.judge is not None:
+        n_judge = 0
+        for p in policy.model.judge.parameters():
+            p.requires_grad_(True)
+            n_judge += p.numel()
+        logging.info("LoRA 적용 후 Judge/Selector head %d개 파라미터를 다시 학습 가능하게 풀었습니다.", n_judge)
+
 
 def build_dummy_batch(policy: SmolVLAPolicy, args, variant: dict, batch_size: int, device: torch.device) -> dict:
     config = policy.config
