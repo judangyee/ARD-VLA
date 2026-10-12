@@ -128,6 +128,20 @@ ARD head가 action expert의 마지막 지점 출력(`suffix_out`) 하나만 보
 로직, gradient 흐름, K_final 스윕 검증은 **[docs/token_pruning.md](docs/token_pruning.md)**
 에 있습니다.
 
+## 폐루프 구조: Judge/Selector + 결정 로직 (`--use-judge`/`--use-selector`)
+
+SmolVLA(+ARD)를 "한 번 추론" 대신, 서브태스크마다 성공/실패를 스스로 판정(Judge)하고 다음
+행동(Selector + 순수 Python 결정 로직)을 고르는 폐루프 시스템으로 확장하는 구조입니다. 하나의
+SmolVLM2 prefix forward를 Judge/Selector/action expert가 공유해서 추가 연산이 들지 않습니다.
+전부 기본 꺼짐이고, 꺼져 있으면 기존과 bit-for-bit 동일합니다. 구조도, 플래그 표, 배치 키,
+검증된 것/아직 확인되지 않은 것은 **[docs/closed_loop.md](docs/closed_loop.md)** 에 있습니다
+— 이번 작업은 구조 구현만이고, 실제 Judge/Selector 학습 데이터 생성·학습·임계값 캘리브레이션은
+범위 밖입니다.
+
+```bash
+pytest tests/test_judge.py tests/test_ard_integration.py tests/test_decision_logic.py tests/test_closed_loop.py
+```
+
 ## 학습 (로컬 GPU 환경)
 
 lerobot의 범용 학습 CLI(`lerobot_train.py`)는 모든 정책을 알아야 하는 `policies/factory.py`에
@@ -197,9 +211,12 @@ python scripts/train_ard.py --dataset-repo-id <...> \
   - `src/lerobot/policies/smolvla/ard.py` — ARD heads/losses, `ForceHead`, GradNorm, Bridge Attention, 대칭 대조군 손실.
   - `src/lerobot/policies/smolvla/freq_policy.py` — FreqPolicy 주파수 일관성 손실.
   - `src/lerobot/policies/smolvla/token_pruning.py` — 비전 토큰 프루닝.
+  - `src/lerobot/policies/smolvla/judge.py` — 폐루프 구조의 Judge/Selector head.
+  - `src/lerobot/policies/smolvla/decision_logic.py` — 폐루프 구조의 결정 로직(torch 의존성 없음).
+  - `src/lerobot/policies/smolvla/closed_loop.py` — 폐루프 구조의 환경-무관 러너.
   - `src/lerobot/policies/smolvla/configuration_smolvla.py` / `modeling_smolvla.py` — 위 기능들을 켜고 끄는 config 플래그와 forward/추론 연결 지점.
-- `tests/` — pytest 테스트 전부(`test_ard.py`, `test_ard_integration.py`, `test_freq_policy.py`, `test_token_pruning.py`, `test_env.py`, `conftest.py`의 합성 SmolVLM fixture 포함).
+- `tests/` — pytest 테스트 전부(`test_ard.py`, `test_ard_integration.py`, `test_freq_policy.py`, `test_token_pruning.py`, `test_judge.py`, `test_decision_logic.py`, `test_closed_loop.py`, `test_env.py`, `conftest.py`의 합성 SmolVLM fixture 포함).
 - `pytest.ini` — `pytest` 루트 실행 설정(`testpaths=tests`, `requires_hub` 마커).
 - `.github/workflows/tests.yml` — CPU 전용 pytest CI.
-- `docs/` — 기능별 상세 설계/사용법/검증 기록(`ard.md`, `bridge_attention.md`, `freq_policy.md`, `token_pruning.md`, `profiling_tools.md`).
+- `docs/` — 기능별 상세 설계/사용법/검증 기록(`ard.md`, `bridge_attention.md`, `freq_policy.md`, `token_pruning.md`, `profiling_tools.md`, `closed_loop.md`).
 - `PROGRESS.md` — 멀티세션 작업 진행 기록(사용량 한도로 세션이 끊겨도 다음 세션이 이어갈 수 있도록).

@@ -221,7 +221,7 @@ SmolVLM2 백본 prefix 계산을 한 번만 공유해 Judge(성공 판정)/Selec
 - [x] 3. 학습 손실 연결
 - [x] 4. decision_logic.py
 - [x] 5. closed_loop.py 러너
-- [ ] 6. 테스트 + 문서 + 최종 보고
+- [x] 6. 테스트 + 문서 + 최종 보고
 
 ## 현재 상태
 
@@ -470,11 +470,27 @@ success_prob 시퀀스를 스크립트로 고정했다(1차 실패→2차부터 
 
 `pytest`(75개 전부 통과 — 73 + 신규 2). 커밋 예정, 이어서 6단계(테스트+문서+최종 보고) 진행.
 
+## 6단계: 테스트 재검토 + 문서 + 최종 보고
+
+스펙의 stage-6 체크리스트 6개 항목을 2~5단계에서 이미 단계별로 테스트를 추가해왔던 것과
+대조 확인(전부 커버됨, 추가 테스트 없이 통과): 플래그 off → bit-exact, prefix forward
+정확히 한 번, 출력 shape/확률 범위/temperature/selector masking, 손실 키 유무에 따른
+0/유한값/detach-gradient, 결정 로직 3구간/재시도 한도/전이 거부/rule table, 폐루프 러너
+실패→재시도→성공→종료 패스 — 전부 `tests/test_judge.py`/`tests/test_ard_integration.py`/
+`tests/test_decision_logic.py`/`tests/test_closed_loop.py`에 있음.
+
+신규 `docs/closed_loop.md` — 구조도(ASCII), 각 블록(Judge/Selector/결정 로직/action
+expert/러너) 역할, 설정 플래그 표(10개), 학습 배치 키 표(5개), 새/수정 파일 목록, "검증한
+것 / 못 한 것" 절(기존 docs/*.md와 같은 관례). README.md에 "폐루프 구조" 절 추가(플래그
+요약 + 문서 링크 + pytest 커맨드) + Layout 절에 새 파일 3개(`judge.py`/`decision_logic.py`/
+`closed_loop.py`) + 새 테스트 3개 + `docs/closed_loop.md` 반영.
+
+`pytest`(75개, 변화 없음 — 이번 단계는 문서화만), `python scripts/check_env.py` 재확인(코드
+변경 없음 재확인 목적).
+
 ## 다음에 할 일
 
-6단계(테스트 보강 + `docs/closed_loop.md` + 최종 보고) 진행 — 지금까지 각 단계에서 이미
-테스트를 같이 추가해왔으므로, 6단계에서는 전체 재검토(누락된 stage-6 체크리스트 항목 확인)
-+ `docs/closed_loop.md` 신설(구조도, 각 블록 역할, 플래그 표, 검증한 것/못 한 것) + README
-링크 추가 → pytest 전체 통과 → 커밋/푸시 → 최종 보고(추가/수정 파일 목록, 새 config-flag
-표, 테스트 개수 전/후, 설계가 1단계 추적 결과로 달라진 점, 실제 SmolVLM2 가중치로 아직
-검증 안 된 항목) 작성.
+없음 — 요청한 6단계(코드 구조 + 단위 테스트 + 문서) 전부 완료. 최종 보고는 세션 응답에 남김.
+실제 Judge/Selector 학습 데이터 생성·학습·임계값/온도 캘리브레이션 실측, 실제 로봇/시뮬레이터
+환경에 `ClosedLoopEnv` 프로토콜 구현, 실제 SmolVLM2 가중치로의 검증은 전부 범위 밖으로
+남겨뒀다 — `docs/closed_loop.md`의 "검증한 것 / 못 한 것" 참고.
