@@ -131,12 +131,14 @@ ARD head가 action expert의 마지막 지점 출력(`suffix_out`) 하나만 보
 ## 폐루프 구조: Judge/Selector + 결정 로직 (`--use-judge`/`--use-selector`)
 
 SmolVLA(+ARD)를 "한 번 추론" 대신, 서브태스크마다 성공/실패를 스스로 판정(Judge)하고 다음
-행동(Selector + 순수 Python 결정 로직)을 고르는 폐루프 시스템으로 확장하는 구조입니다. 하나의
-SmolVLM2 prefix forward를 Judge/Selector/action expert가 공유해서 추가 연산이 들지 않습니다.
-전부 기본 꺼짐이고, 꺼져 있으면 기존과 bit-for-bit 동일합니다. 구조도, 플래그 표, 배치 키,
-검증된 것/아직 확인되지 않은 것은 **[docs/closed_loop.md](docs/closed_loop.md)** 에 있습니다
-— 이번 작업은 구조 구현만이고, 실제 Judge/Selector 학습 데이터 생성·학습·임계값 캘리브레이션은
-범위 밖입니다.
+행동(Selector + 순수 Python 결정 로직)을 고르는 폐루프 시스템으로 확장하는 구조입니다. 매
+control cycle마다 SmolVLM2 prefix forward를 Judge/Selector/action expert가 한 번만 공유하고
+(청크당 1회 — 노드/복구 전이처럼 지시문이 바뀌는 경계에서만 다음 cycle에 한 번 더 forward),
+판정은 항상 그 cycle에서 실행한 결과를 반영한 **실행 후** 관측으로 이뤄집니다. 전부 기본
+꺼짐이고, 꺼져 있으면 기존과 bit-for-bit 동일합니다. 구조도, 플래그 표, 배치 키, 판정
+시점/forward 횟수 규칙, 검증된 것/아직 확인되지 않은 것은
+**[docs/closed_loop.md](docs/closed_loop.md)** 에 있습니다 — 이번 작업은 구조 구현만이고,
+실제 Judge/Selector 학습 데이터 생성·학습·임계값 캘리브레이션은 범위 밖입니다.
 
 ```bash
 pytest tests/test_judge.py tests/test_ard_integration.py tests/test_decision_logic.py tests/test_closed_loop.py

@@ -49,10 +49,39 @@ SmolVLA(+ARD)를 "한 번 추론하고 끝"이 아니라, 매 서브태스크마
 - **Action expert** — 기존 SmolVLA(+ARD) 그대로. Judge/Selector 때문에 구조나 손실이 바뀌지
   않습니다.
 - **폐루프 러너** (`policies/smolvla/closed_loop.py`의 `run_closed_loop`) — 환경을 duck
-  typing 프로토콜(`observe`/`execute`/`subtask_finished`/`settle`/`safe_stop`)로만 받는
-  최소 루프. `predict_action_chunk_with_decisions`를 iteration마다 한 번 호출해서 "지금
-  실행할 액션 청크"와 "지금 관측치에 대한 Judge/Selector 판정"을 동시에 얻고, 그 판정을
-  `DecisionLogic.decide()`에 넘겨 다음 행동을 정합니다.
+  typing 프로토콜(`observe`/`execute`/`subtask_finished`/`settle`/`safe_stop`, 선택적
+  `run_recovery`)로만 받는 최소 루프. 매 iteration마다 `predict_action_chunk_with_decisions`를
+  **정확히 한 번** 호출해서 "지금 실행할 액션 청크"와 "지금 관측치에 대한 Judge/Selector
+  판정"을 동시에 얻지만, **판정에 실제로 쓰는지는 `need_judgment` 플래그로 따로 관리**합니다 —
+  아래 "판정 시점과 prefix forward 횟수" 참고.
+
+### 판정 시점과 prefix forward 횟수
+
+서브태스크가 아직 끝나지 않았으면(`need_judgment=False`) 이번 forward의 `decisions`는 판정에
+쓰지 않고 `actions`로 다음 청크를 그냥 실행합니다 — 여러 청크짜리 서브태스크를 청크 경계마다
+실패로 오판하지 않습니다. 서브태스크가 끝나면(`env.subtask_finished()` 또는
+`max_subtask_steps` 초과) `env.settle()`을 부르고 `need_judgment=True`로 표시합니다. **다음**
+iteration은 새로 `env.observe()`(=방금 끝난 서브태스크의 결과를 반영한 관측)로 forward를
+돌리고, 그 `decisions`로 `decide()`를 부릅니다 — 즉 판정은 항상 **실행 후** 관측을 본다
+(이전 버전은 실행 *전* 관측으로 판정해서 한 박자 늦었던 버그가 있었습니다).
+
+매 iteration은 여전히 forward를 정확히 한 번만 부르므로(로그의 `forward_calls`가 매
+iteration 1), 결정이 "경계"를 넘는 데 forward가 몇 번 쓰이는지는 iteration 수로 환산됩니다:
+- 서브태스크 진행 중(판정 없음, 청크 경계): 청크당 1회.
+- `RETRY`(같은 지시문으로 재시도): 이번 forward의 `actions`를 그대로 재사용 — 경계당 1회
+  (판정한 iteration과 재시도를 실행하는 iteration이 같음, 추가 forward 없음).
+- `ADVANCE`(다음 노드) 또는 `RECOVER`(복구 실행): 지시문/환경이 바뀌므로 다음 iteration에서
+  다시 관측+forward — 경계당 2회(판정 iteration + 재forward iteration).
+- `RECHECK`: 행동 실행 없이 `env.settle()` 후 다시 관측+forward+판정 — 매 RECHECK마다 1회씩
+  쌓임.
+
+`RECOVER`는 `env.run_recovery(recovery_id)`(선택 메서드)를 실제로 호출합니다. 환경이
+`run_recovery`를 구현하지 않았으면 경고를 내고 `RETRY`와 똑같이 처리하며(추가 forward
+없음), `decision_history`의 해당 항목에 `recovery_unsupported=True`를 남깁니다 — 실제 복구
+동작 구현은 환경 쪽 스크립트의 몫으로 남겨둔 것입니다.
+
+액션 실행 직전에는 `postprocessor`(있으면)를 적용해서 역정규화합니다 — `pre_chunk` 훅은
+역정규화 **전** 값을 받습니다(모델 공간 그대로).
 
 ## 설정 플래그
 
@@ -88,7 +117,8 @@ SmolVLA(+ARD)를 "한 번 추론하고 끝"이 아니라, 매 서브태스크마
 - `policies/smolvla/judge.py` (신규) — `Judge` nn.Module.
 - `policies/smolvla/decision_logic.py` (신규, torch 의존성 없음) — `DecisionLogic`,
   `EpisodeState`, `Decision`/`DecisionKind`.
-- `policies/smolvla/closed_loop.py` (신규) — `run_closed_loop`, `ClosedLoopEnv` 프로토콜.
+- `policies/smolvla/closed_loop.py` (신규) — `run_closed_loop`, `ClosedLoopEnv` 프로토콜
+  (+ 선택적 `run_recovery`), `postprocessor`/`max_subtask_steps` 인자.
 - `configuration_smolvla.py` — 위 플래그 전부 추가.
 - `modeling_smolvla.py` — `VLAFlowMatching.judge`, `sample_actions_with_decisions()`(추론),
   학습 `forward()`의 prefix forward에 Judge 연결, `SmolVLAPolicy.predict_action_chunk_with_decisions()`/
@@ -114,7 +144,13 @@ SmolVLA(+ARD)를 "한 번 추론하고 끝"이 아니라, 매 서브태스크마
 - 결정 로직: 3개 임계값 구간, 재시도/재관측 한도 초과 → STOP, 허용되지 않은 Selector 선택
   거부 후 rule table로 대체, Selector 없이 rule table만으로도 동작.
 - 폐루프 러너: 가짜 환경 + tiny policy로 "실패 → `cancel_pending_actions()`로 청크 버림 →
-  재시도 → 성공 → 다음 노드로 → 종료" 한 번의 전체 패스.
+  재시도 → 성공 → 다음 노드로 → 종료" 한 번의 전체 패스. 판정이 실행 *후* 관측을 쓰는지
+  (obs_id로 직접 확인), 서브태스크가 청크 여러 개에 걸칠 때 중간 청크 뒤에는 판정/settle이
+  안 일어나는지, `RECOVER`가 `env.run_recovery()`를 실제로 부르는지(없으면 경고+RETRY로
+  대체하고 `recovery_unsupported=True`를 남기는지), `RECHECK`이 행동 실행 없이 재관측만
+  하는지, `postprocessor`가 실행 직전에 적용되는지(`pre_chunk`는 그 전 값을 받는지),
+  `max_subtask_steps` 초과 시 판정으로 넘어가는지, `forward_calls`/`judged` 로그가 iteration별
+  실제 횟수와 일치하는지까지 전부 확인.
 - `cancel_pending_actions()`가 `select_action()`이 채운 `_queues[ACTION]`을 실제로 비움.
 
 **못 함 (이번 작업 범위 밖, 구조만 있고 실측 없음)**:
@@ -127,6 +163,10 @@ SmolVLA(+ARD)를 "한 번 추론하고 끝"이 아니라, 매 서브태스크마
   실제 로직은 구현하지 않았습니다.
 - `closed_loop.py`의 러너는 액션 청크를 큐에 쌓지 않고 한 번에 다 실행합니다 — 실시간
   스트리밍 실행(select_action류의 큐 기반, 또는 RTC와의 조합)으로 바꾸는 건 범위 밖입니다.
+- `RECOVER`의 실제 복구 동작(`env.run_recovery()`)은 환경 쪽에서 구현해야 합니다 — 이 러너는
+  호출만 하고, 복구 동작 자체(로봇을 어떻게 움직여 재정렬/재파지할지)는 만들지 않았습니다.
+- `max_subtask_steps`는 task graph 노드별이 아니라 러너 레벨 단일 값입니다(YAGNI — 노드별
+  예산이 실제로 필요해지면 그때 `TaskGraphNode`에 필드를 추가하면 됩니다).
 - 실제 로봇/시뮬레이터 환경에 `ClosedLoopEnv` 프로토콜을 구현해서 end-to-end로 돌려본 적이
   없습니다(지금까지는 전부 가짜 환경).
 - 실제 SmolVLM2 가중치(Hub 접근)로 Judge의 `judge_feature_layer`별 특징 품질을 비교해본 적이

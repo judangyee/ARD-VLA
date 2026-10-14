@@ -494,3 +494,79 @@ expert/러너) 역할, 설정 플래그 표(10개), 학습 배치 키 표(5개),
 실제 Judge/Selector 학습 데이터 생성·학습·임계값/온도 캘리브레이션 실측, 실제 로봇/시뮬레이터
 환경에 `ClosedLoopEnv` 프로토콜 구현, 실제 SmolVLM2 가중치로의 검증은 전부 범위 밖으로
 남겨뒀다 — `docs/closed_loop.md`의 "검증한 것 / 못 한 것" 참고.
+
+---
+
+# closed_loop.py 러너 수정 (리뷰 피드백 반영)
+
+6단계 완료 후 리뷰에서 4개 문제가 확인됐다: (1) 판정이 한 박자 늦음(실행 전 관측으로
+판정), (2) 청크=서브태스크로 혼동(여러 청크짜리 서브태스크를 청크마다 판정·실패 오판),
+(3) RECOVER 결정이 실제로 실행되지 않음, (4) 행동 역정규화(postprocessor) 없음. `judge.py`/
+`decision_logic.py`의 판정·결정 규칙 자체는 바꾸지 않았다(요청대로) — `closed_loop.py`만
+재작성.
+
+## 설계
+
+`need_judgment` 플래그로 "이번에 받은 decisions를 판정에 쓸지"를 명시적으로 관리한다. 매
+iteration은 여전히 `predict_action_chunk_with_decisions`를 정확히 한 번 부르지만:
+- `need_judgment=False`(서브태스크 진행 중)면 이번 decisions는 버리고 actions로 다음 청크만
+  실행한다 — 여러 청크짜리 서브태스크가 중간에 실패로 오판되지 않는다.
+- 서브태스크가 끝나면(`env.subtask_finished()` 또는 `max_subtask_steps` 초과) `env.settle()`
+  후 `need_judgment=True`로 표시한다.
+- **다음** iteration이 새로 관측(=방금 끝난 서브태스크의 결과 반영)+forward해서 그
+  decisions로 `decide()`를 부른다 — 판정이 항상 실행 *후* 관측을 본다.
+
+결정별 처리:
+- `STOP`/`ADVANCE(target=None)` — 즉시 종료.
+- `RECHECK` — 행동 실행 없이 `env.settle()` 후 `continue`(need_judgment는 True 유지, 다음
+  iteration에서 또 판정).
+- `RECOVER` — `env.run_recovery(target)`(선택 메서드)를 실제로 호출 + `env.settle()` 후
+  `continue`(지시문/환경이 바뀌었으니 다시 forward). 환경에 `run_recovery`가 없으면
+  (`hasattr` 체크) `warnings.warn()` 후 `RETRY`와 동일하게 처리하고(추가 forward 없음)
+  `decision_history`에 `recovery_unsupported=True`를 남긴다 — NotImplementedError로 죽이지
+  않는다(사용자 지시대로, 실제 복구 구현은 환경 쪽 스크립트 몫).
+- `RETRY` — 지시문이 같으므로 이번 forward의 actions를 그대로 실행(`continue` 없음, 추가
+  forward 없음).
+- `RETRY`/`RECOVER`/`RECHECK` 공통: `policy.cancel_pending_actions()` 호출.
+
+실행 단계는 `pre_chunk` 훅(역정규화 전 raw actions) → `postprocessor(actions)`(신규 인자,
+역정규화) → `_execute_chunk`(신규: `max_subtask_steps`의 남은 예산을 받아 그만큼만 실행하고,
+`(실행한 스텝 수, env.subtask_finished()로 끝났는지)`를 돌려줌) 순서. 서브태스크 스텝 예산
+초과(`budget_exceeded`)도 `env.subtask_finished()`와 동일하게 "서브태스크 종료"로 취급한다.
+
+`max_subtask_steps`는 **task graph 노드별 필드가 아니라 러너 레벨 단일 인자**로 뒀다
+(ponytail: YAGNI — 노드별 예산이 실제로 필요해지면 그때 `TaskGraphNode`에 필드를 추가하면
+된다). `decision_logic.py`는 이 변경 때문에 전혀 손대지 않았다 — `decide()`는 여전히
+"판정이 실제로 일어날 때 한 번 호출된다"는 전제만 필요하고, 그 호출 빈도가 iteration 대비
+어떻게 분포하는지는 `decision_logic.py`가 알 필요가 없다.
+
+로그에 `forward_calls`(iteration마다 항상 1 — 매 iteration이 정확히 한 번만 forward하므로)와
+`judged`(그 iteration에서 실제로 판정이 일어났는지)를 추가했다. "경계당 forward 몇 번"은
+이 리스트를 합산해서 알 수 있다: 서브태스크 진행 중(판정 없음)은 청크당 1, `RETRY` 경계는
+1(판정+실행이 같은 iteration), `ADVANCE`/`RECOVER` 경계는 2(판정 iteration + 재forward
+iteration), `RECHECK`는 호출마다 1씩 쌓인다.
+
+## 테스트
+
+`tests/test_closed_loop.py`를 전면 재작성(10개): 기존 2개(전체 패스/재시도한도)를 새 루프
+흐름에 맞게 갱신하고(한쪽은 `forward_calls`/`judged` 로그까지 정확히 검증), 8개 신규 —
+①판정이 실행 후 관측(obs_id로 직접 확인)을 쓰는지, ②청크 3개짜리 서브태스크에서 앞 두
+청크 뒤에는 `decide()`/`settle()`이 불리지 않는지, ③`RECOVER`가 `env.run_recovery(id)`를
+실제로 부르고 같은 노드를 재시도하는지, ④`run_recovery`가 없는 환경에서 경고+`RETRY`
+대체+`recovery_unsupported` 로그, ⑤`RECHECK`이 행동 실행 없이 재판정만 하는지(+재관측
+한도 초과 시 STOP), ⑥`postprocessor`가 실행 직전에 적용되고 `pre_chunk`는 그 전 값을
+받는지, ⑦`max_subtask_steps` 초과 시 판정으로 넘어가는지. 전부 `FakeEnv`(obs_id 카운터,
+`finish_after`로 "청크 1개=서브태스크"와 "여러 청크짜리 서브태스크" 둘 다 표현,
+`support_recovery` 플래그로 `run_recovery` 유무 전환) + `predict_action_chunk_with_decisions`
+몽키패치 스텁(호출 순번별로 success_prob/failure_probs를 스크립트로 고정)으로 Judge의 실제
+랜덤 초기화 출력에 의존하지 않는다.
+
+`pytest`(83개 전부 통과 — 75 + 신규 8, 기존 2개는 갱신). `docs/closed_loop.md`/README의
+"prefix forward 1회" 설명을 "청크당 1회, 경계에 따라 1~2회"로 정정하고, `closed_loop.py`
+모듈 docstring도 전면 재작성.
+
+## 다음에 할 일
+
+없음 — 요청한 4개 문제(판정 시점/청크-서브태스크 구분/RECOVER 실행/역정규화) 전부 해결,
+pytest 전체 통과, 문서 정정 완료. 실제 환경에 `run_recovery()`를 구현하는 것, 실제
+SmolVLM2 가중치로 판정 시점 수정의 효과를 확인하는 것은 여전히 범위 밖.
