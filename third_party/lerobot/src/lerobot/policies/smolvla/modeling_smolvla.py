@@ -382,32 +382,44 @@ class SmolVLAPolicy(PreTrainedPolicy):
         return self._apply_lac_filter(actions, role_split)
 
     def _apply_lac_filter(self, actions: Tensor, role_split: dict[str, Tensor]) -> Tensor:
-        """`actions`(batch, n_steps, action_dim)의 선두 `2*ard_arm_dim`개 채널을 실행 스텝
-        순서대로(시간축을 따라) `self._lac.step()`에 하나씩 넣어 필터링한다 — LAC의 상태
-        (q̃_{t-1}, α_{t-1})가 호출 간에 이어져야 해서 벡터화하지 않고 순서대로 돈다(chunk_size가
-        보통 50이라 비용은 미미하다). 그 외 채널(`2*ard_arm_dim:`, 있다면)은 그대로 둔다."""
+        """`actions`(batch, n_steps, action_dim) 전체를 생성 시점에 한 번에 필터링한다 —
+        `select_action()`의 청크 단위 경로에서만 쓴다(수학적으로는 스텝마다 지연 필터링하는
+        것과 동일 — 생성과 실행 사이에 새 정보가 없는 순수 순차 재귀라서). 실제 스텝마다
+        거는 쪽(ARD-VLA 2.0 폐루프 경로)은 같은 `apply_lac_step()`을 `closed_loop.py`의
+        `_execute_chunk`가 실행 직전에 직접 부른다 — 복붙 없이 같은 필터 로직을 공유한다."""
+        n_steps = actions.shape[1]
+        filtered_steps = [
+            self.apply_lac_step(actions[:, t], {key: value[:, t] for key, value in role_split.items()})
+            for t in range(n_steps)
+        ]
+        return torch.stack(filtered_steps, dim=1)
+
+    def apply_lac_step(self, action_t: Tensor, role_split_t: dict[str, Tensor]) -> Tensor:
+        """실행 스텝 하나(`action_t`, shape (batch, action_dim))를 LAC로 필터링한다.
+        `role_split_t`는 그 **같은** 스텝의 `{"shared_left","shared_right","residual_left",
+        "residual_right"}`(각 (batch, ard_arm_dim)) — `predict_action_chunk_with_decisions`가
+        `decisions["_lac_role_split"]`로 돌려주는 청크 전체 텐서에서 호출부가 해당 스텝만
+        슬라이스해서 넘기면 된다. `self._lac`가 None이면(`lac_mode="none"`) 그대로 돌려준다.
+        `select_action()`의 청크 단위 경로(`_apply_lac_filter`)와 폐루프 러너의 실제 실행
+        스텝 단위 경로가 이 메서드 하나를 공유한다(LAC 컨트롤러 인스턴스도 `self._lac` 하나뿐 —
+        복붙 구현 금지 요구사항)."""
+        if self._lac is None:
+            return action_t
         arm_dim = self.config.ard_arm_dim
         stabilizer_is_left = self.config.ard_default_actuator_arm == "right"
-        n_steps = actions.shape[1]
-
-        filtered_steps = []
-        for t in range(n_steps):
-            q_t = actions[:, t, : 2 * arm_dim]
-            q_tilde, debug = self._lac.step(
-                role_split["shared_left"][:, t],
-                role_split["shared_right"][:, t],
-                role_split["residual_left"][:, t],
-                role_split["residual_right"][:, t],
-                q_t,
-                stabilizer_is_left=stabilizer_is_left,
-            )
-            filtered_steps.append(q_tilde)
-            if self.lac_debug_log is not None:
-                self.lac_debug_log.append(debug)
-
-        filtered_bimanual = torch.stack(filtered_steps, dim=1)
-        filtered = actions.clone()
-        filtered[..., : 2 * arm_dim] = filtered_bimanual
+        q_t = action_t[..., : 2 * arm_dim]
+        q_tilde, debug = self._lac.step(
+            role_split_t["shared_left"],
+            role_split_t["shared_right"],
+            role_split_t["residual_left"],
+            role_split_t["residual_right"],
+            q_t,
+            stabilizer_is_left=stabilizer_is_left,
+        )
+        if self.lac_debug_log is not None:
+            self.lac_debug_log.append(debug)
+        filtered = action_t.clone()
+        filtered[..., : 2 * arm_dim] = q_tilde
         return filtered
 
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -454,10 +466,24 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        actions, decisions = self.model.sample_actions_with_decisions(
-            images, img_masks, lang_tokens, lang_masks, state,
-            noise=noise, selector_mask=selector_mask, **kwargs,
-        )
+        if self.config.lac_mode != "none":
+            # ARD-VLA 2.0 폐루프 경로: 공유/잔차 분해도 같은 prefix forward로 함께 받아서
+            # `decisions["_lac_role_split"]`에 담아둔다 — 러너가 실제 실행 스텝마다
+            # `self.apply_lac_step()`을 거치게 하려는 것이라, 여기서는 **필터링하지 않고
+            # raw 액션 그대로** 반환한다(요청 (2): "chunk 단위가 아니라 실제 실행 스텝마다").
+            # `_lac_role_split`은 Judge/Selector의 진짜 판정이 아니므로 `decide()`나 로깅
+            # 유틸(`closed_loop.py`의 `_decisions_to_floats`)이 보기 전에 pop해서 써야 한다.
+            actions, decisions, role_split = self.model.sample_actions_with_decisions_and_role_split(
+                images, img_masks, lang_tokens, lang_masks, state,
+                noise=noise, selector_mask=selector_mask, **kwargs,
+            )
+            decisions = dict(decisions)
+            decisions["_lac_role_split"] = role_split
+        else:
+            actions, decisions = self.model.sample_actions_with_decisions(
+                images, img_masks, lang_tokens, lang_masks, state,
+                noise=noise, selector_mask=selector_mask, **kwargs,
+            )
 
         original_action_dim = self.config.action_feature.shape[0]
         actions = actions[:, :, :original_action_dim]
@@ -1471,6 +1497,99 @@ class VLAFlowMatching(nn.Module):
             noise, prefix_pad_masks, past_key_values, bridge_kv_layers, actuator_is_first, **kwargs
         )
         return x_t, decisions
+
+    def sample_actions_with_decisions_and_role_split(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        noise=None,
+        selector_mask: Tensor | None = None,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> tuple[Tensor, dict[str, Tensor], dict[str, Tensor]]:
+        """`sample_actions_with_decisions()`과 똑같이 prefix forward 한 번으로 Judge/Selector
+        판정을 내지만, `sample_actions_with_role_split()`처럼 denoise 루프 동안 ARD의
+        공유/잔차 성분도 함께 적분해서 셋 다(`x_t`, `decisions`, `role_split`) 반환한다 —
+        ARD-VLA 2.0 폐루프 경로(`SmolVLAPolicy.predict_action_chunk_with_decisions`)가
+        `lac_mode != "none"`일 때 쓴다. `use_ard=True`가 필요하다(두 메서드가 이미 그렇다).
+        세 메서드가 거의 같은 prefix-forward-once 설정을 반복하는 건, 이 파일에 이미 있는
+        `sample_actions`/`sample_actions_with_decisions`/`sample_actions_with_role_split`
+        세 자매 메서드와 같은 이유다 — 기존 메서드를 전혀 건드리지 않고(bit-exact 보장) 새
+        반환값이 필요한 조합마다 자매 메서드를 추가하는 이 코드베이스의 기존 패턴을 그대로
+        따른다."""
+        bsize = state.shape[0]
+        device = state.device
+
+        if noise is None:
+            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        judge_layer = self.config.judge_feature_layer if self.judge is not None else None
+        collect_layer_indices = self._merge_collect_layer_indices(self.bridge_layer_indices, judge_layer)
+
+        prefix_outputs_embeds, past_key_values = self.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+            collect_layer_indices=collect_layer_indices,
+        )
+
+        bridge_kv_layers = None
+        if self.bridge_layer_indices is not None:
+            collected = self.vlm_with_expert.last_collected_prefix_layers
+            bridge_kv_layers = [collected[i].to(dtype=torch.float32) for i in self.bridge_layer_indices]
+
+        decisions: dict[str, Tensor] = {}
+        if self.judge is not None:
+            if judge_layer == -1:
+                judge_hidden = prefix_outputs_embeds[0]
+            else:
+                judge_hidden = self.vlm_with_expert.last_collected_prefix_layers[judge_layer]
+            judge_out = self.judge(
+                judge_hidden.to(dtype=torch.float32), prefix_pad_masks, allowed_mask=selector_mask
+            )
+            for key in ("success_prob", "failure_probs", "progress", "selector_probs"):
+                if key in judge_out:
+                    decisions[key] = judge_out[key]
+
+        actuator_is_first = resolve_actuator_is_first(
+            self.config.ard_default_actuator_arm, batch_size=bsize, device=device
+        )
+
+        arm_dim = self.config.ard_arm_dim
+        self._lac_role_split_accum = {
+            "left": torch.zeros(bsize, self.config.chunk_size, arm_dim, device=device, dtype=torch.float32),
+            "right": torch.zeros(bsize, self.config.chunk_size, arm_dim, device=device, dtype=torch.float32),
+        }
+        try:
+            x_t = self._denoise_loop(
+                noise, prefix_pad_masks, past_key_values, bridge_kv_layers, actuator_is_first, **kwargs
+            )
+            residual_left = self._lac_role_split_accum["left"]
+            residual_right = self._lac_role_split_accum["right"]
+        finally:
+            self._lac_role_split_accum = None
+
+        shared_left = x_t[..., :arm_dim] - residual_left
+        shared_right = x_t[..., arm_dim : 2 * arm_dim] - residual_right
+        role_split = {
+            "shared_left": shared_left,
+            "shared_right": shared_right,
+            "residual_left": residual_left,
+            "residual_right": residual_right,
+        }
+        return x_t, decisions, role_split
 
     def sample_actions_with_role_split(
         self,

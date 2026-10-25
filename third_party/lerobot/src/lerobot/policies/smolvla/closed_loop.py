@@ -47,6 +47,32 @@ iteration 수로 환산된다:
 `pre_chunk`/`per_step`은 미래 기능(사전 청크 검증/상시 Stabilizer 모니터링)을 위한 자리만
 만들어둔 콜백이다 — 기본 `None`이고, 실제 검증/모니터링 로직은 이번 작업 범위 밖이라 구현하지
 않는다(호출부만 있다).
+
+## LAC(ARD-VLA 2.0) — 실제 실행 스텝마다, 리셋 규칙과 함께
+
+`policy.config.lac_mode != "none"`이면 `predict_action_chunk_with_decisions()`가
+`decisions["_lac_role_split"]`로 공유/잔차 분해를 함께 돌려준다(Judge/Selector 판정과
+무관한 내부 배관이라 `decide()`에 넘기기 전에 꺼내 쓴다). LAC는 **chunk 단위가 아니라
+실제 실행 스텝마다** 적용한다 — `_execute_chunk()`가 `env.execute()` 직전에
+`policy.apply_lac_step()`을 거친다(`select_action()`의 청크 단위 사전 필터링과 같은
+`lac.py` 코드를 공유하되, 적용 시점만 다르다).
+
+LAC는 "이전 명령을 기억하고 천천히 따라가는 필터"라서, 리셋 없이 넘어가면 새 서브태스크나
+복구 동작이 이전 궤적 쪽으로 끌려간다. 그래서 `policy._lac.reset()`을 다음 세 시점에 부른다
+(리셋 직후 첫 스텝은 필터링 없이 그대로 통과 — `lac.py`의 `q̃_0 = q_1` 규칙):
+- **에피소드 시작**: `run_closed_loop()`가 맨 처음에 `policy.reset()`(큐까지 포함한 전체
+  리셋)을 부른다.
+- **Selector가 다음 서브태스크로 전환할 때**(`ADVANCE`, target이 다음 노드): `policy._lac`만
+  리셋(큐/디버그 로그는 그대로 — 에피소드 전체에 걸쳐 누적).
+- **Judge가 실패 판정 → 재시도/복구로 들어갈 때**(`RETRY`/`RECOVER`, `run_recovery`가 없어서
+  RETRY로 대체되는 경우 포함): 역시 `policy._lac`만 리셋.
+
+`RECHECK`(아직 불확실 — 같은 시도를 다시 관측만 하는 것)은 리셋하지 않는다 — 진행 중인
+시도를 계속 지켜보는 것이라 필터 상태를 끊을 이유가 없다.
+
+`log_lac_events=True`면 반환 로그에 `lac_resets`(각 리셋의 iteration/이유:
+"episode"/"subtask"/"retry")와 `lac_debug_log`(`policy.lac_debug_log`— 매 실행 스텝의
+rho/omega/alpha/regime)를 채운다.
 """
 
 from __future__ import annotations
@@ -80,6 +106,16 @@ def _selector_mask_tensor(mask: list[bool] | None) -> torch.Tensor | None:
     return torch.tensor(mask, dtype=torch.bool)
 
 
+def _reset_lac(policy, log: dict[str, Any], iteration: int, reason: str, log_lac_events: bool) -> None:
+    """`policy._lac`(있으면, 즉 `lac_mode != "none"`)만 리셋한다 — `policy.reset()`(큐/디버그
+    로그까지 전부 초기화하는 전체 리셋)과 달리 에피소드 중간의 서브태스크 전환/재시도·복구
+    진입용이다. 둘 다 없으면(`policy._lac is None`) 조용히 아무 것도 안 한다."""
+    if getattr(policy, "_lac", None) is not None:
+        policy._lac.reset()
+    if log_lac_events:
+        log["lac_resets"].append({"iteration": iteration, "reason": reason})
+
+
 def run_closed_loop(
     policy,
     env: ClosedLoopEnv,
@@ -95,13 +131,17 @@ def run_closed_loop(
     pre_chunk: Callable[[torch.Tensor, dict, EpisodeState], None] | None = None,
     per_step: Callable[[int, torch.Tensor, EpisodeState], None] | None = None,
     post_decision: Callable[[Any, dict, EpisodeState], None] | None = None,
+    log_lac_events: bool = False,
 ) -> dict[str, Any]:
-    """하나의 에피소드를 끝까지(종료 노드 도달 또는 STOP) 돈다.
+    """하나의 에피소드를 끝까지(종료 노드 도달 또는 STOP) 돈다. 맨 처음 `policy.reset()`을
+    불러서 큐/LAC 상태를 포함해 완전히 새 에피소드로 시작한다(모듈 docstring의 "LAC" 절 참고).
 
     반환값은 에피소드 로그 dict: `decision_history`/`judge_probabilities`(판정이 실제로 일어난
     iteration에서만 1개씩 추가), `forward_calls`/`judged`(iteration마다 1개씩 — 모듈 docstring
-    참고), `retry_counts`(최종 상태), `termination_reason`.
+    참고), `retry_counts`(최종 상태), `termination_reason`, `lac_resets`/`lac_debug_log`
+    (`log_lac_events=True`일 때만 채워짐).
     """
+    policy.reset()
     state = EpisodeState(current_node=start_node)
     need_judgment = False
     subtask_step_count = 0
@@ -112,9 +152,12 @@ def run_closed_loop(
         "judged": [],
         "retry_counts": {},
         "termination_reason": None,
+        "lac_resets": [],
+        "lac_debug_log": None,
     }
+    _reset_lac(policy, log, iteration=-1, reason="episode", log_lac_events=log_lac_events)
 
-    for _ in range(max_iterations):
+    for iteration in range(max_iterations):
         instruction = decision_logic.instruction_text(goal, state)
         observation = dict(env.observe())
         observation["task"] = instruction
@@ -123,6 +166,9 @@ def run_closed_loop(
         selector_mask = _selector_mask_tensor(decision_logic.allowed_mask(state))
         with torch.no_grad():
             actions, decisions = policy.predict_action_chunk_with_decisions(batch, selector_mask=selector_mask)
+        # Judge/Selector의 진짜 판정이 아닌 LAC 내부 배관이라, decide()/로깅이 보기 전에 꺼낸다
+        # (요청 (4): "Judge/Selector의 입력과 판정 로직은 건드리지 마라").
+        role_split = decisions.pop("_lac_role_split", None)
 
         log["forward_calls"].append(1)
         log["judged"].append(need_judgment)
@@ -152,13 +198,15 @@ def run_closed_loop(
                 policy.cancel_pending_actions()
 
             if decision.kind == DecisionKind.RECHECK:
-                # 행동 실행 없이 다시 관측·판정한다 — need_judgment는 True로 유지.
+                # 행동 실행 없이 다시 관측·판정한다 — need_judgment는 True로 유지. 아직 불확실한
+                # 같은 시도를 계속 지켜보는 것이라 LAC는 리셋하지 않는다.
                 env.settle()
                 continue
 
             if decision.kind == DecisionKind.RECOVER:
                 need_judgment = False
                 subtask_step_count = 0
+                _reset_lac(policy, log, iteration, "retry", log_lac_events)
                 if hasattr(env, "run_recovery"):
                     env.run_recovery(decision.target)
                     env.settle()
@@ -176,15 +224,19 @@ def run_closed_loop(
 
             elif decision.kind == DecisionKind.ADVANCE:
                 # 다음 노드로(이미 decide() 안에서 state.current_node가 갱신됨) — 지시문이
-                # 바뀌므로 다시 관측+forward해서 actions를 재계산한다.
+                # 바뀌므로 다시 관측+forward해서 actions를 재계산한다. 새 서브태스크로 넘어가는
+                # 것이므로 LAC가 이전 서브태스크의 궤적을 끌고 가지 않도록 리셋한다.
                 need_judgment = False
                 subtask_step_count = 0
+                _reset_lac(policy, log, iteration, "subtask", log_lac_events)
                 continue
 
             elif decision.kind == DecisionKind.RETRY:
                 # 지시문이 같으므로 이번 forward의 actions를 그대로 실행한다 — 추가 forward 없음.
+                # 같은 노드를 처음부터 다시 시도하는 것이므로 LAC도 리셋한다.
                 need_judgment = False
                 subtask_step_count = 0
+                _reset_lac(policy, log, iteration, "retry", log_lac_events)
 
         # ---- 실행 단계: need_judgment==False였거나, 위에서 RETRY/recovery_unsupported로
         # 넘어온 경우(둘 다 "이번 forward의 actions를 바로 실행") ----
@@ -195,7 +247,9 @@ def run_closed_loop(
         remaining_budget = None
         if max_subtask_steps is not None:
             remaining_budget = max(max_subtask_steps - subtask_step_count, 0)
-        steps_run, finished_by_env = _execute_chunk(env, exec_actions, per_step, state, remaining_budget)
+        steps_run, finished_by_env = _execute_chunk(
+            policy, env, exec_actions, role_split, per_step, state, remaining_budget
+        )
         subtask_step_count += steps_run
 
         budget_exceeded = (
@@ -211,21 +265,37 @@ def run_closed_loop(
         log["termination_reason"] = "max_iterations_exceeded"
 
     log["retry_counts"] = dict(state.retry_counts)
+    if log_lac_events:
+        log["lac_debug_log"] = policy.lac_debug_log
     return log
 
 
 def _execute_chunk(
-    env: ClosedLoopEnv, actions: torch.Tensor, per_step, state: EpisodeState, max_steps: int | None
+    policy,
+    env: ClosedLoopEnv,
+    actions: torch.Tensor,
+    role_split: dict[str, torch.Tensor] | None,
+    per_step,
+    state: EpisodeState,
+    max_steps: int | None,
 ) -> tuple[int, bool]:
     """액션 청크(batch=1 가정, shape (1, n_steps, action_dim))를 한 스텝씩 실행하다가
     서브태스크가 끝나거나(`env.subtask_finished()`) `max_steps`(서브태스크 스텝 예산의 남은
     분량)에 닿으면 멈춘다. `(실제로 실행한 스텝 수, env.subtask_finished()로 끝났는지)`를
     돌려준다 — 후자가 False면 청크가 그냥 소진됐거나(다음 청크로 계속) 예산을 다 썼다는 뜻
-    (예산 초과 판정은 호출부가 누적 스텝 수로 따로 한다)."""
+    (예산 초과 판정은 호출부가 누적 스텝 수로 따로 한다).
+
+    `role_split`이 있으면(`lac_mode != "none"`) `env.execute()` 바로 직전에 그 스텝의 공유/
+    잔차 성분으로 `policy.apply_lac_step()`을 거친다 — chunk 단위가 아니라 실제 실행 스텝마다
+    LAC를 적용하라는 요구사항이라, 여기서 액션을 꺼내 보내기 직전에만 필터링한다."""
     n_steps = actions.shape[1] if max_steps is None else min(actions.shape[1], max_steps)
     steps_run = 0
     for step in range(n_steps):
-        step_action = actions[0, step]
+        step_action = actions[:, step]
+        if role_split is not None:
+            role_split_t = {key: value[:, step] for key, value in role_split.items()}
+            step_action = policy.apply_lac_step(step_action, role_split_t)
+        step_action = step_action[0]
         if per_step is not None:
             per_step(step, step_action, state)
         env.execute(step_action)
