@@ -197,8 +197,8 @@ class LatentAwareController:
 
         first_step = self._q_prev_j is None
         if first_step:
-            # q̃_0 = q_1 — 이전 값을 이번 q로 시드하면 아래 일반 EMA 수식이 그대로 q_1을
-            # 돌려준다(필터 강도와 무관하게 (1-a)*q+a*q == q).
+            # q̃_0 = q_1 — 부동소수점에서는 (1-a)*q+a*q가 q와 비트 단위로 같지 않을 수 있어서
+            # (clamp/덧셈 순서에 따른 라운딩), 아래 EMA 수식을 타지 않고 그대로 반환한다.
             self._q_prev_j = torch.cat([q_L_j, q_R_j], dim=-1)
         q_prev_L_j = self._q_prev_j[..., : self.joint_dim]
         q_prev_R_j = self._q_prev_j[..., self.joint_dim : 2 * self.joint_dim]
@@ -207,9 +207,12 @@ class LatentAwareController:
             alpha_hat = alpha_hat_shared.clamp(cfg.alpha_min, cfg.alpha_max)
             alpha_prev = alpha_hat if first_step else self._alpha_prev
             alpha = (1 - cfg.beta) * alpha_prev + cfg.beta * alpha_hat
-            a = alpha[..., None]
-            q_tilde_L_j = (1 - a) * q_prev_L_j + a * q_L_j
-            q_tilde_R_j = (1 - a) * q_prev_R_j + a * q_R_j
+            if first_step:
+                q_tilde_L_j, q_tilde_R_j = q_L_j, q_R_j
+            else:
+                a = alpha[..., None]
+                q_tilde_L_j = (1 - a) * q_prev_L_j + a * q_L_j
+                q_tilde_R_j = (1 - a) * q_prev_R_j + a * q_R_j
             self._alpha_prev = alpha
             debug = {"rho": rho, "omega": omega_lr, "regime": regime, "alpha_hat": alpha_hat, "alpha": alpha}
         else:
@@ -224,12 +227,15 @@ class LatentAwareController:
             alpha_stab = (1 - cfg.beta) * alpha_prev_stab + cfg.beta * alpha_hat_stab
             alpha_act = (1 - cfg.beta) * alpha_prev_act + cfg.beta * alpha_hat_act
 
-            q_stab_prev_j, q_act_prev_j = self._resolve_role(q_prev_L_j, q_prev_R_j, stabilizer_is_left)
-            q_stab_j, q_act_j = self._resolve_role(q_L_j, q_R_j, stabilizer_is_left)
-            a_stab, a_act = alpha_stab[..., None], alpha_act[..., None]
-            q_tilde_stab_j = (1 - a_stab) * q_stab_prev_j + a_stab * q_stab_j
-            q_tilde_act_j = (1 - a_act) * q_act_prev_j + a_act * q_act_j
-            q_tilde_L_j, q_tilde_R_j = self._unresolve_role(q_tilde_stab_j, q_tilde_act_j, stabilizer_is_left)
+            if first_step:
+                q_tilde_L_j, q_tilde_R_j = q_L_j, q_R_j
+            else:
+                q_stab_prev_j, q_act_prev_j = self._resolve_role(q_prev_L_j, q_prev_R_j, stabilizer_is_left)
+                q_stab_j, q_act_j = self._resolve_role(q_L_j, q_R_j, stabilizer_is_left)
+                a_stab, a_act = alpha_stab[..., None], alpha_act[..., None]
+                q_tilde_stab_j = (1 - a_stab) * q_stab_prev_j + a_stab * q_stab_j
+                q_tilde_act_j = (1 - a_act) * q_act_prev_j + a_act * q_act_j
+                q_tilde_L_j, q_tilde_R_j = self._unresolve_role(q_tilde_stab_j, q_tilde_act_j, stabilizer_is_left)
 
             self._alpha_prev = {"stab": alpha_stab, "act": alpha_act}
             debug = {

@@ -80,6 +80,7 @@ from lerobot.policies.smolvla.ard import (
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.freq_policy import compute_frequency_consistency_loss
 from lerobot.policies.smolvla.judge import Judge
+from lerobot.policies.smolvla.lac import LACConfig, LatentAwareController
 from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
 from lerobot.policies.smolvla.token_pruning import compute_task_relevance_scores, select_tokens
 from lerobot.policies.utils import (
@@ -268,6 +269,32 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        self._lac: LatentAwareController | None = None
+        self.lac_debug_log: list[dict] | None = None
+        if self.config.lac_mode != "none":
+            lac_config = LACConfig(
+                alpha_base=self.config.lac_alpha_base,
+                delta_macro=self.config.lac_delta_macro,
+                delta_prec=self.config.lac_delta_prec,
+                delta_noise=self.config.lac_delta_noise,
+                tau_rho=self.config.lac_tau_rho,
+                tau_omega=self.config.lac_tau_omega,
+                beta=self.config.lac_beta,
+                alpha_min=self.config.lac_alpha_min,
+                alpha_max=self.config.lac_alpha_max,
+                epsilon=self.config.lac_epsilon,
+                role_aware=self.config.lac_mode == "role_aware",
+                alpha_stab_max=self.config.lac_alpha_stab_max,
+                alpha_act_cooperative=self.config.lac_alpha_act_cooperative,
+                mirror_sign=self.config.lac_mirror_sign,
+            )
+            self._lac = LatentAwareController(
+                lac_config,
+                joint_dim=self.config.ard_arm_dim - self.config.ard_gripper_dim,
+                gripper_dim=self.config.ard_gripper_dim,
+            )
+            if self.config.lac_log:
+                self.lac_debug_log = []
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -323,6 +350,65 @@ class SmolVLAPolicy(PreTrainedPolicy):
             actions = self._pi_aloha_encode_actions(actions)
 
         return actions
+
+    def _get_action_chunk_with_lac(
+        self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
+    ) -> Tensor:
+        """`_get_action_chunk()`과 동일하지만 `lac_mode != "none"`일 때만 쓰인다 — ARD의
+        공유/잔차 분해를 함께 받아서 `self._lac`(LAC 필터, `reset()`에서 생성)로 양팔의
+        bimanual 채널(`2*ard_arm_dim`개)을 필터링한 뒤 돌려준다. 그 외 채널(있다면)은 그대로
+        둔다. `select_action()`에서만 호출한다 — `predict_action_chunk`/
+        `predict_action_chunk_with_decisions`(closed_loop.py 러너가 쓰는 경로)는 청크를
+        한 번에 통째로 반환하는 별도 경로라 이번 작업 범위에서는 LAC를 연결하지 않았다
+        (PROGRESS.md 참고)."""
+        for k in batch:
+            if k in self._queues and k != ACTION:
+                batch[k] = torch.stack(list(self._queues[k]), dim=1)
+
+        images, img_masks = self.prepare_images(batch)
+        state = self.prepare_state(batch)
+        lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
+        lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+
+        actions, role_split = self.model.sample_actions_with_role_split(
+            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+        )
+
+        original_action_dim = self.config.action_feature.shape[0]
+        actions = actions[:, :, :original_action_dim]
+        if self.config.adapt_to_pi_aloha:
+            actions = self._pi_aloha_encode_actions(actions)
+
+        return self._apply_lac_filter(actions, role_split)
+
+    def _apply_lac_filter(self, actions: Tensor, role_split: dict[str, Tensor]) -> Tensor:
+        """`actions`(batch, n_steps, action_dim)의 선두 `2*ard_arm_dim`개 채널을 실행 스텝
+        순서대로(시간축을 따라) `self._lac.step()`에 하나씩 넣어 필터링한다 — LAC의 상태
+        (q̃_{t-1}, α_{t-1})가 호출 간에 이어져야 해서 벡터화하지 않고 순서대로 돈다(chunk_size가
+        보통 50이라 비용은 미미하다). 그 외 채널(`2*ard_arm_dim:`, 있다면)은 그대로 둔다."""
+        arm_dim = self.config.ard_arm_dim
+        stabilizer_is_left = self.config.ard_default_actuator_arm == "right"
+        n_steps = actions.shape[1]
+
+        filtered_steps = []
+        for t in range(n_steps):
+            q_t = actions[:, t, : 2 * arm_dim]
+            q_tilde, debug = self._lac.step(
+                role_split["shared_left"][:, t],
+                role_split["shared_right"][:, t],
+                role_split["residual_left"][:, t],
+                role_split["residual_right"][:, t],
+                q_t,
+                stabilizer_is_left=stabilizer_is_left,
+            )
+            filtered_steps.append(q_tilde)
+            if self.lac_debug_log is not None:
+                self.lac_debug_log.append(debug)
+
+        filtered_bimanual = torch.stack(filtered_steps, dim=1)
+        filtered = actions.clone()
+        filtered[..., : 2 * arm_dim] = filtered_bimanual
+        return filtered
 
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         if self.config.adapt_to_pi_aloha:
@@ -409,7 +495,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
         if self._check_get_actions_condition():
-            actions = self._get_action_chunk(batch, noise)
+            if self.config.lac_mode != "none":
+                actions = self._get_action_chunk_with_lac(batch, noise)
+            else:
+                actions = self._get_action_chunk(batch, noise)
 
             # `self.predict_action_chunk` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
@@ -790,6 +879,10 @@ class VLAFlowMatching(nn.Module):
         self.image_end_token = torch.tensor([self.fake_image_token], dtype=torch.long)
         self.prefix_length = self.config.prefix_length
         self.rtc_processor = rtc_processor
+        # LAC(lerobot.policies.smolvla.lac)가 denoise 루프 중 ARD 공유/잔차 성분을 적분해서
+        # 뽑아갈 때만 쓰는 side-channel — None이면(기본) _denoise_loop가 아무 것도 안 한다
+        # (last_collected_prefix_layers와 같은 패턴, Bridge Attention 참고).
+        self._lac_role_split_accum: dict[str, Tensor] | None = None
 
         # ARD: 비대칭 역할 분리 (자세한 내용은 lerobot.policies.smolvla.ard 참고)
         self.ard_heads = None
@@ -1235,19 +1328,26 @@ class VLAFlowMatching(nn.Module):
         actuator_is_first,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
-        """`sample_actions`/`sample_actions_with_decisions`가 공유하는 flow-matching denoise
-        루프 — prefix forward(및 Judge/Selector 계산)가 이미 끝난 뒤의 부분만 담당한다."""
+        """`sample_actions`/`sample_actions_with_decisions`/`sample_actions_with_role_split`가
+        공유하는 flow-matching denoise 루프 — prefix forward(및 Judge/Selector 계산)가 이미
+        끝난 뒤의 부분만 담당한다.
+
+        `self._lac_role_split_accum`이 `None`이 아니면(LAC용 `sample_actions_with_role_split`
+        호출 중에만 설정됨) 매 스텝 ARD 잔차를 적분해서 그 dict에 더한다 — 다른 모든 호출
+        경로는 이 값이 항상 `None`이라 아래 추가 분기가 전혀 실행되지 않는다(bit-exact 유지)."""
         bsize = noise.shape[0]
         device = noise.device
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
+        track_role_split = self._lac_role_split_accum is not None
 
         x_t = noise
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+            role_split_sink: dict[str, Tensor] | None = {} if track_role_split else None
 
-            def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
+            def denoise_step_partial_call(input_x_t, current_timestep=time_tensor, _sink=role_split_sink):
                 return self.denoise_step(
                     x_t=input_x_t,
                     prefix_pad_masks=prefix_pad_masks,
@@ -1255,6 +1355,7 @@ class VLAFlowMatching(nn.Module):
                     timestep=current_timestep,
                     actuator_is_first=actuator_is_first,
                     bridge_kv_layers=bridge_kv_layers,
+                    role_split_sink=_sink,
                 )
 
             if self._rtc_enabled():
@@ -1274,6 +1375,11 @@ class VLAFlowMatching(nn.Module):
                 v_t = denoise_step_partial_call(x_t)
 
             x_t = x_t + dt * v_t
+
+            if track_role_split and role_split_sink:
+                arm_dim = role_split_sink["left_residual"].shape[-1]
+                self._lac_role_split_accum["left"][..., :arm_dim] += dt * role_split_sink["left_residual"]
+                self._lac_role_split_accum["right"][..., :arm_dim] += dt * role_split_sink["right_residual"]
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
@@ -1366,6 +1472,80 @@ class VLAFlowMatching(nn.Module):
         )
         return x_t, decisions
 
+    def sample_actions_with_role_split(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        noise=None,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """`sample_actions()`과 동일한 denoise 루프를 쓰지만, ARD의 공유(action_out_proj 출력)/
+        잔차(ARD 헤드 출력) 성분을 denoise 스텝마다 따로 적분해서 LAC
+        (lerobot.policies.smolvla.lac)가 쓸 분해를 함께 반환한다 — `use_ard=True`가 반드시
+        필요하다(LAC가 가정하는 "공유+잔차" 분해 자체가 ARD head 구조라서).
+
+        선형 적분(`x_T = x_0 + Σ dt·v_t = (x_0 + Σ dt·v_base) + Σ dt·v_residual`)이 정확히
+        성립하므로, 마지막 denoise 스텝 하나만 보는 근사가 아니라 전체 청크에 대한 정확한
+        분해를 얻는다 — `config.rtc_config.enabled=True`면 RTC가 여러 candidate v_t를
+        블렌딩해서 이 선형성이 깨지므로 `configuration_smolvla.py`에서 둘의 동시 사용을
+        막아뒀다(이 메서드 자체는 방어적으로 다시 검사하지 않음 — config 검증을 신뢰)."""
+        bsize = state.shape[0]
+        device = state.device
+
+        if noise is None:
+            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        _, past_key_values = self.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+            collect_layer_indices=self.bridge_layer_indices,
+        )
+        bridge_kv_layers = None
+        if self.bridge_layer_indices is not None:
+            collected = self.vlm_with_expert.last_collected_prefix_layers
+            bridge_kv_layers = [collected[i].to(dtype=torch.float32) for i in self.bridge_layer_indices]
+
+        actuator_is_first = resolve_actuator_is_first(
+            self.config.ard_default_actuator_arm, batch_size=bsize, device=device
+        )
+
+        arm_dim = self.config.ard_arm_dim
+        self._lac_role_split_accum = {
+            "left": torch.zeros(bsize, self.config.chunk_size, arm_dim, device=device, dtype=torch.float32),
+            "right": torch.zeros(bsize, self.config.chunk_size, arm_dim, device=device, dtype=torch.float32),
+        }
+        try:
+            x_t = self._denoise_loop(
+                noise, prefix_pad_masks, past_key_values, bridge_kv_layers, actuator_is_first, **kwargs
+            )
+            residual_left = self._lac_role_split_accum["left"]
+            residual_right = self._lac_role_split_accum["right"]
+        finally:
+            self._lac_role_split_accum = None
+
+        shared_left = x_t[..., :arm_dim] - residual_left
+        shared_right = x_t[..., arm_dim : 2 * arm_dim] - residual_right
+        role_split = {
+            "shared_left": shared_left,
+            "shared_right": shared_right,
+            "residual_left": residual_left,
+            "residual_right": residual_right,
+        }
+        return x_t, role_split
+
     def denoise_step(
         self,
         prefix_pad_masks,
@@ -1374,8 +1554,15 @@ class VLAFlowMatching(nn.Module):
         timestep,
         actuator_is_first: Tensor | None = None,
         bridge_kv_layers: list[Tensor] | None = None,
+        role_split_sink: dict[str, Tensor] | None = None,
     ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
+        """Apply one denoising step of the noise `x_t` at a given timestep.
+
+        `role_split_sink`: LAC(lerobot.policies.smolvla.lac)가 공유/잔차 성분을 denoise
+        스텝마다 적분해서 뽑아갈 때만 쓰는 side-channel(`None`이면 기본과 완전히 동일 —
+        `last_collected_prefix_layers`와 같은 패턴). 주어지면 이번 스텝의 `left_residual`/
+        `right_residual`(ARD 헤드가 만든, 아직 base에 더해지기 전의 잔차)을 그 dict에 써
+        넣기만 하고 반환값(`v_t`)에는 전혀 영향을 주지 않는다."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
@@ -1408,6 +1595,9 @@ class VLAFlowMatching(nn.Module):
             left_residual, right_residual = combine_by_role(
                 stabilizer_residual, actuator_residual, actuator_is_first
             )
+            if role_split_sink is not None:
+                role_split_sink["left_residual"] = left_residual
+                role_split_sink["right_residual"] = right_residual
             v_t = torch.cat(
                 [
                     v_t[..., :arm_dim] + left_residual,

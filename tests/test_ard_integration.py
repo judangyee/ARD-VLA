@@ -340,3 +340,147 @@ def test_judge_detach_features_blocks_backbone_gradient(build_tiny_policy, build
 
     assert all(p.grad is None for p in policy.model.vlm_with_expert.parameters())
     assert all(p.grad is None for p in policy.model.action_out_proj.parameters())
+
+
+# --- LAC(Latent-Aware Controller) 추론 필터 — 실제 SmolVLAPolicy 전체(select_action 경로)
+# 연결 확인. LAC 모듈 자체(손계산 케이스, clip, role_aware 등)의 순수 단위 테스트는
+# tests/test_lac.py에 있다.
+
+
+def test_role_split_shared_plus_residual_reconstructs_raw_action(build_tiny_policy, build_tiny_batch):
+    """`sample_actions_with_role_split()`의 (shared+residual) 분해가 실제로 denoise 루프가
+    만든 최종 액션과 정확히 일치하는지(선형 적분이라 정확해야 함), 그리고 `sample_actions()`
+    (기존, 미변경) 호출과 bit-for-bit 동일한 x_t를 내는지 — 같은 noise를 명시적으로 넘겨서
+    확인한다."""
+    from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
+
+    arm_dim = 4
+    policy = build_tiny_policy(arm_dim=arm_dim, ard_arm_dim=arm_dim, use_ard=True, num_steps=3)
+    policy.eval()
+    batch = build_tiny_batch(batch_size=2, arm_dim=arm_dim, chunk=8, lang_len=6)
+
+    images, img_masks = policy.prepare_images(batch)
+    state = policy.prepare_state(batch)
+    lang_tokens = batch[OBS_LANGUAGE_TOKENS]
+    lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
+
+    torch.manual_seed(0)
+    noise = policy.model.sample_noise(
+        (2, policy.config.chunk_size, policy.config.max_action_dim), torch.device("cpu")
+    )
+
+    with torch.no_grad():
+        x_t, role_split = policy.model.sample_actions_with_role_split(
+            images, img_masks, lang_tokens, lang_masks, state, noise=noise.clone()
+        )
+        x_t_plain = policy.model.sample_actions(
+            images, img_masks, lang_tokens, lang_masks, state, noise=noise.clone()
+        )
+
+    assert torch.allclose(x_t, x_t_plain, atol=1e-5), "role_split 경로가 기존 sample_actions()와 다른 x_t를 내면 안 된다"
+
+    recon_left = role_split["shared_left"] + role_split["residual_left"]
+    recon_right = role_split["shared_right"] + role_split["residual_right"]
+    assert torch.allclose(recon_left, x_t[..., :arm_dim], atol=1e-4)
+    assert torch.allclose(recon_right, x_t[..., arm_dim : 2 * arm_dim], atol=1e-4)
+
+    # VLAFlowMatching의 side-channel이 다음 호출을 위해 깨끗이 정리됐는지(다른 경로에 새지 않는지).
+    assert policy.model._lac_role_split_accum is None
+
+
+def test_lac_mode_none_matches_existing_select_action_output(build_tiny_policy, build_tiny_batch):
+    """`lac_mode="none"`(기본)을 명시적으로 줘도 전혀 안 준 것과 bit-for-bit 동일해야 한다."""
+    arm_dim = 4
+    batch = build_tiny_batch(batch_size=1, arm_dim=arm_dim, chunk=8, lang_len=6)
+
+    torch.manual_seed(1)
+    policy_default = build_tiny_policy(arm_dim=arm_dim, ard_arm_dim=arm_dim, use_ard=True, num_steps=2)
+    policy_default.eval()
+    torch.manual_seed(2)
+    with torch.no_grad():
+        actions_default = [policy_default.select_action(dict(batch)) for _ in range(4)]
+
+    torch.manual_seed(1)
+    policy_explicit_none = build_tiny_policy(
+        arm_dim=arm_dim, ard_arm_dim=arm_dim, use_ard=True, num_steps=2, lac_mode="none"
+    )
+    policy_explicit_none.eval()
+    torch.manual_seed(2)
+    with torch.no_grad():
+        actions_explicit = [policy_explicit_none.select_action(dict(batch)) for _ in range(4)]
+
+    for a, b in zip(actions_default, actions_explicit, strict=True):
+        assert torch.equal(a, b)
+    assert policy_default._lac is None
+    assert policy_explicit_none._lac is None
+
+
+def test_select_action_with_lac_covla_passes_through_first_step_then_filters(build_tiny_policy, build_tiny_batch):
+    """LAC의 첫 스텝은 그대로(q̃_0=q_1) 통과해야 하고, 그 이후부터는 필터링이 실제로 값을
+    바꿔야 한다. ARD head가 zero-init이라(합성 모델, 학습 전) 잔차가 항상 0이고, 그래서
+    매 스텝 regime이 "macro"로 고정되어 alpha가 상수가 된다는 점을 이용해 unfiltered
+    (lac_mode="none") 버전과 같은 noise로 직접 비교한다(모듈 docstring의 추론 경로 참고)."""
+    arm_dim = 4
+    batch = build_tiny_batch(batch_size=1, arm_dim=arm_dim, chunk=8, lang_len=6)
+    n_steps = 4
+
+    torch.manual_seed(11)
+    policy_none = build_tiny_policy(arm_dim=arm_dim, ard_arm_dim=arm_dim, use_ard=True, num_steps=2)
+    policy_none.eval()
+    torch.manual_seed(22)
+    with torch.no_grad():
+        actions_none = [policy_none.select_action(dict(batch)) for _ in range(n_steps)]
+
+    torch.manual_seed(11)
+    policy_lac = build_tiny_policy(
+        arm_dim=arm_dim, ard_arm_dim=arm_dim, use_ard=True, num_steps=2, lac_mode="covla",
+    )
+    policy_lac.eval()
+    torch.manual_seed(22)
+    with torch.no_grad():
+        actions_lac = [policy_lac.select_action(dict(batch)) for _ in range(n_steps)]
+
+    assert torch.equal(actions_none[0], actions_lac[0]), "LAC 첫 스텝은 필터링 없이 그대로여야 한다"
+    assert not torch.equal(actions_none[1], actions_lac[1]), "두 번째 스텝부터는 필터링이 값을 바꿔야 한다"
+    for a in actions_lac:
+        assert torch.isfinite(a).all()
+    assert policy_lac._lac._q_prev_j is not None
+
+
+def test_lac_log_records_one_entry_per_chunk_step(build_tiny_policy, build_tiny_batch):
+    """LAC는 청크 전체(n_action_steps개)를 생성 시점에 한 번에 필터링한다(모듈 docstring의
+    "매 실행 스텝마다 순서대로" 참고 — 수치는 실제로 순차적으로 계산되지만, 그 계산을
+    select_action() 호출마다 지연시키지 않고 청크가 만들어질 때 전부 끝낸다). 그래서 로그는
+    select_action() 호출 횟수가 아니라 "청크 하나가 새로 만들어질 때마다 n_action_steps개씩"
+    늘어난다."""
+    arm_dim = 4
+    policy = build_tiny_policy(
+        arm_dim=arm_dim, ard_arm_dim=arm_dim, use_ard=True, num_steps=2, lac_mode="covla", lac_log=True,
+    )
+    policy.eval()
+    batch = build_tiny_batch(batch_size=1, arm_dim=arm_dim, chunk=8, lang_len=6)
+
+    with torch.no_grad():
+        policy.select_action(dict(batch))  # 새 청크 생성 -> n_action_steps(8)개 로그
+    assert len(policy.lac_debug_log) == policy.config.n_action_steps
+    for entry in policy.lac_debug_log:
+        assert set(entry) == {"rho", "omega", "regime", "alpha_hat", "alpha"}
+
+    with torch.no_grad():
+        for _ in range(3):
+            policy.select_action(dict(batch))  # 같은 청크에서 pop만 함 -> 로그 안 늘어남
+    assert len(policy.lac_debug_log) == policy.config.n_action_steps
+
+
+def test_reset_rebuilds_lac_filter_state(build_tiny_policy, build_tiny_batch):
+    arm_dim = 4
+    policy = build_tiny_policy(arm_dim=arm_dim, ard_arm_dim=arm_dim, use_ard=True, num_steps=2, lac_mode="covla")
+    policy.eval()
+    batch = build_tiny_batch(batch_size=1, arm_dim=arm_dim, chunk=8, lang_len=6)
+    with torch.no_grad():
+        policy.select_action(dict(batch))
+    assert policy._lac._q_prev_j is not None
+
+    policy.reset()
+    assert policy._lac is not None
+    assert policy._lac._q_prev_j is None

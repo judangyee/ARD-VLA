@@ -190,3 +190,60 @@ def test_mirror_sign_flips_omega_sign():
 def test_mirror_sign_length_mismatch_raises():
     with pytest.raises(ValueError, match="mirror_sign"):
         LatentAwareController(LACConfig(mirror_sign=[1.0, 1.0]), joint_dim=3)
+
+
+# --- SmolVLAConfig의 lac_mode 검증 (실제 SmolVLAPolicy 생성 없이 config만) ---
+
+
+def _base_kwargs(**overrides):
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
+
+    kwargs = dict(
+        input_features={
+            OBS_IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)),
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(16,)),
+        },
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(16,))},
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_config_lac_mode_invalid_raises():
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+
+    with pytest.raises(ValueError, match="lac_mode"):
+        SmolVLAConfig(**_base_kwargs(lac_mode="bogus"))
+
+
+def test_config_lac_requires_use_ard():
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+
+    with pytest.raises(ValueError, match="use_ard"):
+        SmolVLAConfig(**_base_kwargs(use_ard=False, lac_mode="covla"))
+
+
+def test_config_lac_rejects_rtc_combo():
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+
+    with pytest.raises(ValueError, match="RTC"):
+        SmolVLAConfig(**_base_kwargs(use_ard=True, lac_mode="covla", rtc_config=RTCConfig(enabled=True)))
+
+
+def test_config_lac_mirror_sign_length_validation():
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+
+    with pytest.raises(ValueError, match="lac_mirror_sign"):
+        SmolVLAConfig(
+            **_base_kwargs(use_ard=True, lac_mode="covla", ard_arm_dim=8, ard_gripper_dim=1, lac_mirror_sign=[1.0, 1.0])
+        )
+
+    # 길이가 맞으면(7관절) 에러 없음.
+    SmolVLAConfig(
+        **_base_kwargs(
+            use_ard=True, lac_mode="covla", ard_arm_dim=8, ard_gripper_dim=1,
+            lac_mirror_sign=[-1.0, -1.0, 1.0, 1.0, 1.0, -1.0, 1.0],
+        )
+    )
