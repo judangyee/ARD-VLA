@@ -570,3 +570,121 @@ iteration), `RECHECK`는 호출마다 1씩 쌓인다.
 없음 — 요청한 4개 문제(판정 시점/청크-서브태스크 구분/RECOVER 실행/역정규화) 전부 해결,
 pytest 전체 통과, 문서 정정 완료. 실제 환경에 `run_recovery()`를 구현하는 것, 실제
 SmolVLM2 가중치로 판정 시점 수정의 효과를 확인하는 것은 여전히 범위 밖.
+
+---
+
+# LAC(Latent-Aware Controller) 추론 필터 추가 (branch: lac-inference)
+
+Co-VLA(arXiv 2606.20285)의 LAC를 ARD-VLA에 이식 — 학습 없는 추론 시점 EMA 필터로, ARD의
+"공유(action_out_proj)+잔차(ARD 헤드)" 가산 구조를 보고 매 실행 스텝마다 필터 강도 α를
+조절한다. Co-VLA 원본 재현(`lac_mode="covla"`) + ARD 역할 인식 확장(`lac_mode="role_aware"`)
+둘 다 구현.
+
+## 0단계 확인 결과 (코드 수정 전 보고)
+
+- **가산 구조 확인(A안)**: `denoise_step()`/`sample_actions()` 둘 다 `v_t =
+  action_out_proj(suffix_out)`(공유 베이스) 뒤에 ARD 헤드 잔차를 양팔 채널에 **더한다**
+  (`ard.py`의 `AsymmetricResidualHeads`는 마지막 레이어 zero-init — 학습 전엔 잔차≡0).
+  단, 이건 flow-matching **velocity** 레벨의 가산이라, 최종 액션에서 공유/잔차를 뽑으려면
+  마지막 denoise 스텝 하나만 보면 안 되고 **루프 전체에서 베이스/잔차 velocity를 따로
+  적분**해야 한다(선형 적분이라 정확히 분해됨) — 그래서 `sample_actions_with_role_split()` +
+  `_denoise_loop()`의 누적기를 새로 추가했다.
+- **16 DoF 배치**: `ard_arm_dim=8`(관절7+그리퍼1), 채널 `[0:8]`=왼팔, `[8:16]`=오른팔, 그리퍼는
+  각 팔 블록의 마지막 1채널. `ard_default_actuator_arm="right"`(기본) → Actuator=오른팔.
+- **chunk 실행 지점**: `select_action()`의 `_queues[ACTION]`(deque)이 유일한 "하나씩 꺼내는"
+  경로. `predict_action_chunk`/`predict_action_chunk_with_decisions`(closed_loop.py 러너가
+  씀)는 청크를 통째로 반환하는 별도 경로 — **LAC는 `select_action()`에만 연결**하기로 결정
+  (사용자 확인 없이 "진행해"로 승인받은 뒤 이 범위로 진행, PROGRESS.md에 명시).
+- **역할 할당**: 고정 config뿐(`resolve_actuator_is_first`) — role classifier 없음(폐루프의
+  Judge/Selector는 성공 판정/서브태스크 선택용이라 팔 역할과 무관). role_aware의 "classifier
+  출력이 있으면 그걸 따르게" 분기는 `stabilizer_is_left` 인자로 자리만 만들고 classifier
+  자체는 구현하지 않음.
+- **mirror_sign**: `/home/user/ard-gen/ard-gen/assets/openarm/openarm_bimanual.xml`에서 좌우
+  joint의 `axis`/`range`를 직접 비교 — joint1/2/6과 그리퍼가 미러링(부호 반대), joint3/4/5/7은
+  아님. 기본값 `[-1,-1,1,1,1,-1,1]`(joint1~7)을 제안했지만, **이건 MJCF 텍스트 비교일 뿐
+  forward kinematics로 검증하지 않았다(미검증)**. 부가 발견: 현재 ARD-Gen의
+  `pipeline/to_lerobot.py`는 peg_in_hole/insertion에서 `action = right_arm.action`만
+  내보내서(왼팔은 고정 그립) 실제로는 16-DoF 양팔 제어 데이터셋이 아직 없음 — mirror_sign을
+  실제 양팔 데이터로 검증할 방법이 현재는 없다.
+
+## 구현
+
+**`policies/smolvla/lac.py`(신규)** — `LACConfig`(dataclass), `LatentAwareController`:
+- `step(a_shared_L, a_shared_R, a_res_L, a_res_R, q_t, stabilizer_is_left=True) -> (q̃_t,
+  debug)`. 그리퍼 채널은 내부에서 분리해 ρ/ω 계산과 필터링 양쪽에서 제외하고 그대로
+  pass-through.
+- 첫 스텝(`reset()` 직후)은 `q̃_0 = q_1`을 **EMA 수식을 타지 않고 직접 반환** — 처음엔
+  `(1-a)*q+a*q`로 구현했다가 부동소수점 라운딩 때문에 `q`와 비트 단위로 안 같아서 통합
+  테스트(`test_select_action_with_lac_covla_passes_through_first_step_then_filters`)가
+  실패, 특수 분기로 고쳤다.
+- role_aware: `_role_alpha_hat()`이 공유 regime 추정치에서 Stabilizer는 상한만 낮추고
+  (`alpha_stab_max`), Actuator는 협동(ω>τ_ω)일 때만 `alpha_act_cooperative`로 덮어쓴다(그 외엔
+  공유 추정치 그대로 — "떨림일 때만 낮춤"이 자동 성립). mirror_sign은 항상 **오른팔**
+  잔차에(역할과 무관하게) 적용한 뒤 역할 해석.
+- `SmolVLAConfig`에 `lac_mode`("none"/"covla"/"role_aware", 기본 "none") + 관련 수치 플래그
+  10개. `__post_init__` 검증: `use_ard=True` 필요, RTC(`rtc_config.enabled=True`)와 동시
+  사용 금지(RTC의 velocity 블렌딩이 LAC의 선형 적분 전제를 깨서), `lac_mirror_sign` 길이
+  검증.
+
+**`modeling_smolvla.py` 연결** — 기존 `last_collected_prefix_layers` side-channel과 같은
+패턴으로 설계:
+- `denoise_step()`에 `role_split_sink: dict|None=None` 파라미터 추가 — `None`이면(기본)
+  기존과 완전히 동일, 주어지면 ARD 잔차(`left_residual`/`right_residual`)만 써넣고 반환값은
+  안 바꿈.
+- `_denoise_loop()`가 `self._lac_role_split_accum`(기본 None, `VLAFlowMatching.__init__`에서
+  초기화)이 설정돼 있을 때만 매 스텝 `dt * residual`을 누적 — 다른 모든 호출 경로는 이 값이
+  항상 None이라 분기 자체가 실행 안 됨(bit-exact 유지, 기존 바이트 단위 회귀 테스트로 확인).
+- 신규 `sample_actions_with_role_split()`(`sample_actions()`는 **전혀 수정하지 않음**) —
+  누적기를 설정→`_denoise_loop()` 호출→`shared = x_t - residual_accum`으로 역산해서
+  `(x_t, {shared_left, shared_right, residual_left, residual_right})` 반환.
+- `SmolVLAPolicy.reset()`이 `lac_mode != "none"`이면 `self._lac`(LatentAwareController)를
+  config에서 만들고, `lac_log=True`면 `self.lac_debug_log = []`.
+- `select_action()`이 `lac_mode != "none"`이면 신규 `_get_action_chunk_with_lac()`(→
+  `sample_actions_with_role_split()` 호출)로 분기, 아니면 기존 `_get_action_chunk()`
+  (미변경) — `_apply_lac_filter()`가 반환된 청크 전체(`n_action_steps`개)를 시간 순서대로
+  `self._lac.step()`에 하나씩 넣어 필터링한 뒤 큐에 넣는다. **"청크 생성 시점에 한 번에
+  필터링"이지 "pop할 때마다 지연 필터링"이 아니다** — 수학적으로는 동일(생성↔실행 사이에
+  새 정보가 없는 순수 순차 재귀)하지만 구현이 훨씬 단순해서 이 방식을 택했다(별도의
+  shared/residual 큐가 필요 없음). `predict_action_chunk`/
+  `predict_action_chunk_with_decisions`(closed_loop.py 러너)는 건드리지 않았다 — 0단계
+  보고에서 올린 스코프 질문에 사용자가 "진행해"로 답해서, 과제 문구를 글자 그대로("chunk에서
+  액션 하나씩 꺼내는 곳" = `select_action()`) 따르는 쪽으로 결정했다.
+
+**`scripts/compare_lac_modes.py`(신규)** — `tests/conftest.py`와 같은 몽키패치로 합성
+SmolVLM 백본을 만들어 none/covla/role_aware를 비교 실행. ARD 헤드가 zero-init이라 섭동 없이
+돌리면 잔차≡0 → 항상 "macro" regime으로 결정론적(`--no-perturb-ard-heads`로 확인 가능,
+covla는 alpha=0.8 고정, role_aware는 Stabilizer가 0.5로 캡되는 게 바로 보임) — 그래서
+`--perturb-ard-heads`(기본 켬)로 ARD 헤드 마지막 레이어에 작은 가우시안 잡음을 주입해서
+"약간 학습된" 것처럼 흉내 낸 잔차로도 비교한다(이것도 실제 학습된 가중치가 아니라는 걸
+스크립트 docstring에 명시). jerk(3차 차분 크기 평균) 비교 결과 covla/role_aware가 none보다
+낮게 나왔다(각 세션의 특정 시드에 대한 관찰일 뿐, 일반적 결론은 아님).
+
+## 테스트
+
+- `tests/test_lac.py`(18개, 순수 단위 테스트): Co-VLA 손계산 3케이스(precision/noise/macro
+  regime이 수식과 정확히 일치), α clip, β 평활화, 첫 스텝 pass-through, `reset()`, 그리퍼
+  pass-through, role_aware(Stabilizer 상한/Actuator 협동 승격/떨림 시에만 하향/
+  stabilizer_is_left 반영), mirror_sign의 ω 부호 반전 + 길이 검증, `SmolVLAConfig`의
+  `lac_mode`/`use_ard` 필요/RTC 금지/`lac_mirror_sign` 길이 검증 4개.
+- `tests/test_ard_integration.py`에 LAC 통합 테스트 6개 추가: `sample_actions_with_role_split`
+  의 (shared+residual) 분해가 `sample_actions()`(미변경)와 bit-for-bit 동일한 x_t를 내고
+  정확히 재구성되는지, `lac_mode="none"`이 기존과 bit-for-bit 동일한지, `select_action()`
+  에서 첫 스텝은 그대로 통과하고 두 번째 스텝부터 실제로 달라지는지(같은 noise로 unfiltered
+  버전과 직접 비교), `lac_log`가 "호출마다"가 아니라 "청크 생성마다 n_action_steps개"로
+  쌓이는지, `reset()`이 LAC 상태를 재초기화하는지.
+- 전체 `pytest` 106개 통과(`test_ard.py`/`test_token_pruning.py`/`test_freq_policy.py`
+  등 기존 테스트 전부 포함, 회귀 없음 확인).
+
+## 검증한 것 / 못 한 것
+
+`docs/lac.md`의 "검증한 것 / 못 한 것" 절에 상세 정리(README에서 링크). 요약: LAC 수식·
+role_aware 분기·mirror_sign 메커니즘·select_action 연결·bit-exact(off)는 합성 데이터로
+검증됨. 실제 SmolVLM2 가중치, 실제 OpenArm 시뮬/하드웨어, mirror_sign의 forward-kinematics
+검증, `predict_action_chunk` 계열(closed_loop 러너) 연결, 하이퍼파라미터(τ/Δ/β) 실측은
+전부 범위 밖/미검증.
+
+## 다음에 할 일
+
+없음 — 요청한 3개 목표(Co-VLA 원본 재현, 역할 인식 확장, 비교 코드/테스트) 전부 완료.
+추후 작업 후보: `predict_action_chunk_with_decisions`(closed_loop 러너)에도 LAC 연결,
+mirror_sign을 실제 양팔 데이터/시뮬로 검증, 실제 가중치로 하이퍼파라미터 재조정.
