@@ -146,15 +146,18 @@ control cycle마다 SmolVLM2 prefix forward를 Judge/Selector/action expert가 �
 잔차(ARD 헤드)" 가산 구조에서 팔별 공유/잔차 에너지 비율(ρ)과 협동 방향(ω)을 보고 매
 실행 스텝마다 EMA 필터 강도 α를 조절합니다 — `"covla"`는 Co-VLA 원본(두 팔에 같은 α),
 `"role_aware"`는 ARD의 Stabilizer/Actuator 역할별로 α를 따로 둡니다(Stabilizer는 항상
-강하게 평활화, Actuator는 반대 방향 협동일 때만 빠르게 통과). `select_action()`에만
-연결했고(closed_loop.py 러너가 쓰는 `predict_action_chunk_with_decisions`에는 아직 미연결),
-기본 `lac_mode="none"`이면 기존과 bit-for-bit 동일합니다. 수식, 설정 플래그, 오른팔 관절
-미러링 보정(mirror_sign, 미검증), 검증된 것/아직 확인되지 않은 것은
-**[docs/lac.md](docs/lac.md)** 에 있습니다.
+강하게 평활화, Actuator는 반대 방향 협동일 때만 빠르게 통과). `select_action()`과
+ARD-VLA 2.0 폐루프 경로(`predict_action_chunk_with_decisions`+`closed_loop.py`) 둘 다
+같은 LAC 인스턴스를 공유하며 연결돼 있고, 폐루프 쪽은 서브태스크 전환/재시도·복구 진입
+시점마다 LAC를 리셋합니다(이전 서브태스크의 궤적에 안 끌려가도록). 기본 `lac_mode="none"`
+이면 기존과 bit-for-bit 동일합니다. 수식, 설정 플래그, 리셋 규칙, 오른팔 관절 미러링 보정
+(mirror_sign, 미검증), 검증된 것/아직 확인되지 않은 것은 **[docs/lac.md](docs/lac.md)**
+에 있습니다.
 
 ```bash
-pytest tests/test_lac.py tests/test_ard_integration.py
-python scripts/compare_lac_modes.py  # 합성 백본으로 none/covla/role_aware 비교
+pytest tests/test_lac.py tests/test_ard_integration.py tests/test_lac_closed_loop.py
+python scripts/compare_lac_modes.py             # select_action() 경로, 합성 백본
+python scripts/compare_lac_closed_loop_modes.py # 폐루프 경로, 합성 백본
 ```
 
 ```bash
@@ -226,7 +229,8 @@ python scripts/train_ard.py --dataset-repo-id <...> \
 - `scripts/compare_smolvla_ard.py` — base/ard/symmetric 변형 간 파라미터·메모리·속도 비교.
 - `scripts/compare_bridge_attention.py` — Bridge Attention on/off loss 곡선 비교.
 - `scripts/layer_importance.py` — SmolLM2 백본 레이어 중요도(코사인 유사도 기반) 분석.
-- `scripts/compare_lac_modes.py` — LAC none/covla/role_aware 모드 비교(합성 백본, jerk/ρ/ω/α).
+- `scripts/compare_lac_modes.py` — LAC none/covla/role_aware 모드 비교(`select_action()` 경로, 합성 백본, jerk/ρ/ω/α).
+- `scripts/compare_lac_closed_loop_modes.py` — 같은 비교를 ARD-VLA 2.0 폐루프 경로(`run_closed_loop`+Judge)로 끝까지.
 - `third_party/lerobot/` — vendored, editable LeRobot/SmolVLA source.
   - `src/lerobot/policies/smolvla/ard.py` — ARD heads/losses, `ForceHead`, GradNorm, Bridge Attention, 대칭 대조군 손실.
   - `src/lerobot/policies/smolvla/freq_policy.py` — FreqPolicy 주파수 일관성 손실.
@@ -236,7 +240,7 @@ python scripts/train_ard.py --dataset-repo-id <...> \
   - `src/lerobot/policies/smolvla/closed_loop.py` — 폐루프 구조의 환경-무관 러너.
   - `src/lerobot/policies/smolvla/lac.py` — LAC(Latent-Aware Controller) 추론 시점 EMA 필터.
   - `src/lerobot/policies/smolvla/configuration_smolvla.py` / `modeling_smolvla.py` — 위 기능들을 켜고 끄는 config 플래그와 forward/추론 연결 지점.
-- `tests/` — pytest 테스트 전부(`test_ard.py`, `test_ard_integration.py`, `test_freq_policy.py`, `test_token_pruning.py`, `test_judge.py`, `test_decision_logic.py`, `test_closed_loop.py`, `test_lac.py`, `test_env.py`, `conftest.py`의 합성 SmolVLM fixture 포함).
+- `tests/` — pytest 테스트 전부(`test_ard.py`, `test_ard_integration.py`, `test_freq_policy.py`, `test_token_pruning.py`, `test_judge.py`, `test_decision_logic.py`, `test_closed_loop.py`, `test_lac.py`, `test_lac_closed_loop.py`, `test_env.py`, `conftest.py`의 합성 SmolVLM fixture 포함).
 - `pytest.ini` — `pytest` 루트 실행 설정(`testpaths=tests`, `requires_hub` 마커).
 - `.github/workflows/tests.yml` — CPU 전용 pytest CI.
 - `docs/` — 기능별 상세 설계/사용법/검증 기록(`ard.md`, `bridge_attention.md`, `freq_policy.md`, `token_pruning.md`, `profiling_tools.md`, `closed_loop.md`, `lac.md`).

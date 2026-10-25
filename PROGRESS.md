@@ -686,5 +686,108 @@ role_aware 분기·mirror_sign 메커니즘·select_action 연결·bit-exact(off
 ## 다음에 할 일
 
 없음 — 요청한 3개 목표(Co-VLA 원본 재현, 역할 인식 확장, 비교 코드/테스트) 전부 완료.
-추후 작업 후보: `predict_action_chunk_with_decisions`(closed_loop 러너)에도 LAC 연결,
-mirror_sign을 실제 양팔 데이터/시뮬로 검증, 실제 가중치로 하이퍼파라미터 재조정.
+추후 작업 후보: mirror_sign을 실제 양팔 데이터/시뮬로 검증, 실제 가중치로 하이퍼파라미터
+재조정. "predict_action_chunk_with_decisions에도 LAC 연결"은 바로 다음 작업(아래)으로
+완료됐다.
+
+---
+
+# LAC을 ARD-VLA 2.0 폐루프 경로에도 연결 (branch: lac-closed-loop)
+
+이전 작업은 LAC를 `select_action()` 경로에만 연결했다. 이번 작업은 `predict_action_chunk_
+with_decisions()`/`closed_loop.py`(ARD-VLA 2.0 폐루프 러너)에도 **같은 `self._lac`
+인스턴스·같은 필터 코드**로 연결한다 — chunk 단위가 아니라 실제 실행 스텝마다, 서브태스크
+전환/재시도·복구 진입 시 리셋하는 규칙까지 포함.
+
+## 0단계 확인 결과
+
+- **predict_action_chunk_with_decisions() 반환 형태**: `(actions, decisions)` — `actions`는
+  (batch, chunk_size, action_dim) 전체 청크, `decisions`는 Judge/Selector 판정 dict. prefix
+  forward가 정확히 한 번만 일어나도록 `sample_actions_with_decisions()`를 부른다.
+- **러너가 스텝을 꺼내 실행하는 곳**: 러너 안(`closed_loop.py`의 `_execute_chunk()`) — 러너는
+  `select_action()`을 전혀 안 부른다(`predict_action_chunk_with_decisions()`만 직접 호출).
+  → **select_action()과 폐루프 경로가 한 스텝에 겹쳐서 두 번 걸릴 위험은 원래 없다**(서로
+  다른 호출 경로이고, 폐루프는 select_action을 안 거침). 코드 검토로 확인, 직접 테스트로도
+  재확인(`test_closed_loop_lac_applied_exactly_once_per_step`).
+- **서브태스크 전환/재시도·복구가 일어나는 곳**: 전부 `closed_loop.py`의 `run_closed_loop()`
+  안 — `decide()`가 반환한 `DecisionKind`에 따라 `ADVANCE`(target≠None, 서브태스크 전환)/
+  `RETRY`/`RECOVER`(실패→재시도·복구) 분기에서 처리.
+
+## 설계/구현
+
+1. **predict_action_chunk_with_decisions() 확장** — `lac_mode != "none"`이면 신규
+   `VLAFlowMatching.sample_actions_with_decisions_and_role_split()`(기존
+   `sample_actions_with_decisions()`와 완전히 같은 prefix-forward-once Judge/Selector
+   계산 + `sample_actions_with_role_split()`의 공유/잔차 적분을 합친 자매 메서드 — 이
+   코드베이스가 이미 `sample_actions`→`sample_actions_with_decisions`→
+   `sample_actions_with_role_split` 세 자매로 풀던 것과 같은 패턴)을 불러서 `decisions
+   ["_lac_role_split"]`에 분해를 담아 돌려준다. `lac_mode="none"`이면 기존
+   `sample_actions_with_decisions()` 호출이 전혀 안 바뀐다 — bit-exact.
+   - **반환 시그니처를 안 바꾼 이유**: `(actions, decisions)` 2-tuple을 그대로 유지하고
+     `_lac_role_split`을 `decisions` dict 안에 추가 키로 넣는 쪽을 택했다(3-tuple로
+     바꾸는 대안도 검토했지만, 이미 이 메서드를 2-tuple로 unpack하는 기존 호출부/테스트가
+     `closed_loop.py` 1곳 + `tests/test_ard_integration.py`/`test_closed_loop.py` 9곳
+     있어서, 전부 고쳐야 하는 불필요한 blast radius가 생긴다). `_lac_role_split`은 Judge/
+     Selector의 진짜 판정이 아니라는 걸 이름의 밑줄 접두사로 표시했고, 러너가 `decide()`/
+     로깅 전에 `pop()`해서 쓰므로 그 둘은 이 키를 절대 보지 않는다(요청 (4)).
+2. **실행 스텝마다 적용** — `predict_action_chunk_with_decisions()`는 **필터링 전 raw
+   액션**을 그대로 돌려준다(이것도 테스트로 직접 확인). 실제 필터링은
+   `closed_loop.py`의 `_execute_chunk()`가 `env.execute()` 바로 직전에 그 스텝의 공유/
+   잔차 조각으로 `policy.apply_lac_step()`을 불러서 한다 — chunk 전체를 한 번에 거는 게
+   아니라 정말 스텝 하나씩.
+3. **복붙 없이 코드 공유** — 신규 `SmolVLAPolicy.apply_lac_step(action_t, role_split_t) ->
+   filtered`를 `select_action()` 쪽 `_apply_lac_filter()`(청크 전체를 이 메서드로 한 스텝씩
+   돌리는 걸로 리팩터)와 `closed_loop.py`의 `_execute_chunk()`가 똑같이 부른다. LAC 컨트롤러
+   인스턴스도 `self._lac` 하나뿐 — 두 경로가 같은 상태를 공유한다(단, 동시에 두 경로를 같은
+   정책 인스턴스로 섞어 쓰면 상태가 꼬일 수 있다는 뜻이기도 하다 — 보통은 한 정책을 한
+   경로로만 쓰므로 문제 없음, 문서에 명시는 안 했지만 기록만 남김).
+4. **리셋 규칙**(가장 중요한 요구사항) — `run_closed_loop()`가:
+   - 시작할 때 `policy.reset()`(큐까지 전체 리셋) → 로그 이유 `"episode"`.
+   - `ADVANCE`(다음 노드로, target≠None) 때 신규 `_reset_lac()` 헬퍼로 `policy._lac`만
+     리셋(큐/디버그 로그는 에피소드 전체에 걸쳐 누적되게 그대로 둠) → 이유 `"subtask"`.
+   - `RETRY`/`RECOVER`(실패 → 재시도/복구, `run_recovery` 없어서 RETRY로 대체되는 경우
+     포함) 때도 `_reset_lac()` → 이유 `"retry"`.
+   - `RECHECK`(아직 불확실 — 같은 시도를 다시 관측만 함)은 리셋 안 함 — 리셋 규칙의 "이전
+     명령을 천천히 따라가는 필터가 새 시도로 끌려가지 않게 한다"는 취지가 RECHECK에는
+     적용 안 됨(새 시도가 아니라 같은 시도를 계속 보는 것).
+   - `log_lac_events=True`면 반환 로그의 `lac_resets`(iteration/이유 목록)와
+     `lac_debug_log`(`policy.lac_debug_log`)로 확인 가능.
+5. Judge/Selector의 입력·판정 로직(`judge.py`/`decision_logic.py`)은 전혀 안 건드렸다 —
+   `_lac_role_split`은 `decide()`에 도달하기 전에 빼낸다(요청 (4) 그대로).
+
+## 테스트
+
+`tests/test_lac_closed_loop.py`(7개): `lac_mode="none"`이면 `decisions`에
+`_lac_role_split`이 없는지 + 같은 시드로 두 번 돌려 완전히 동일한지, Judge의
+`success_prob`이 lac_mode와 무관하게 동일한지(같은 noise로 비교), `predict_action_chunk_
+with_decisions()`가 raw 액션을 돌려주는지(필터링이 러너에서만 일어난다는 증거),
+`apply_lac_step()`의 그리퍼 pass-through, 리셋이 episode/subtask/retry 세 시점에
+정확히(스크립트로 고정한 시나리오: pick 1차 실패→RETRY→pick 2차 성공→ADVANCE to place) 일어
+나는지, 그리고 독립적으로 재현한 단일 패스 LAC 참조값과 실제 실행된 두 스텝이 정확히
+일치하는지(=한 스텝에 두 번 안 걸림).
+
+`pytest`(113개 전부 통과 — 106 + 신규 7). 기존 `test_lac.py`/`test_ard_integration.py`/
+`test_closed_loop.py`/`test_decision_logic.py` 등 전부 회귀 없음.
+
+## 검증 실행
+
+`scripts/compare_lac_closed_loop_modes.py`(신규) — 실제 `run_closed_loop()` + Judge(zero-
+init이 아니라서 success_prob이 매 스텝 랜덤) + 결정 로직을 합성 백본으로 몇 에피소드 끝까지
+돌려서 jerk/`lac_resets`/regime 분포를 비교. 결과: covla/role_aware가 none보다 jerk를
+낮췄다(16.08 → 9.50, 섭동 적용 시). 다만 이번 특정 실행에서는 랜덤 Judge 가중치가
+success_prob을 RECHECK 구간에만 떨어뜨려서 재관측 한도 초과(STOP)로 끝났고, 그래서
+`lac_resets`에 `"subtask"`/`"retry"`가 안 찍혔다 — 그 둘이 실제로 불리는지는 랜덤성과
+무관한 `tests/test_lac_closed_loop.py`의 스크립트 테스트가 보장한다. 이 사실과 "랜덤
+초기화라 regime 분포 자체는 의미가 없을 수 있다"는 점을 스크립트 출력에 그대로 남겼다.
+
+## 검증한 것 / 못 한 것
+
+`docs/lac.md`에 "폐루프 리셋 규칙" 절을 추가하고 "검증한 것/못 한 것"을 갱신했다. 요약:
+반환 시그니처 설계·리셋 3시점·raw-액션-반환(이중 적용 방지)·그리퍼 pass-through는 합성
+데이터로 검증됨. 실제 SmolVLM2 가중치, 실제 OpenArm 시뮬/하드웨어, "실제 Judge 분포가 세
+결정을 골고루 만드는지"는 범위 밖/미검증(기존 LAC 작업의 미검증 항목과 동일한 제약).
+
+## 다음에 할 일
+
+없음 — 요청한 작업(ARD-VLA 2.0 폐루프 경로 LAC 연결, 실제 실행 스텝 단위 적용, 3가지
+리셋 규칙, 복붙 없는 코드 공유, 테스트, 검증 실행, 문서) 전부 완료.

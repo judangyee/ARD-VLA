@@ -108,18 +108,42 @@ right_arm.action`만 내보냅니다(왼팔은 고정 그립) — 즉 지금 실
 전부 `lac_mode="none"`이 기본이고, 그러면 기존 출력과 bit-for-bit 동일합니다
 (`tests/test_ard_integration.py::test_lac_mode_none_matches_existing_select_action_output`).
 
-## 어디에 연결했는지 — `select_action()`만
+## 어디에 연결했는지 — `select_action()` + ARD-VLA 2.0 폐루프 경로
 
-LAC는 `SmolVLAPolicy.select_action()`(청크에서 액션을 하나씩 꺼내 실행하는 경로)에만
-연결했습니다 — `predict_action_chunk`/`predict_action_chunk_with_decisions`(closed_loop.py
-러너가 쓰는 경로)는 청크를 통째로 반환하는 별도 경로라 이번 작업 범위에서는 건드리지
-않았습니다. `select_action()`이 새 청크를 생성할 때(`lac_mode != "none"`이면)
-`_get_action_chunk_with_lac()`가 ARD의 공유/잔차 분해를 받아 청크 전체(`n_action_steps`개)를
-시간 순서대로 `LatentAwareController.step()`에 하나씩 넣어 필터링한 뒤 큐에 넣습니다 — 매
-`select_action()` 호출마다가 아니라 **청크가 새로 만들어질 때 한 번에** 필터링합니다(수학적
-으로는 동일 — 생성과 실행 사이에 새 정보가 들어오지 않는 순수 순차 재귀라서 — 하지만
-`lac_log=True`로 로그를 보면 호출 횟수가 아니라 "청크당 n_action_steps개"로 쌓이는 걸
-확인할 수 있습니다).
+LAC는 두 추론 경로 모두에 연결돼 있고, **같은 `self._lac` 인스턴스·같은 `apply_lac_step()`
+메서드**를 공유합니다(복붙 없음):
+
+- **`select_action()`**(청크에서 액션을 하나씩 꺼내 실행하는 경로): 새 청크를 생성할 때
+  (`lac_mode != "none"`이면) `_get_action_chunk_with_lac()`가 ARD의 공유/잔차 분해를 받아
+  청크 전체(`n_action_steps`개)를 시간 순서대로 `apply_lac_step()`에 하나씩 넣어 필터링한
+  뒤 큐에 넣습니다 — 매 `select_action()` 호출마다가 아니라 **청크가 새로 만들어질 때
+  한 번에** 필터링합니다(수학적으로는 동일 — 생성과 실행 사이에 새 정보가 들어오지 않는
+  순수 순차 재귀라서 — 하지만 `lac_log=True`로 로그를 보면 호출 횟수가 아니라 "청크당
+  n_action_steps개"로 쌓이는 걸 확인할 수 있습니다).
+- **ARD-VLA 2.0 폐루프 경로**(`predict_action_chunk_with_decisions` + `closed_loop.py`):
+  여기서는 반대로 **chunk 단위가 아니라 실제 실행 스텝마다** 적용합니다.
+  `predict_action_chunk_with_decisions()`는 `lac_mode != "none"`이면 raw(미필터링) 액션과
+  `decisions["_lac_role_split"]`(공유/잔차 분해)을 그대로 돌려주고, `run_closed_loop()`의
+  `_execute_chunk()`가 `env.execute()` **직전에** 그 스텝의 분해로 `apply_lac_step()`을
+  불러 필터링합니다 — 아래 "폐루프 리셋 규칙" 참고. `_lac_role_split`은 Judge/Selector의
+  진짜 판정이 아닌 내부 배관이라 `decide()`/로깅 전에 꺼내 쓰고 버립니다.
+
+## 폐루프 리셋 규칙
+
+LAC는 "이전 명령을 기억하고 천천히 따라가는 필터"라서, 리셋 없이 넘어가면 새 서브태스크나
+복구 동작이 이전 궤적 쪽으로 끌려갑니다. `run_closed_loop()`가 `policy._lac.reset()`을
+정확히 세 시점에 부릅니다(리셋 직후 첫 스텝은 필터링 없이 그대로 통과 — `q̃_0 = q_1`):
+
+| 시점 | 무엇을 리셋하나 | 로그 이유 |
+|---|---|---|
+| 에피소드 시작 | `policy.reset()`(큐까지 전체) | `"episode"` |
+| Selector가 다음 서브태스크로 전환(`ADVANCE`, target≠None) | `policy._lac`만 | `"subtask"` |
+| Judge 실패 → 재시도(`RETRY`)/복구(`RECOVER`, `run_recovery` 없어서 RETRY로 대체되는 경우 포함) | `policy._lac`만 | `"retry"` |
+
+`RECHECK`(아직 불확실 — 같은 시도를 다시 관측만 함)은 리셋하지 않습니다 — 진행 중인 시도를
+계속 지켜보는 것이라 필터 상태를 끊을 이유가 없습니다. `run_closed_loop(...,
+log_lac_events=True)`로 반환 로그의 `lac_resets`(각 리셋의 iteration/이유)와
+`lac_debug_log`(`policy.lac_debug_log`)를 확인할 수 있습니다.
 
 ## 새/수정 파일
 
@@ -128,42 +152,60 @@ LAC는 `SmolVLAPolicy.select_action()`(청크에서 액션을 하나씩 꺼내 �
   금지, `lac_mirror_sign` 길이 검증).
 - `modeling_smolvla.py` — `denoise_step()`의 `role_split_sink` side-channel(기존
   `last_collected_prefix_layers`와 같은 패턴), `_denoise_loop()`의 공유/잔차 적분,
-  `sample_actions_with_role_split()`(신규, `sample_actions()`는 미변경),
-  `SmolVLAPolicy.reset()`의 `self._lac` 생성, `_get_action_chunk_with_lac()`/
-  `_apply_lac_filter()`(신규), `select_action()`의 분기.
-- `scripts/compare_lac_modes.py` (신규) — 작은 합성 백본으로 none/covla/role_aware를
-  비교하는 검증 스크립트(아래 "검증한 것" 참고).
+  `sample_actions_with_role_split()`/`sample_actions_with_decisions_and_role_split()`
+  (둘 다 신규, `sample_actions()`/`sample_actions_with_decisions()`는 미변경),
+  `SmolVLAPolicy.reset()`의 `self._lac` 생성, `apply_lac_step()`(신규, 공유 메서드) +
+  `_get_action_chunk_with_lac()`/`_apply_lac_filter()`(둘 다 이제 `apply_lac_step()`을
+  호출), `select_action()`/`predict_action_chunk_with_decisions()`의 분기.
+- `closed_loop.py` — `run_closed_loop()`가 시작 시 `policy.reset()`, 신규 `_reset_lac()`
+  헬퍼(서브태스크/재시도 전환 시 `policy._lac.reset()`), `_execute_chunk()`가
+  `env.execute()` 직전에 `policy.apply_lac_step()` 호출, `log_lac_events` 옵션.
+- `scripts/compare_lac_modes.py` — 작은 합성 백본으로 none/covla/role_aware를 비교하는
+  검증 스크립트(`select_action()` 경로, 아래 "검증한 것" 참고).
+- `scripts/compare_lac_closed_loop_modes.py` (신규) — 같은 비교를 실제 `run_closed_loop()`
+  + Judge + 결정 로직으로 끝까지 돌려서 확인(아래 "검증한 것" 참고).
 
 ## 검증한 것 / 못 한 것
 
-**검증함** (`tests/test_lac.py`, `tests/test_ard_integration.py` — 전부 합성 모델로
-오프라인 CPU에서 돈다):
+**검증함** (`tests/test_lac.py`, `tests/test_ard_integration.py`,
+`tests/test_lac_closed_loop.py` — 전부 합성 모델로 오프라인 CPU에서 돈다):
 - Co-VLA 손계산 케이스 3개(반대 비틀기→precision, 떨림→noise, 같이 이동→macro)가 수식
   그대로 나옴. α clip, β 평활화, `reset()`이 상태를 지우는지, 그리퍼 pass-through.
 - role_aware: Stabilizer α가 상한을 안 넘는지, 협동 시 Actuator α가 높아지는지, 떨림일 때만
   낮아지는지, `stabilizer_is_left` 플래그 반영.
 - mirror_sign이 ω의 부호를 실제로 바꾸는지, 길이 불일치 시 에러.
 - config 검증: `lac_mode` 오탈자, `use_ard=False`와의 조합, RTC와의 조합, `mirror_sign` 길이.
-- 실제 SmolVLAPolicy 전체: `sample_actions_with_role_split()`의 (공유+잔차) 분해가
+- `select_action()` 경로: `sample_actions_with_role_split()`의 (공유+잔차) 분해가
   `sample_actions()`(미변경)와 bit-for-bit 동일한 `x_t`를 만들고 정확히 재구성되는지,
-  `lac_mode="none"`이 기존과 bit-for-bit 동일한지, `select_action()`에서 첫 스텝은 통과
-  하고 그 다음부터 실제로 필터링되는지, `lac_log`가 청크당 로그를 남기는지, `reset()`이
-  LAC 상태를 재초기화하는지.
-- `scripts/compare_lac_modes.py`로 none/covla/role_aware의 jerk(3차 차분)·ρ/ω/α 분포·
-  regime 비율을 실제로 비교 실행 — covla/role_aware가 none보다 jerk를 낮추는 걸 확인했고,
-  섭동 없이 돌리면(ARD 헤드 zero-init) 전부 "macro"로 결정론적으로 나오는 것과, role_aware가
-  그 경우에도 Stabilizer α를 0.5로 캡하는 것(covla의 0.8과 다름)을 직접 봤다.
+  `lac_mode="none"`이 기존과 bit-for-bit 동일한지, 첫 스텝은 통과하고 그 다음부터 실제로
+  필터링되는지, `lac_log`가 청크당 로그를 남기는지, `reset()`이 LAC 상태를 재초기화하는지.
+- **ARD-VLA 2.0 폐루프 경로**: `lac_mode="none"`이면 `decisions`에 `_lac_role_split` 키가
+  전혀 생기지 않는지(+같은 시드로 두 번 돌려 bit-for-bit 동일한지), Judge의 `success_prob`이
+  lac_mode와 완전히 무관(같은 noise로 비교)한지, `predict_action_chunk_with_decisions()`가
+  raw(미필터링) 액션을 돌려주는지(러너가 유일한 필터링 지점), `apply_lac_step()`의 그리퍼
+  pass-through, **리셋이 episode/subtask/retry 세 시점에 정확히(스크립트로 고정한 시나리오로)
+  일어나는지**, 그리고 독립적으로 재현한 단일 패스 참조값과 실제 실행된 두 스텝이 정확히
+  일치해서(=두 번 걸리지 않음) 확인됨.
+- `scripts/compare_lac_modes.py`(select_action 경로)/`compare_lac_closed_loop_modes.py`
+  (폐루프 경로)로 none/covla/role_aware의 jerk(3차 차분)·ρ/ω/α 분포·regime 비율을 실제로
+  비교 실행 — 둘 다 covla/role_aware가 none보다 jerk를 낮추는 걸 확인했고, 폐루프 쪽은
+  실제 Judge+결정 로직+러너를 끝까지 돌려서 LAC 리셋이 실제 발생하는 것까지(이번 특정
+  실행에서는 "episode" 리셋만, 아래 "못 함" 참고) 봤다.
 
 **못 함 (범위 밖, 구조/합성 데이터 검증만)**:
 - 실제 SmolVLM2 가중치로 한 번도 안 돌려봄 — 전부 작은 합성 모델.
 - mirror_sign 기본값은 MJCF 텍스트 비교일 뿐 forward kinematics로 검증 안 함, 게다가
   현재 ARD-Gen 데이터셋은 8-DoF 단일팔이라 실제 양팔 제어 데이터로 검증할 수조차 없음.
-- `predict_action_chunk`/`predict_action_chunk_with_decisions`(closed_loop.py 러너)에는
-  LAC를 연결하지 않음 — `select_action()`에만 연결(설계 결정, 위 참고).
+- `scripts/compare_lac_closed_loop_modes.py`의 특정 실행에서는 랜덤 Judge 가중치 때문에
+  success_prob이 RECHECK 구간에만 떨어져서 재관측 한도 초과(STOP)로 끝나고 "subtask"/
+  "retry" 리셋이 실제로 안 찍혔다 — 그 두 리셋이 제대로 불리는지는 랜덤성에 의존하지 않는
+  `tests/test_lac_closed_loop.py`의 스크립트 테스트로 확인했지만, "실제 Judge 출력 분포가
+  세 결정을 골고루 만들어내는지"는 실제 가중치 없이는 의미 있게 볼 수 없다.
 - 실제 로봇/시뮬레이터에서 jerk 감소가 체감되는지, τ/Δ/β 등 하이퍼파라미터가 실제로
   적절한지는 전혀 실측하지 않음(Co-VLA 논문 기본값을 그대로 가져온 것).
 
 ```bash
-pytest tests/test_lac.py tests/test_ard_integration.py
+pytest tests/test_lac.py tests/test_ard_integration.py tests/test_lac_closed_loop.py
 python scripts/compare_lac_modes.py
+python scripts/compare_lac_closed_loop_modes.py
 ```
