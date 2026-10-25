@@ -236,6 +236,35 @@ class SmolVLAConfig(PreTrainedConfig):
     judge_loss_weight: float = 1.0
     selector_loss_weight: float = 1.0
 
+    # --- LAC(Latent-Aware Controller, Co-VLA arXiv 2606.20285) — 학습 없는 추론 시점 EMA
+    # 필터. ARD의 "공유(action_out_proj)+잔차(ARD 헤드)" 가산 구조에서 팔별 공유/잔차 에너지
+    # 비율(ρ)과 협동 방향(ω)을 보고 매 실행 스텝마다 필터 강도 α를 조절한다
+    # (lerobot.policies.smolvla.lac.LatentAwareController 참고). "none"이면 기존 출력과
+    # bit-for-bit 동일하다. "covla"면 Co-VLA 원본(두 팔에 같은 α), "role_aware"면 ARD의
+    # Stabilizer/Actuator 역할별로 α를 따로 둔다(둘 다 use_ard=True 필요 — LAC가 가정하는
+    # "공유+잔차" 분해 자체가 ARD head의 구조라서).
+    lac_mode: str = "none"  # "none" | "covla" | "role_aware"
+    lac_alpha_base: float = 0.4
+    lac_delta_macro: float = 0.4
+    lac_delta_prec: float = 0.3
+    lac_delta_noise: float = 0.1
+    lac_tau_rho: float = 0.01
+    lac_tau_omega: float = 0.3
+    lac_beta: float = 0.2
+    lac_alpha_min: float = 0.05
+    lac_alpha_max: float = 0.95
+    lac_epsilon: float = 1e-6
+    # role_aware 전용 — Stabilizer는 상한을 낮게 고정, Actuator는 협동(ω>tau_omega)일 때만
+    # 높인다(lac.py의 LatentAwareController._role_alpha_hat 참고).
+    lac_alpha_stab_max: float = 0.5
+    lac_alpha_act_cooperative: float = 0.9
+    # 오른팔 관절 축 미러링 보정(ω 계산에만 영향, 역할과 무관하게 항상 오른팔에 적용) — 길이는
+    # `ard_arm_dim - ard_gripper_dim`(관절 수)과 같아야 한다. None이면 전부 1.0(미러링 없음)
+    # — ARD-Gen의 OpenArm MJCF 비교로 얻은 기본 추정값은 [-1,-1,1,1,1,-1,1](joint1~7)이지만,
+    # **실제 forward kinematics로 검증하지 않았다** (lac.py 모듈 docstring 참고, "미검증").
+    lac_mirror_sign: list[float] | None = None
+    lac_log: bool = False  # 매 실행 스텝 rho/omega/alpha/regime을 policy.lac_debug_log에 기록
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -344,6 +373,27 @@ class SmolVLAConfig(PreTrainedConfig):
             )
         if not self.use_selector and self.selector_num_options != 0:
             raise ValueError("`selector_num_options`는 `use_selector=True`일 때만 설정할 수 있습니다.")
+        if self.lac_mode not in ("none", "covla", "role_aware"):
+            raise ValueError(f"`lac_mode`는 'none'/'covla'/'role_aware' 중 하나여야 합니다. 현재 값: {self.lac_mode!r}")
+        if self.lac_mode != "none":
+            if not self.use_ard:
+                raise ValueError(
+                    "`lac_mode`는 `use_ard=True`일 때만 의미가 있습니다 — LAC의 공유/잔차 분해가 "
+                    "ARD head(action_out_proj 출력=공유, ARD 헤드 출력=잔차) 구조를 전제합니다."
+                )
+            if self.rtc_config is not None and self.rtc_config.enabled:
+                raise ValueError(
+                    "`lac_mode`와 RTC(`rtc_config.enabled=True`)는 함께 쓸 수 없습니다 — RTC가 여러 "
+                    "denoise 후보 velocity를 블렌딩해서 최종 v_t를 만들기 때문에, 공유/잔차를 denoise "
+                    "스텝마다 누적해 분해하는 LAC의 전제(선형 적분)가 깨집니다(미지원, PROGRESS.md 참고)."
+                )
+            if self.lac_mirror_sign is not None:
+                num_joints = self.ard_arm_dim - self.ard_gripper_dim
+                if len(self.lac_mirror_sign) != num_joints:
+                    raise ValueError(
+                        f"`lac_mirror_sign` 길이({len(self.lac_mirror_sign)})가 관절 수"
+                        f"(`ard_arm_dim - ard_gripper_dim` = {num_joints})와 다릅니다."
+                    )
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):
