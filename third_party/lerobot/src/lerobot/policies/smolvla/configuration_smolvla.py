@@ -265,6 +265,30 @@ class SmolVLAConfig(PreTrainedConfig):
     lac_mirror_sign: list[float] | None = None
     lac_log: bool = False  # 매 실행 스텝 rho/omega/alpha/regime을 policy.lac_debug_log에 기록
 
+    # --- "설정 가능한 ARD" (ARD-VLA → RoCo Challenge 등 매 회차 바뀌는 과제에 대응) ---
+    # role_map: {"stabilizer": "left"|"right", "actuator": "left"|"right"} — ard_default_actuator_arm의
+    # 사용자 친화적 별칭. None(기본)이면 ard_default_actuator_arm을 그대로 쓴다(기존과 동일). 지정하면
+    # __post_init__에서 ard_default_actuator_arm = role_map["actuator"]로 덮어써서, 실제 분리/결합
+    # 로직(resolve_actuator_is_first 등)은 여전히 ard_default_actuator_arm 하나만 읽는다(단일 소스 유지).
+    role_map: dict[str, str] | None = None
+    # 액션 공간 종류. "joint"(기본, 기존과 동일)면 채널이 관절 각도/속도라서 lac_mirror_sign(관절 축
+    # 미러링 보정)이 그대로 적용된다. "ee"(end-effector, 예: RoCo Challenge 공식 데이터셋)면 채널이
+    # 엔드이펙터 목표 pose+그리퍼라서 "관절 축 미러링"이라는 개념이 성립하지 않는다 — __post_init__이
+    # lac_mirror_sign을 강제로 None(미러링 없음)으로 덮어쓰고, 사용자가 값을 줬으면 경고한다.
+    action_space: str = "joint"  # "joint" 또는 "ee"
+    # 메인 flow-matching 회귀 손실(L_pos = F.*_loss(u_t, v_t), modeling_smolvla.py)의 종류. "l2"
+    # (기본, 기존과 완전히 동일한 MSE)는 목표에 가까워질수록 기울기가 0으로 사라져서 끝까지 밀어
+    # 넣지 않는 경향이 있다 — RoCo Challenge 1회 우승팀이 "l1"로 바꿔 이 문제를 해결했다고 보고
+    # 했다(arXiv 2603.15469). "smooth_l1"은 그 중간(큰 오차엔 L1처럼, 작은 오차엔 L2처럼) 동작.
+    pos_loss_type: str = "l2"  # "l2" | "l1" | "smooth_l1"
+    # 액션 청크 내 위치(실행 스텝 인덱스, 시간이 아님)별로 정규화 스케일을 다르게 준다 — 뒤쪽
+    # 위치일수록(먼 미래일수록) 예측 분산이 커지는 경향을 σ(t) = a + s*sqrt(t) (t=0..chunk_size-1)
+    # 로 반영한다. 기본 False면 기존 정규화(차원별 평균/표준편차만)와 비트 단위로 완전히 동일하다
+    # (LeHome 우승 보고서, arXiv 2606.27163 참고). scripts/fit_timestep_norm.py로 a/s를 피팅한다.
+    per_timestep_norm: bool = False
+    per_timestep_norm_a: float | list[float] = 1.0  # 스칼라 또는 (실제 액션 차원,) 리스트
+    per_timestep_norm_s: float | list[float] = 0.0
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -288,6 +312,45 @@ class SmolVLAConfig(PreTrainedConfig):
             # 원본 VLM 레이어 수(예: 32)를 넘는 인덱스인지는 실제 모델을 로드해야 알 수 있어서
             # (config 단계에선 Hub 접근 없이 알 수 없음) 여기서는 형식만 검증하고, 상한 체크는
             # smolvlm_with_expert.py의 SmolVLMWithExpertModel.__init__에서 한다.
+        if self.role_map is not None:
+            if set(self.role_map.keys()) != {"stabilizer", "actuator"}:
+                raise ValueError(
+                    f"`role_map`은 정확히 'stabilizer'와 'actuator' 키만 가져야 합니다. "
+                    f"현재 키: {sorted(self.role_map.keys())}"
+                )
+            stabilizer_arm, actuator_arm = self.role_map["stabilizer"], self.role_map["actuator"]
+            if stabilizer_arm not in ("left", "right") or actuator_arm not in ("left", "right"):
+                raise ValueError(f"`role_map`의 값은 'left' 또는 'right'여야 합니다. 현재 값: {self.role_map}")
+            if stabilizer_arm == actuator_arm:
+                raise ValueError(f"`role_map`의 stabilizer와 actuator는 서로 다른 팔이어야 합니다: {self.role_map}")
+            self.ard_default_actuator_arm = actuator_arm
+        if self.action_space not in ("joint", "ee"):
+            raise ValueError(f"`action_space`는 'joint' 또는 'ee'여야 합니다. 현재 값: {self.action_space!r}")
+        if self.pos_loss_type not in ("l2", "l1", "smooth_l1"):
+            raise ValueError(
+                f"`pos_loss_type`은 'l2'/'l1'/'smooth_l1' 중 하나여야 합니다. 현재 값: {self.pos_loss_type!r}"
+            )
+        if self.action_space == "ee" and self.lac_mirror_sign is not None:
+            logging.warning(
+                "action_space='ee'에서는 '관절 축 미러링' 전제가 성립하지 않아 `lac_mirror_sign`"
+                "(현재 값: %s)을 무시하고 전부 1.0(미러링 없음)으로 강제합니다.",
+                self.lac_mirror_sign,
+            )
+            self.lac_mirror_sign = None
+        if self.per_timestep_norm:
+            for name, value in (
+                ("per_timestep_norm_a", self.per_timestep_norm_a),
+                ("per_timestep_norm_s", self.per_timestep_norm_s),
+            ):
+                if isinstance(value, list) and len(value) == 0:
+                    raise ValueError(f"`{name}`가 리스트면 비어 있을 수 없습니다.")
+            a_values = (
+                self.per_timestep_norm_a if isinstance(self.per_timestep_norm_a, list) else [self.per_timestep_norm_a]
+            )
+            if any(a <= 0 for a in a_values):
+                raise ValueError(
+                    f"`per_timestep_norm_a`는 모두 양수여야 합니다(sigma(t=0)=a). 현재 값: {self.per_timestep_norm_a}"
+                )
         if self.use_ard:
             if self.ard_arm_dim <= 0:
                 raise ValueError(f"`ard_arm_dim`은 양수여야 합니다. 현재 값: {self.ard_arm_dim}")
@@ -412,6 +475,17 @@ class SmolVLAConfig(PreTrainedConfig):
                     f"`2 * ard_arm_dim`({2 * self.ard_arm_dim}) 이상이어야, 선두 채널이 왼팔/오른팔 "
                     "블록으로 균등하게 나뉩니다."
                 )
+
+        if self.per_timestep_norm and self.action_feature is not None:
+            real_action_dim = self.action_feature.shape[0]
+            for name, value in (
+                ("per_timestep_norm_a", self.per_timestep_norm_a),
+                ("per_timestep_norm_s", self.per_timestep_norm_s),
+            ):
+                if isinstance(value, list) and len(value) != real_action_dim:
+                    raise ValueError(
+                        f"`{name}` 길이({len(value)})가 실제 액션 차원({real_action_dim})과 다릅니다."
+                    )
 
         if self.ard_use_joint_torque:
             # 데이터셋이 observation.state와 관절 토크를 별도 feature로 제공하는 경우에만 미리

@@ -70,9 +70,12 @@ from lerobot.policies.smolvla.ard import (
     AsymmetricResidualHeads,
     ForceHead,
     GradNormLambdas,
+    apply_timestep_norm,
     combine_by_role,
     compute_ard_losses,
     compute_symmetric_losses,
+    compute_timestep_norm_sigma,
+    invert_timestep_norm,
     resolve_actuator_is_first,
     resolve_bridge_layer_indices,
     split_by_role,
@@ -1162,6 +1165,19 @@ class VLAFlowMatching(nn.Module):
         하나만 켜져 있어도) `"freq_loss"` 키에 FreqPolicy식 주파수 일관성 손실
         (lerobot.policies.smolvla.freq_policy 참고)이 담긴다.
         """
+        if self.config.per_timestep_norm:
+            # 모델이 학습/추론 내내 "스케일된 액션" 공간에서만 동작하게 한다 — 외부 경계
+            # (여기서의 ground-truth actions 입력, _denoise_loop의 최종 반환값)에서만 σ(t)로
+            # 나누고/곱해서, 표준 차원별 평균/표준편차 정규화(NormalizerProcessorStep)는 전혀
+            # 건드리지 않는다. LAC(lac_mode)는 이 경계 안쪽(스케일된 공간)에서 그대로 동작한다
+            # — 두 기능을 함께 켜면 LAC의 rho/omega 임계값 보정이 필요할 수 있어, RoCo 프리셋은
+            # lac_mode="none"으로 둔다(configs/presets/roco_board.yaml 참고).
+            sigma = compute_timestep_norm_sigma(
+                self.config.per_timestep_norm_a, self.config.per_timestep_norm_s,
+                actions.shape[1], actions.device, actions.dtype, pad_to=actions.shape[-1],
+            )
+            actions = apply_timestep_norm(actions, sigma)
+
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -1233,7 +1249,15 @@ class VLAFlowMatching(nn.Module):
                 dim=-1,
             )
 
-        losses = F.mse_loss(u_t, v_t, reduction="none")
+        # pos_loss_type="l2"(기본)는 기존과 완전히 동일한 MSE. "l1"/"smooth_l1"은 목표 근처에서
+        # L2의 기울기가 사라지는 문제(RoCo Challenge 1회 우승팀 보고, arXiv 2603.15469)를 겨냥한
+        # 대안 — configuration_smolvla.py의 pos_loss_type 필드 주석 참고.
+        if self.config.pos_loss_type == "l1":
+            losses = F.l1_loss(u_t, v_t, reduction="none")
+        elif self.config.pos_loss_type == "smooth_l1":
+            losses = F.smooth_l1_loss(u_t, v_t, reduction="none")
+        else:
+            losses = F.mse_loss(u_t, v_t, reduction="none")
 
         # use_ard와 무관하게 켤 수 있으므로, ard_extras가 None이 아니게 되는 조건에
         # use_freq_policy/judge도 포함시킨다 — SmolVLAPolicy.forward()가 이 dict에서 "freq_loss"
@@ -1409,6 +1433,16 @@ class VLAFlowMatching(nn.Module):
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+
+        if self.config.per_timestep_norm:
+            # forward()가 입력 actions를 σ(t)로 나눴던 것의 역연산 — denoise 루프 전체(및 LAC)는
+            # 스케일된 공간에서 돌고, 여기 단 한 곳(모든 sample_actions*가 공유하는 반환 지점)에서만
+            # 표준 정규화 공간으로 되돌려서 이후 UnnormalizerProcessorStep과 호환되게 한다.
+            sigma = compute_timestep_norm_sigma(
+                self.config.per_timestep_norm_a, self.config.per_timestep_norm_s,
+                x_t.shape[1], x_t.device, x_t.dtype, pad_to=x_t.shape[-1],
+            )
+            x_t = invert_timestep_norm(x_t, sigma)
 
         return x_t
 

@@ -429,6 +429,44 @@ def _exclude_gripper(traj_pred: Tensor, gripper_dim: int) -> Tensor:
     return traj_pred[..., : traj_pred.shape[-1] - gripper_dim]
 
 
+def compute_timestep_norm_sigma(
+    a: float | list[float],
+    s: float | list[float],
+    chunk_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    pad_to: int | None = None,
+) -> Tensor:
+    """`config.per_timestep_norm`용 σ(t) = a + s*sqrt(t), t=0..chunk_size-1.
+
+    `a`/`s`가 스칼라면 반환 shape (chunk_size, 1)이라 액션의 모든 채널에 동일하게 broadcast된다.
+    리스트(길이 D)면 (chunk_size, D)라서 채널마다 다른 σ(t)를 쓴다. `pad_to`가 D보다 크면(실제
+    액션 차원만큼만 피팅했는데 actions 텐서가 max_action_dim으로 패딩돼 있는 경우) 나머지
+    채널은 σ(t)=1(identity, a=1·s=0)로 채워서 broadcast가 깨지지 않게 한다. 호출자
+    (modeling_smolvla.py)가 `actions / sigma`(정규화) / `x_t * sigma`(역정규화) 형태로
+    (batch, chunk_size, action_dim)에 바로 곱/나눗셈하면 된다(LeHome 우승 보고서, arXiv
+    2606.27163 참고)."""
+    t = torch.arange(chunk_size, device=device, dtype=dtype)
+    sqrt_t = torch.sqrt(t)
+    a_t = torch.as_tensor(a, device=device, dtype=dtype).reshape(-1)
+    s_t = torch.as_tensor(s, device=device, dtype=dtype).reshape(-1)
+    if pad_to is not None and pad_to > a_t.shape[0]:
+        pad = pad_to - a_t.shape[0]
+        a_t = torch.cat([a_t, torch.ones(pad, device=device, dtype=dtype)])
+        s_t = torch.cat([s_t, torch.zeros(pad, device=device, dtype=dtype)])
+    return a_t[None, :] + s_t[None, :] * sqrt_t[:, None]  # (chunk_size, len(a) or 1)
+
+
+def apply_timestep_norm(actions: Tensor, sigma: Tensor) -> Tensor:
+    """actions: (batch, chunk_size, D). sigma: compute_timestep_norm_sigma()의 (chunk_size, 1|D)."""
+    return actions / sigma[None, : actions.shape[1], :]
+
+
+def invert_timestep_norm(scaled_actions: Tensor, sigma: Tensor) -> Tensor:
+    """apply_timestep_norm의 역연산."""
+    return scaled_actions * sigma[None, : scaled_actions.shape[1], :]
+
+
 def compute_ard_losses(
     per_element_loss: Tensor,
     stabilizer_traj_pred: Tensor,
