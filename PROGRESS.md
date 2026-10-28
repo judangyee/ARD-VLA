@@ -791,3 +791,115 @@ success_prob을 RECHECK 구간에만 떨어뜨려서 재관측 한도 초과(STO
 
 없음 — 요청한 작업(ARD-VLA 2.0 폐루프 경로 LAC 연결, 실제 실행 스텝 단위 적용, 3가지
 리셋 규칙, 복붙 없는 코드 공유, 테스트, 검증 실행, 문서) 전부 완료.
+
+---
+
+# 설정 가능한 ARD(Configurable ARD) + RoCo Challenge 프리셋 (branch: configurable-ard)
+
+RoCo Challenge(대회마다 과제가 바뀌는 양팔 조립 대회) 참가를 위해, OpenArm 16채널/왼팔=
+Stabilizer/chunk 50/L2 손실로 고정돼 있던 ARD-VLA를 설정만으로 다른 과제에 맞출 수 있게
+바꿔달라는 요청. 학습 실행(GPU)은 범위 밖, 구조 구현 + 작은 합성 모델 검증까지.
+
+## 0단계: 하드코딩 위치 조사 (코드 수정 전 보고)
+
+사용자 지시대로 코드를 먼저 바꾸지 않고 6가지 항목을 조사해서 보고한 뒤 진행 승인을
+받았다. 핵심 발견: **"16 DoF가 하드코딩"이라는 걱정의 대부분은 이미 config화돼 있었다**
+(`ard_arm_dim`/`ard_gripper_dim`/`ard_default_actuator_arm`에 리터럴 16/8 없음, grep
+확인). 진짜 하드코딩은:
+- `ard.py`의 `split_by_role`/`combine_by_role`/`AsymmetricResidualHeads`가 "연속·동일
+  길이·왼팔먼저" 구조를 함수 시그니처(`arm_dim: int` 하나)로 강제하는 것(숫자가 아니라
+  구조 가정).
+- `modeling_smolvla.py:1236`의 `F.mse_loss(u_t, v_t, reduction="none")` — 메인 회귀
+  손실이 진짜로 L2 하나로 고정.
+- chunk_size/n_action_steps는 이미 config대로 정확히 동작(검증까지 있음) — 하드코딩
+  아님, 수정 불필요.
+- 액션 정규화(`processor_smolvla.py`의 `NormalizerProcessorStep`)는 차원별 평균/표준편차
+  만 쓰고 시간축 awareness 전혀 없음 — `per_timestep_norm`은 순수 신규 기능.
+- `freeze_vision_encoder`(기본 True)는 **이미 존재**. `_get_default_peft_targets()`도
+  이미 차원 독립적.
+- `quantization` 옵션은 레포 전체에 **존재하지 않음**(grep 0건) — 작업 지시의 전제
+  ("기존 옵션은 그대로 두되")가 실제와 달랐다.
+- RoCo 공식 데이터셋(`rocochallenge2025/rocochallenge2026_Industrial_Assembly`)은 HF
+  Hub 차단으로 스키마를 못 열어봄 — 공개 스펙으로 진행, 미확인 표시(기존 모든 작업과
+  동일한 샌드박스 제약).
+
+보고 후 사용자에게 두 설계 결정을 확인받았다: (1) `ArmLayoutConfig`를 완전 일반화(임의
+비연속/비대칭 슬라이스)하지 않고, 기존 `ard_arm_dim` 등을 그대로 재사용하는 **얇은
+래퍼**로 간다(RoCo의 7+7 레이아웃도 기존 "연속·동일길이" 패턴으로 완전히 표현 가능해서
+`modeling_smolvla.py`의 7곳 슬라이스 조립 코드를 리팩터링할 필요가 없음). (2)
+`quantization` 필드는 추가하지 않는다(없는 기능의 placeholder를 만드는 건 YAGNI).
+
+## 구현
+
+1. **`role_map`**(`configuration_smolvla.py`) — `{"stabilizer":.., "actuator":..}` →
+   `__post_init__`에서 `ard_default_actuator_arm = role_map["actuator"]`로 파생(단일
+   소스 유지, 실제 분리/결합 로직은 여전히 `ard_default_actuator_arm` 하나만 읽음).
+2. **`action_space`**(`"joint"`\|`"ee"`) — `"ee"`면 `lac_mirror_sign`을 강제로 `None`
+   으로 덮어쓰고 경고 로그(관절 축 미러링 전제가 엔드이펙터 델타에는 안 맞음). config
+   레이어 변경만으로 충분 — 모델 코드는 전혀 안 건드림(`lac_mirror_sign`을 읽는 곳은
+   이미 `lac.py` 한 곳뿐이라 config에서 미리 고쳐두면 그걸로 끝).
+3. **`pos_loss_type`**(`"l2"`\|`"l1"`\|`"smooth_l1"`) — `modeling_smolvla.py`의
+   `F.mse_loss` 호출 한 곳을 3분기로 교체. L2는 목표 근처에서 기울기가 사라지는 문제가
+   있음(RoCo 1회 우승팀 보고, arXiv 2603.15469).
+4. **`per_timestep_norm`**(+`_a`/`_s`) — σ(t)=a+s·√t(t=실행 스텝 위치, 0..chunk_size-1).
+   `ard.py`에 순수 함수 3개(`compute_timestep_norm_sigma`/`apply_timestep_norm`/
+   `invert_timestep_norm`, 패딩 채널은 identity로 채움) 추가. 모델 wiring은 단 두 지점:
+   `VLAFlowMatching.forward()`가 ground-truth actions를 받는 즉시 스케일하고,
+   `_denoise_loop()`(모든 `sample_actions*` 4변형이 공유하는 **단 하나의 반환 지점**)가
+   최종 x_t를 역스케일 — 중간(denoise 루프 전체, LAC 포함)은 전부 스케일된 공간에서
+   동작하고 표준 정규화는 전혀 안 건드림. 꺼지면(기본) bit-for-bit 동일. LAC와 동시에
+   켜면 ρ/ω 임계값이 스케일된 공간 기준이 되는 상호작용이 있어 RoCo 프리셋은
+   `lac_mode="none"`으로 피함.
+5. **chunk_size/n_action_steps** — 조사 결과 이미 config대로 정확히 동작해서 코드 변경
+   없음. 테스트로 RoCo값(chunk 20/실행 5)에서 LAC 없이/있이 둘 다 정상 동작하는지만
+   확인.
+6. **`freeze_vision_encoder`** — 이미 존재(기본 True), 변경 없음. RoCo 프리셋에 명시적
+   으로만 박아서 학습 범위가 프리셋만 봐도 드러나게 함.
+7. **`scripts/fit_timestep_norm.py`**(신규) — 데이터셋의 위치별 정규화된 액션 표준편차를
+   `std(t) ≈ a + s·√t` 최소제곱 피팅. HF Hub 차단으로 실행 못 해봄(미검증).
+8. **`configs/presets/roco_board.yaml`**(신규) — `ard_arm_dim=7`/`ard_gripper_dim=1`
+   (공개 스펙 기반 가정, 미확인), `role_map={stabilizer:right, actuator:left}`,
+   `action_space=ee`, `pos_loss_type=l1`, `chunk_size=20`/`n_action_steps=5`,
+   `per_timestep_norm=true`(a/s는 미피팅 항등값), `freeze_vision_encoder=true`,
+   `lac_mode=none`. quantization 키 없음(위 참고). 값마다 한 줄 이유 주석.
+
+## 테스트
+
+`tests/test_configurable_ard.py`(17개, 전부 통과): 새 필드 기본값 no-op(bit-exact),
+7+7 레이아웃 forward/backward, role_map 반전(+잘못된 값 거부), pos_loss_type 3종(수학적
+성질 + 실제 torch 함수 dispatch 가로채기 확인 + 잘못된 값 거부), per_timestep_norm
+(스칼라/채널별+패딩 왕복오차, on/off 동작, 추론 경로 finite, a<=0 거부), action_space=ee
+→ mirror_sign 강제 비활성+경고(+joint면 유지, 잘못된 값 거부), RoCo 프리셋 로드 검증 +
+작은 합성 모델 학습/추론 스모크 테스트.
+
+**테스트 작성 중 발견한 버그(테스트 자체의 버그, 코드 버그 아님)**: 처음 "새 필드
+no-op" 비교 테스트가 두 정책의 loss가 다르게 나와 실패했다 — 원인은 `batch`를 만드는
+데 쓴 `torch.manual_seed`가 forward() 직전 재설정 시점과 안 맞아서(한쪽은 batch 생성
+직후 RNG 상태를 이어서 forward, 다른 쪽은 seed를 다시 리셋하고 forward) 두 forward()
+호출의 noise/time 샘플링이 서로 다른 지점에서 RNG를 소비한 것 — **모델 코드와는 무관한
+테스트 작성 실수**였다(같은 정책을 여러 번 forward하면 완벽히 결정적임을 별도로 확인해
+입증). batch 생성과 forward() 사이의 seed 리셋 위치를 맞춰서 고쳤다.
+
+`pytest tests/`(130개 전부 통과 — 기존 113 + 신규 17). 기존 `test_ard*`/`test_lac*`/
+`test_closed_loop*`/`test_judge*` 전부 회귀 없음.
+
+## 문서
+
+`docs/configurable_ard.md`(신규) — 조사 결과 표, 각 필드의 수식적 근거(arXiv
+2603.15469/2606.27163 인용), RoCo 프리셋 값 표 + 선택 이유, quantization을 추가하지
+않은 이유, "검증한 것/못 한 것"(README 관례). README.md에 새 섹션 + 링크 추가.
+
+## 검증한 것 / 못 한 것
+
+**검증함**: 위 테스트 전부(합성 모델, Hub 접근 없음). **못 함**(범위 밖/미확인): RoCo
+공식 데이터셋 스키마(HF Hub 차단, 공개 스펙 기반 가정으로 대체), `per_timestep_norm_a`/
+`_s` 실데이터 피팅(스크립트는 작성, 실행 못 함), 실제 SmolVLM2 가중치/실제 로봇·시뮬,
+chunk_size=20/n_action_steps=5가 실제 RoCo 과제에 적절한 값인지, `per_timestep_norm`+
+`lac_mode`를 동시에 켠 실제 효과(분석만 함, 실측 안 함).
+
+## 다음에 할 일
+
+- RoCo 데이터셋 접근이 가능한 환경에서: `scripts/fit_timestep_norm.py` 실행, 실제
+  `ard_arm_dim`/`ard_gripper_dim`/`action_space` 가정 재확인, `scripts/train_ard.py`로
+  작은 규모 실제 학습.
+- `per_timestep_norm` + `lac_mode`를 함께 쓰고 싶다면 ρ/ω 임계값 재캘리브레이션 필요.

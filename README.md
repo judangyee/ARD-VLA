@@ -164,6 +164,23 @@ python scripts/compare_lac_closed_loop_modes.py # 폐루프 경로, 합성 백�
 pytest tests/test_judge.py tests/test_ard_integration.py tests/test_decision_logic.py tests/test_closed_loop.py
 ```
 
+## 설정 가능한 ARD (Configurable ARD) + RoCo Challenge 프리셋
+
+ARD-VLA는 원래 OpenArm 16채널/왼팔=Stabilizer/chunk 50/L2 손실 전제였는데, 대회마다 과제가
+바뀌는 RoCo Challenge 같은 쓰임을 위해 이 전제들을 전부 config로 뺐습니다: `role_map`(역할-팔
+매핑), `action_space`("joint"\|"ee", "ee"면 `lac_mirror_sign` 자동 비활성), `pos_loss_type`
+("l2"\|"l1"\|"smooth_l1", L2의 목표 근처 기울기 소실 문제 회피), `per_timestep_norm`(청크 내
+위치별 정규화 스케일). 전부 기본값이 기존과 bit-for-bit 동일합니다. `configs/presets/
+roco_board.yaml`이 RoCo용 조합을 담고 있습니다(7+7=14차원, ee, l1, chunk 20/실행 5 등 —
+**공개 스펙 기반 가정**, 실제 데이터셋 스키마는 HF Hub 차단으로 미확인). 조사 결과("뭐가 진짜
+하드코딩이었나"), 각 필드의 수식적 근거, 검증된 것/미확인 사항은
+**[docs/configurable_ard.md](docs/configurable_ard.md)** 에 있습니다.
+
+```bash
+pytest tests/test_configurable_ard.py
+python scripts/fit_timestep_norm.py --dataset-repo-id <HF_USER>/<DATASET> --chunk-size 20
+```
+
 ## 학습 (로컬 GPU 환경)
 
 lerobot의 범용 학습 CLI(`lerobot_train.py`)는 모든 정책을 알아야 하는 `policies/factory.py`에
