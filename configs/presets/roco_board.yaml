@@ -1,0 +1,66 @@
+# RoCo Challenge(산업용 양팔 조립) 프리셋 — SmolVLAConfig 생성 시 **override로만** 쓴다.
+# input_features/output_features/vlm_model_name 등 데이터셋에 따라 달라지는 값은 포함하지
+# 않으므로, 실제 사용 시에는 기본 kwargs와 합쳐서 넘겨야 한다:
+#
+#   import yaml
+#   from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+#   overrides = yaml.safe_load(open("configs/presets/roco_board.yaml"))
+#   config = SmolVLAConfig(input_features=..., output_features=..., **overrides)
+#
+# **미확인 사항(docs/configurable_ard.md 참고)**: 이 샌드박스는 Hugging Face Hub 접근이
+# 막혀 있어 공식 데이터셋(rocochallenge2025/rocochallenge2026_Industrial_Assembly, LeRobot
+# v3.0, ~1.1GB)의 meta/info.json을 직접 열어보지 못했다. 아래 ard_arm_dim/ard_gripper_dim은
+# 과제 설명에 공개된 스펙(action 14차원 = 7-DoF 양팔 엔드이펙터 목표+그리퍼)으로부터의
+# **가정값**이다 — 실제로는 7이 "6D pose + 그리퍼 1"인지 다른 분해인지 확인되지 않았다.
+# per_timestep_norm_a/_s도 실제 데이터로 피팅하지 못해 항등(identity, a=1,s=0)으로 둔다 —
+# scripts/fit_timestep_norm.py --dataset-repo-id rocochallenge2025/rocochallenge2026_Industrial_Assembly
+# --chunk-size 20 를 돌려서 갱신해야 한다.
+
+use_ard: true  # 비대칭 역할 분리(Stabilizer/Actuator) 자체는 RoCo에서도 그대로 유효한 전제
+
+# 공식 데이터는 "대부분 왼팔만 사용"(공개 스펙) — 즉 왼팔이 실제 작업(조립)을 수행하는
+# Actuator, 오른팔이 보조/고정 역할인 Stabilizer다. 기존 기본값(ard_default_actuator_arm=
+# "right")과 반대라서 role_map으로 명시적으로 뒤집는다.
+role_map:
+  stabilizer: right
+  actuator: left
+
+# 공개 스펙: action 14차원 = 7-DoF 양팔(vega_1u) 엔드이펙터 목표. 팔 하나당 7채널 중 1개를
+# 그리퍼로 가정(나머지 6=pose). **미확인** — 실제로는 ard_arm_dim/ard_gripper_dim 조합이
+# 다를 수 있다(위 상단 주석 참고).
+ard_arm_dim: 7
+ard_gripper_dim: 1
+
+# 액션이 관절 각도가 아니라 엔드이펙터 목표 pose이므로 "joint"가 아니라 "ee" — 이러면
+# configuration_smolvla.py의 __post_init__이 lac_mirror_sign(관절 축 미러링 가정)을 자동으로
+# 무효화한다(lac_mode=none이라 당장은 영향 없지만, 나중에 LAC를 켜게 될 경우를 대비).
+action_space: ee
+
+# RoCo Challenge 1회 우승팀이 목표 근처에서 기울기가 사라지는 L2 대신 L1로 바꿔 끝까지
+# 정밀하게 밀어넣는 효과를 봤다고 보고함(arXiv 2603.15469).
+pos_loss_type: l1
+
+# 공개 스펙 기준(시연 200개, 10fps)으로 조립처럼 긴 호흡의 작업에 맞춘 값 — 매 회차 과제가
+# 바뀌면 재튜닝이 필요한 숫자라 프리셋에 명시적으로 박아둔다.
+chunk_size: 20
+n_action_steps: 5  # chunk_size보다 짧게 둬서 매 5스텝마다 재계획(replan) — 폐루프 피드백 반영 빈도
+
+# LeHome 우승 보고서(arXiv 2606.27163)식 "먼 미래일수록 분산이 커진다"는 가정을 켠다 —
+# a/s는 아직 실제 데이터로 피팅 못해 항등값(위 상단 주석 참고).
+per_timestep_norm: true
+per_timestep_norm_a: 1.0
+per_timestep_norm_s: 0.0
+
+# 비전 인코더는 고정(이미 SmolVLAConfig 기본값과 동일 — 명시적으로 박아서 프리셋만 봐도
+# 학습 범위가 드러나게 함), 액션 expert 전체 학습 + VLM은 LoRA(PEFT 설정은 프리셋 바깥,
+# 학습 스크립트의 --use-peft 등으로 켠다 — _get_default_peft_targets()가 이미 VLM
+# q/v_proj + 공용 projection들을 타겟으로 잡는다).
+freeze_vision_encoder: true
+
+# per_timestep_norm과 동시에 켜면 LAC의 rho/omega 임계값이 "스케일된 공간" 기준으로 틀어질
+# 수 있어(modeling_smolvla.py의 forward()/​_denoise_loop() 주석 참고), 재캘리브레이션 전까지는
+# 꺼둔다 — RoCo 1차 제출 범위에서는 LAC 자체가 필수가 아니다.
+lac_mode: none
+
+# quantization: 이 레포 코드베이스에 그런 옵션이 아직 존재하지 않아(grep 결과 0건) 프리셋에서도
+# 생략한다 — docs/configurable_ard.md 참고.
