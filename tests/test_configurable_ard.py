@@ -261,111 +261,126 @@ def test_action_space_rejects_unknown_value():
         _minimal_config(action_space="cartesian")
 
 
-# --- 8. ard_angle_dims: RoCo rx/ry/rz 각도 래핑 ---
+# --- 8. angle_unwrap_dims: 데이터 전처리 unwrap/rewrap (ARD/손실과 무관) ---
+#
+# 이전에는 pos_loss(u_t/v_t = flow-matching 속도장)에 직접 각도 래핑을 걸었는데, 틀린
+# 설계였다 — u_t/v_t는 액션이 아니라 노이즈-액션의 속도장이라 각도 주기성이 적용되지
+# 않고, 정상적인 큰 오차까지 왜곡시킨다(PROGRESS.md 참고). 대신 데이터 전처리 단계
+# (processor_smolvla.py의 AngleUnwrapProcessorStep/AngleRewrapProcessorStep)에서 다룬다.
 
 
-def test_wrap_to_pi_removes_2pi_boundary_discontinuity():
-    from lerobot.policies.smolvla.ard import wrap_to_pi
-
-    # 3.14 vs -3.14: 물리적으로는 거의 같은 각도인데 raw 차이는 ~2*pi에 가깝다.
-    diff = torch.tensor([3.14 - (-3.14), 0.1, -0.1, 2 * math.pi, -2 * math.pi])
-    wrapped = wrap_to_pi(diff)
-    assert wrapped[0].abs() < 0.01, f"경계 불연속이 감싸지지 않음: {wrapped[0]}"
-    assert torch.allclose(wrapped[1:3], diff[1:3])  # 경계 멀리 있는 값은 그대로
-    assert torch.allclose(wrapped[3:], torch.zeros(2), atol=1e-5)  # 정확히 2*pi 배수는 0
+def test_angle_unwrap_dims_rejects_invalid_values():
+    with pytest.raises(ValueError, match="angle_unwrap_dims"):
+        _minimal_config(angle_unwrap_dims=[])
+    with pytest.raises(ValueError, match="angle_unwrap_dims"):
+        _minimal_config(angle_unwrap_dims=[3, 3])
+    with pytest.raises(ValueError, match="angle_unwrap_dims"):
+        _minimal_config(max_action_dim=16, angle_unwrap_dims=[16])  # max_action_dim 범위 밖
 
 
-def test_build_angle_channel_mask_applies_to_both_arm_blocks_and_skips_padding():
-    from lerobot.policies.smolvla.ard import build_angle_channel_mask
+def _make_transition(action):
+    from lerobot.processor import TransitionKey
 
-    mask = build_angle_channel_mask(angle_dims=[3, 4, 5], arm_dim=7, total_dim=16, device=torch.device("cpu"))
-    expected = torch.zeros(16, dtype=torch.bool)
-    expected[[3, 4, 5, 10, 11, 12]] = True  # 왼팔 블록[0:7] + 오른팔 블록[7:14], 패딩[14:16]은 제외
-    assert torch.equal(mask, expected)
+    return {TransitionKey.ACTION: action, TransitionKey.OBSERVATION: None, TransitionKey.COMPLEMENTARY_DATA: {}}
 
 
-def test_apply_angle_aware_target_wraps_only_masked_channels():
-    from lerobot.policies.smolvla.ard import apply_angle_aware_target
+def test_angle_unwrap_step_makes_chunk_continuous_across_pi_boundary():
+    from lerobot.policies.smolvla.processor_smolvla import AngleUnwrapProcessorStep
+    from lerobot.processor import TransitionKey
 
-    u_t = torch.tensor([[3.14, 5.0]])
-    v_t = torch.tensor([[-3.14, 0.0]])  # 채널0: 경계 근처(거의 같은 각도), 채널1: 진짜 큰 차이
-    mask = torch.tensor([True, False])
+    step = AngleUnwrapProcessorStep(angle_dims=(0,))
+    t = torch.linspace(3.0, 3.6, 5)
+    wrapped = ((t + math.pi) % (2 * math.pi)) - math.pi  # ±pi 경계를 넘는 raw 궤적
+    raw = torch.zeros(1, 5, 2)
+    raw[0, :, 0] = wrapped
+    raw[0, :, 1] = torch.arange(5.0)  # angle_dims에 없는 채널은 건드리면 안 됨
 
-    v_t_for_loss = apply_angle_aware_target(u_t, v_t, mask)
-    diff0 = (u_t[0, 0] - v_t_for_loss[0, 0]).item()
-    assert abs(diff0) < 0.01, f"마스크된 채널은 wrap돼야 한다: {diff0}"
-    assert torch.equal(v_t_for_loss[:, 1], v_t[:, 1])  # 마스크 안 된 채널은 그대로
+    out = step(_make_transition(raw.clone()))[TransitionKey.ACTION]
 
-
-def test_apply_angle_aware_target_is_identity_when_mask_all_false():
-    from lerobot.policies.smolvla.ard import apply_angle_aware_target
-
-    u_t = torch.randn(2, 4)
-    v_t = torch.randn(2, 4)
-    mask = torch.zeros(4, dtype=torch.bool)
-    # u_t - (u_t - v_t)가 부동소수점상 v_t와 완전히 bit-exact하지 않을 수 있어(비결합성),
-    # 실제 modeling_smolvla.py는 ard_angle_dims가 없으면 이 함수를 호출조차 안 한다(아래
-    # test_pos_loss_type_dispatches_to_matching_torch_loss_fn과 같은 패턴) — 여기서는 수학적으로
-    # "거의 동일"함만 확인한다.
-    assert torch.allclose(apply_angle_aware_target(u_t, v_t, mask), v_t, atol=1e-6)
+    assert torch.allclose(out[0, :, 0], t, atol=1e-4), f"연속적으로 펴지지 않음: {out[0, :, 0]}"
+    assert torch.equal(out[..., 1], raw[..., 1])  # 지정 안 한 채널은 그대로
 
 
-def test_ard_angle_dims_rejects_invalid_values():
-    with pytest.raises(ValueError, match="ard_angle_dims"):
-        _minimal_config(use_ard=True, ard_angle_dims=[])
-    with pytest.raises(ValueError, match="ard_angle_dims"):
-        _minimal_config(use_ard=True, ard_angle_dims=[3, 3])
-    with pytest.raises(ValueError, match="ard_angle_dims"):
-        _minimal_config(use_ard=True, ard_arm_dim=7, ard_angle_dims=[7])  # arm_dim 범위 밖
-    with pytest.raises(ValueError, match="ard_angle_dims"):
-        _minimal_config(use_ard=False, ard_angle_dims=[3])  # use_ard=False인데 지정
+def test_angle_rewrap_step_inverts_unwrap():
+    from lerobot.policies.smolvla.processor_smolvla import AngleRewrapProcessorStep
+    from lerobot.processor import TransitionKey
+
+    step = AngleRewrapProcessorStep(angle_dims=(0, 1))
+    continuous = torch.tensor([3.6, -4.0, 0.2])  # 채널 0,1은 pi 밖(unwrap된 공간), 채널 2는 대상 아님
+    out = step(_make_transition(continuous.clone()))[TransitionKey.ACTION]
+
+    assert torch.all(out[:2] >= -math.pi) and torch.all(out[:2] < math.pi)
+    assert out[2] == continuous[2]  # angle_dims에 없는 채널은 그대로
+    # wrap_to_pi(continuous)와 동일해야 함(수동 계산과 비교)
+    expected = continuous[:2] - 2 * math.pi * torch.round(continuous[:2] / (2 * math.pi))
+    assert torch.allclose(out[:2], expected, atol=1e-6)
 
 
-def test_ard_angle_dims_default_skips_wrapping_call(build_tiny_policy, build_tiny_batch, monkeypatch):
-    """ard_angle_dims=None(기본)이면 modeling_smolvla.py가 apply_angle_aware_target을 전혀
-    호출하지 않아야 한다(호출 자체가 없어야 bit-exact가 보장됨)."""
-    import lerobot.policies.smolvla.modeling_smolvla as mod
+def test_angle_unwrap_rewrap_round_trip_within_one_chunk():
+    from lerobot.policies.smolvla.processor_smolvla import AngleRewrapProcessorStep, AngleUnwrapProcessorStep
+    from lerobot.processor import TransitionKey
 
-    calls = []
-    original = mod.apply_angle_aware_target
+    unwrap_step = AngleUnwrapProcessorStep(angle_dims=(0, 1))
+    rewrap_step = AngleRewrapProcessorStep(angle_dims=(0, 1))
 
-    def _counting(*a, **k):
-        calls.append(1)
-        return original(*a, **k)
+    torch.manual_seed(0)
+    raw = (torch.rand(1, 6, 3) * 2 - 1) * math.pi  # [-pi, pi) 범위의 raw 액션 청크
 
-    monkeypatch.setattr(mod, "apply_angle_aware_target", _counting)
+    unwrapped = unwrap_step(_make_transition(raw.clone()))[TransitionKey.ACTION]
+    rewrapped = rewrap_step(_make_transition(unwrapped[0, -1].clone()))[TransitionKey.ACTION]  # 마지막 스텝만 재감싸기
 
-    policy = build_tiny_policy(arm_dim=7, use_ard=True, ard_arm_dim=7, ard_gripper_dim=1, num_steps=2)
-    policy.train()
-    batch = build_tiny_batch(batch_size=2, arm_dim=7, chunk=8, lang_len=6)
-    policy.forward(batch)
-    assert calls == [], "ard_angle_dims=None인데 apply_angle_aware_target이 호출됐다"
+    assert torch.allclose(rewrapped[:2], raw[0, -1, :2], atol=1e-4)
+    assert torch.equal(rewrapped[2], raw[0, -1, 2])  # unwrap 대상이 아닌 채널
 
 
-def test_ard_angle_dims_set_calls_wrapping_and_stays_finite(build_tiny_policy, build_tiny_batch, monkeypatch):
-    import lerobot.policies.smolvla.modeling_smolvla as mod
+def test_angle_steps_pass_through_when_action_missing_or_disabled():
+    """추론 전처리는 액션이 없는 입력(실제 로봇 관측)도 받는다 — 에러 없이 통과해야 한다.
+    angle_dims가 비어 있으면(기본) 둘 다 완전한 identity다."""
+    from lerobot.policies.smolvla.processor_smolvla import AngleRewrapProcessorStep, AngleUnwrapProcessorStep
+    from lerobot.processor import TransitionKey
 
-    calls = []
-    original = mod.apply_angle_aware_target
+    no_action = _make_transition(None)
+    assert AngleUnwrapProcessorStep(angle_dims=(0,))(no_action)[TransitionKey.ACTION] is None
+    assert AngleRewrapProcessorStep(angle_dims=(0,))(no_action)[TransitionKey.ACTION] is None
 
-    def _counting(*a, **k):
-        calls.append(1)
-        return original(*a, **k)
+    raw = torch.randn(1, 4, 3)
+    assert torch.equal(AngleUnwrapProcessorStep()(_make_transition(raw.clone()))[TransitionKey.ACTION], raw)
+    single = torch.randn(3)
+    assert torch.equal(AngleRewrapProcessorStep()(_make_transition(single.clone()))[TransitionKey.ACTION], single)
 
-    monkeypatch.setattr(mod, "apply_angle_aware_target", _counting)
 
-    arm_dim = 7
-    policy = build_tiny_policy(
-        arm_dim=arm_dim, use_ard=True, ard_arm_dim=arm_dim, ard_gripper_dim=1,
-        ard_angle_dims=[3, 4, 5], num_steps=2,
+def test_angle_unwrap_dims_inserted_into_pipeline_only_when_set(monkeypatch):
+    """make_smolvla_pre_post_processors()가 실제로 만드는 파이프라인을 직접 검사한다 —
+    angle_unwrap_dims=None(기본)이면 AngleUnwrapProcessorStep/AngleRewrapProcessorStep이
+    전혀 없고, 설정하면 각각 정확히 하나씩 들어간다. 토크나이저 로드(HF Hub 접근)만
+    몽키패치로 피한다(conftest.py의 AutoConfig/AutoProcessor 패턴과 동일)."""
+    import transformers
+
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+    from lerobot.policies.smolvla.processor_smolvla import (
+        AngleRewrapProcessorStep,
+        AngleUnwrapProcessorStep,
+        make_smolvla_pre_post_processors,
     )
-    policy.train()
-    batch = build_tiny_batch(batch_size=2, arm_dim=arm_dim, chunk=8, lang_len=6)
-    loss, _ = policy.forward(batch)
 
-    assert calls == [1]
-    assert torch.isfinite(loss)
-    loss.backward()
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", staticmethod(lambda *a, **k: object()))
+
+    def _build(**overrides):
+        config = SmolVLAConfig(
+            input_features={"observation.state": PolicyFeature(type=FeatureType.STATE, shape=(16,))},
+            output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(16,))},
+            max_state_dim=16, max_action_dim=16, device="cpu", **overrides,
+        )
+        return make_smolvla_pre_post_processors(config)
+
+    pre_off, post_off = _build()
+    assert not any(isinstance(s, AngleUnwrapProcessorStep) for s in pre_off.steps)
+    assert not any(isinstance(s, AngleRewrapProcessorStep) for s in post_off.steps)
+
+    pre_on, post_on = _build(angle_unwrap_dims=[3, 4, 5])
+    assert sum(isinstance(s, AngleUnwrapProcessorStep) for s in pre_on.steps) == 1
+    assert sum(isinstance(s, AngleRewrapProcessorStep) for s in post_on.steps) == 1
 
 
 # --- 7. RoCo Challenge 프리셋 ---
@@ -394,10 +409,10 @@ def test_roco_preset_loads_into_valid_config():
     assert config.per_timestep_norm is True
     assert config.freeze_vision_encoder is True
     assert config.lac_mode == "none"
-    # 확인된 RoCo 스키마: 팔당 [ee pose 6 + 그리퍼 1] = 7채널, rx/ry/rz는 상대 인덱스 3,4,5.
+    # 확인된 RoCo 스키마: 팔당 [ee pose 6 + 그리퍼 1] = 7채널.
     assert config.ard_arm_dim == 7
     assert config.ard_gripper_dim == 1
-    assert config.ard_angle_dims == [3, 4, 5]
+    assert config.angle_unwrap_dims is None  # 전처리 unwrap은 일단 꺼둠(docs 참고)
     assert 2 * config.ard_arm_dim == config.action_feature.shape[0] == 14
 
 
