@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 import torch
@@ -260,6 +261,113 @@ def test_action_space_rejects_unknown_value():
         _minimal_config(action_space="cartesian")
 
 
+# --- 8. ard_angle_dims: RoCo rx/ry/rz 각도 래핑 ---
+
+
+def test_wrap_to_pi_removes_2pi_boundary_discontinuity():
+    from lerobot.policies.smolvla.ard import wrap_to_pi
+
+    # 3.14 vs -3.14: 물리적으로는 거의 같은 각도인데 raw 차이는 ~2*pi에 가깝다.
+    diff = torch.tensor([3.14 - (-3.14), 0.1, -0.1, 2 * math.pi, -2 * math.pi])
+    wrapped = wrap_to_pi(diff)
+    assert wrapped[0].abs() < 0.01, f"경계 불연속이 감싸지지 않음: {wrapped[0]}"
+    assert torch.allclose(wrapped[1:3], diff[1:3])  # 경계 멀리 있는 값은 그대로
+    assert torch.allclose(wrapped[3:], torch.zeros(2), atol=1e-5)  # 정확히 2*pi 배수는 0
+
+
+def test_build_angle_channel_mask_applies_to_both_arm_blocks_and_skips_padding():
+    from lerobot.policies.smolvla.ard import build_angle_channel_mask
+
+    mask = build_angle_channel_mask(angle_dims=[3, 4, 5], arm_dim=7, total_dim=16, device=torch.device("cpu"))
+    expected = torch.zeros(16, dtype=torch.bool)
+    expected[[3, 4, 5, 10, 11, 12]] = True  # 왼팔 블록[0:7] + 오른팔 블록[7:14], 패딩[14:16]은 제외
+    assert torch.equal(mask, expected)
+
+
+def test_apply_angle_aware_target_wraps_only_masked_channels():
+    from lerobot.policies.smolvla.ard import apply_angle_aware_target
+
+    u_t = torch.tensor([[3.14, 5.0]])
+    v_t = torch.tensor([[-3.14, 0.0]])  # 채널0: 경계 근처(거의 같은 각도), 채널1: 진짜 큰 차이
+    mask = torch.tensor([True, False])
+
+    v_t_for_loss = apply_angle_aware_target(u_t, v_t, mask)
+    diff0 = (u_t[0, 0] - v_t_for_loss[0, 0]).item()
+    assert abs(diff0) < 0.01, f"마스크된 채널은 wrap돼야 한다: {diff0}"
+    assert torch.equal(v_t_for_loss[:, 1], v_t[:, 1])  # 마스크 안 된 채널은 그대로
+
+
+def test_apply_angle_aware_target_is_identity_when_mask_all_false():
+    from lerobot.policies.smolvla.ard import apply_angle_aware_target
+
+    u_t = torch.randn(2, 4)
+    v_t = torch.randn(2, 4)
+    mask = torch.zeros(4, dtype=torch.bool)
+    # u_t - (u_t - v_t)가 부동소수점상 v_t와 완전히 bit-exact하지 않을 수 있어(비결합성),
+    # 실제 modeling_smolvla.py는 ard_angle_dims가 없으면 이 함수를 호출조차 안 한다(아래
+    # test_pos_loss_type_dispatches_to_matching_torch_loss_fn과 같은 패턴) — 여기서는 수학적으로
+    # "거의 동일"함만 확인한다.
+    assert torch.allclose(apply_angle_aware_target(u_t, v_t, mask), v_t, atol=1e-6)
+
+
+def test_ard_angle_dims_rejects_invalid_values():
+    with pytest.raises(ValueError, match="ard_angle_dims"):
+        _minimal_config(use_ard=True, ard_angle_dims=[])
+    with pytest.raises(ValueError, match="ard_angle_dims"):
+        _minimal_config(use_ard=True, ard_angle_dims=[3, 3])
+    with pytest.raises(ValueError, match="ard_angle_dims"):
+        _minimal_config(use_ard=True, ard_arm_dim=7, ard_angle_dims=[7])  # arm_dim 범위 밖
+    with pytest.raises(ValueError, match="ard_angle_dims"):
+        _minimal_config(use_ard=False, ard_angle_dims=[3])  # use_ard=False인데 지정
+
+
+def test_ard_angle_dims_default_skips_wrapping_call(build_tiny_policy, build_tiny_batch, monkeypatch):
+    """ard_angle_dims=None(기본)이면 modeling_smolvla.py가 apply_angle_aware_target을 전혀
+    호출하지 않아야 한다(호출 자체가 없어야 bit-exact가 보장됨)."""
+    import lerobot.policies.smolvla.modeling_smolvla as mod
+
+    calls = []
+    original = mod.apply_angle_aware_target
+
+    def _counting(*a, **k):
+        calls.append(1)
+        return original(*a, **k)
+
+    monkeypatch.setattr(mod, "apply_angle_aware_target", _counting)
+
+    policy = build_tiny_policy(arm_dim=7, use_ard=True, ard_arm_dim=7, ard_gripper_dim=1, num_steps=2)
+    policy.train()
+    batch = build_tiny_batch(batch_size=2, arm_dim=7, chunk=8, lang_len=6)
+    policy.forward(batch)
+    assert calls == [], "ard_angle_dims=None인데 apply_angle_aware_target이 호출됐다"
+
+
+def test_ard_angle_dims_set_calls_wrapping_and_stays_finite(build_tiny_policy, build_tiny_batch, monkeypatch):
+    import lerobot.policies.smolvla.modeling_smolvla as mod
+
+    calls = []
+    original = mod.apply_angle_aware_target
+
+    def _counting(*a, **k):
+        calls.append(1)
+        return original(*a, **k)
+
+    monkeypatch.setattr(mod, "apply_angle_aware_target", _counting)
+
+    arm_dim = 7
+    policy = build_tiny_policy(
+        arm_dim=arm_dim, use_ard=True, ard_arm_dim=arm_dim, ard_gripper_dim=1,
+        ard_angle_dims=[3, 4, 5], num_steps=2,
+    )
+    policy.train()
+    batch = build_tiny_batch(batch_size=2, arm_dim=arm_dim, chunk=8, lang_len=6)
+    loss, _ = policy.forward(batch)
+
+    assert calls == [1]
+    assert torch.isfinite(loss)
+    loss.backward()
+
+
 # --- 7. RoCo Challenge 프리셋 ---
 
 
@@ -286,6 +394,11 @@ def test_roco_preset_loads_into_valid_config():
     assert config.per_timestep_norm is True
     assert config.freeze_vision_encoder is True
     assert config.lac_mode == "none"
+    # 확인된 RoCo 스키마: 팔당 [ee pose 6 + 그리퍼 1] = 7채널, rx/ry/rz는 상대 인덱스 3,4,5.
+    assert config.ard_arm_dim == 7
+    assert config.ard_gripper_dim == 1
+    assert config.ard_angle_dims == [3, 4, 5]
+    assert 2 * config.ard_arm_dim == config.action_feature.shape[0] == 14
 
 
 def test_roco_preset_tiny_model_trains_and_infers(build_tiny_policy, build_tiny_batch):
