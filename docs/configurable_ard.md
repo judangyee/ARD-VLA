@@ -4,7 +4,8 @@
 
 ARD-VLA는 원래 OpenArm 16채널(팔당 8 DoF, 왼팔=Stabilizer 고정, chunk 50, pos_loss는 L2)
 전제로 설계됐습니다. RoCo Challenge처럼 대회마다 로봇/액션 공간/우세 팔이 바뀌는 과제에
-재사용하려고, 이 하드코딩을 config 손잡이 4개로 뺐습니다. **이번 작업은 구조 구현 + 작은
+재사용하려고, 이 하드코딩을 config 손잡이 5개(`role_map`/`action_space`/`pos_loss_type`/
+`per_timestep_norm`/`ard_angle_dims`)로 뺐습니다. **이번 작업은 구조 구현 + 작은
 합성 모델 검증까지입니다** — 실제 SmolVLM2 가중치나 RoCo 공식 데이터셋에서는 돌려보지
 않았습니다(아래 "검증한 것 / 못 한 것" 참고).
 
@@ -38,6 +39,7 @@ ARD-VLA는 원래 OpenArm 16채널(팔당 8 DoF, 왼팔=Stabilizer 고정, chunk
 | `pos_loss_type` | `"l2"` | `"l2"`\|`"l1"`\|`"smooth_l1"`. 메인 flow-matching 회귀 손실(`modeling_smolvla.py`의 `F.*_loss(u_t, v_t)`) 종류 |
 | `per_timestep_norm` | `False` | 켜면 청크 내 실행 위치 t(0..chunk_size-1)마다 σ(t)=a+s·√t로 추가 스케일 |
 | `per_timestep_norm_a`/`per_timestep_norm_s` | `1.0`/`0.0` | 스칼라 또는 (실제 액션 차원,) 리스트. `scripts/fit_timestep_norm.py`로 피팅 |
+| `ard_angle_dims` | `None` | 각 팔 블록 내 회전(라디안) 채널의 상대 인덱스 리스트(0..`ard_arm_dim`-1). 메인 pos_loss 계산에서 이 채널들의 (목표-예측) 차이를 [-π, π)로 감싸 2π 경계 불연속을 없앤다. `use_ard=True`일 때만 의미 있음 |
 
 전부 기본값이 기존 동작과 동일해서 **꺼져 있으면 bit-for-bit 동일**합니다
 (`tests/test_configurable_ard.py::test_new_config_fields_default_to_noop`).
@@ -77,19 +79,49 @@ L2(MSE)는 예측이 목표에 가까워질수록 기울기(`2*(pred-target)`)�
 위치별 정규화된 액션 표준편차에 최소제곱 피팅해서 a/s를 구합니다. **이 샌드박스는 HF Hub
 접근이 막혀 있어 실행해보지 못했습니다** — 로컬/GPU 환경에서 돌려야 합니다.
 
-### `action_space`/`role_map` — RoCo Challenge 공개 스펙과의 매핑
+### `ard_angle_dims` — 왜 회전 채널에 각도 래핑이 필요한가
+
+RoCo처럼 `action_space="ee"`에서 rx/ry/rz(라디안)는 ±π에서 순환합니다 — 예측이 3.14,
+목표가 -3.14라면 물리적으로는 거의 같은 각도인데 raw 차이는 ~2π(약 6.28)로 보여서
+L1/L2/Smooth-L1 손실과 그 그래디언트가 거짓으로 커집니다. `ard_angle_dims`를 설정하면
+(`ard.py`의 `wrap_to_pi`/`build_angle_channel_mask`/`apply_angle_aware_target`),
+`modeling_smolvla.py`의 pos_loss 계산에서 그 채널들의 `(u_t - v_t)` 차이를 `[-π, π)`로
+감싼 뒤, **기존 `F.mse_loss`/`F.l1_loss`/`F.smooth_l1_loss` 호출부를 그대로 둔 채** 그
+자리에 넣을 "각도-인식 타깃"(`u_t - wrapped_diff`)으로 바꿔치기합니다 — 이 함수들이
+내부적으로 입력-타깃 차이만 보기 때문에 가능한 트릭입니다.
+
+**단위 관련 주의(미검증)**: `wrap_to_pi`는 입력이 실제 라디안 단위일 때만 정확합니다.
+하지만 이 지점의 `u_t`/`v_t`는 이미 표준 차원별(평균/표준편차) z-score 정규화를 거친
+값입니다(`NormalizerProcessorStep`이 `policy.forward()` 호출 **전에** 적용됨, 아래 "확인한
+것" 참고) — 그 채널의 std가 정확히 1이 아니면 경계가 `2π`가 아니라 `2π/std`로 바뀝니다.
+모델에는 `std`가 전달되지 않아 이 보정을 하지 못하므로, 표준 정규화를 쓰는 설정(RoCo
+포함)에서는 **근사치**입니다. 정확한 경계가 필요하면 실제 std로
+`2π/std`를 계산해 두 번째 wrap을 추가하는 식으로 확장해야 합니다 — 지금은 구현하지
+않았습니다.
+
+### `action_space`/`role_map` — RoCo Challenge 공식 스키마와의 매핑
 
 RoCo Challenge 공식 데이터셋(`rocochallenge2025/rocochallenge2026_Industrial_Assembly`,
-LeRobot v3.0, ~1.1GB)은 **이 샌드박스에서 HF Hub 접근이 막혀 있어 meta/info.json을 직접
-열어보지 못했습니다** — 아래는 과제 설명에 공개된 스펙(action 14차원 = 7-DoF 양팔
-`vega_1u` 엔드이펙터 목표+그리퍼, state 44차원, 카메라 3개 240x320, 10fps, 시연 200개,
-대부분 왼팔만 사용)으로부터의 **가정**입니다:
+LeRobot v3.0, ~1.1GB)은 **이 샌드박스에서 여전히 HF Hub 접근이 막혀 있어 meta/info.json을
+직접 열어보지 못합니다**. 다만 **사용자가 직접 확인해서 전달한 스키마(2026-10-29)** 는
+다음과 같습니다 — action 14차원 순서:
 
-- `ard_arm_dim=7`, `ard_gripper_dim=1` — "7-DoF 양팔"을 "팔당 6D pose + 그리퍼 1"로 가정.
-  **미확인** — 실제로는 다른 분해(예: 7=관절, 그리퍼 별도)일 수 있습니다.
-- "대부분 왼팔만 사용" → 왼팔이 실제 작업(Actuator), 오른팔이 보조(Stabilizer) →
+```
+left_ee_x, left_ee_y, left_ee_z, left_ee_rx, left_ee_ry, left_ee_rz, left_gripper,
+right_ee_x, right_ee_y, right_ee_z, right_ee_rx, right_ee_ry, right_ee_rz, right_gripper
+```
+
+즉 팔별로 연속된 **[엔드이펙터 pose 6(xyz+rxryrz) + 그리퍼 1] = 7채널** 블록이 왼팔,
+오른팔 순서로 이어집니다. 이로부터:
+
+- `ard_arm_dim=7`, `ard_gripper_dim=1`(마지막 1채널=그리퍼) — **확인됨**, 추측이 아니라
+  이 스키마와 정확히 일치합니다.
+- `ard_angle_dims=[3, 4, 5]` — 각 7채널 블록 내 rx/ry/rz의 상대 인덱스. **확인됨**(스키마
+  순서 그대로).
+- 채널이 관절이 아니라 엔드이펙터 목표 pose라서 `action_space="ee"`.
+- "대부분 왼팔만 사용"(공개 설명, 이 부분은 여전히 **미확인** — 스키마 자체와는 별개)
+  → 왼팔이 실제 작업(Actuator), 오른팔이 보조(Stabilizer) →
   `role_map={"stabilizer": "right", "actuator": "left"}`.
-- 채널이 엔드이펙터 목표 pose라서 `action_space="ee"`.
 
 ## RoCo Challenge 프리셋 (`configs/presets/roco_board.yaml`)
 
@@ -105,9 +137,10 @@ config = SmolVLAConfig(input_features=..., output_features=..., **overrides)
 
 | 필드 | 값 | 이유 |
 |---|---|---|
-| `role_map` | `{stabilizer: right, actuator: left}` | 공개 스펙: 왼팔이 실제 작업 수행 |
-| `ard_arm_dim`/`ard_gripper_dim` | `7`/`1` | 공개 스펙 기반 가정값(**미확인**, 위 참고) |
+| `role_map` | `{stabilizer: right, actuator: left}` | 공개 설명: 왼팔이 실제 작업 수행(이 부분은 미확인) |
+| `ard_arm_dim`/`ard_gripper_dim` | `7`/`1` | **확인된 스키마**(팔당 ee pose 6 + 그리퍼 1) |
 | `action_space` | `ee` | 채널이 관절이 아니라 엔드이펙터 목표 |
+| `ard_angle_dims` | `[3, 4, 5]` | **확인된 스키마**의 rx/ry/rz 상대 인덱스. 단위/정규화 상호작용은 미검증(위 참고) |
 | `pos_loss_type` | `l1` | RoCo 1회 우승팀 보고(arXiv 2603.15469) |
 | `chunk_size`/`n_action_steps` | `20`/`5` | 조립 작업에 맞춘 재계획 빈도(공개 스펙 10fps 기준 가정) |
 | `per_timestep_norm` | `true`(a/s는 미피팅 항등값) | LeHome 보고(arXiv 2606.27163). 실데이터 피팅 필요 |
@@ -127,11 +160,13 @@ config = SmolVLAConfig(input_features=..., output_features=..., **overrides)
 ## 새/수정 파일
 
 - `configuration_smolvla.py` — `role_map`/`action_space`/`pos_loss_type`/`per_timestep_norm`
-  (+`_a`/`_s`) 필드와 `__post_init__`/`validate_features()` 검증·파생 로직.
+  (+`_a`/`_s`)/`ard_angle_dims` 필드와 `__post_init__`/`validate_features()` 검증·파생 로직.
 - `ard.py` — `compute_timestep_norm_sigma`/`apply_timestep_norm`/`invert_timestep_norm`
-  (순수 함수 3개, 패딩 채널은 identity로 채움).
-- `modeling_smolvla.py` — `F.mse_loss` 호출을 `pos_loss_type` 3분기로 교체,
-  `forward()`/`_denoise_loop()` 경계에서 `per_timestep_norm` 스케일/역스케일.
+  (순수 함수 3개, 패딩 채널은 identity로 채움), `wrap_to_pi`/`build_angle_channel_mask`/
+  `apply_angle_aware_target`(각도 래핑 순수 함수 3개).
+- `modeling_smolvla.py` — `F.mse_loss` 호출을 `pos_loss_type` 3분기로 교체(+ `ard_angle_dims`
+  설정 시 각도-인식 타깃으로 바꿔치기), `forward()`/`_denoise_loop()` 경계에서
+  `per_timestep_norm` 스케일/역스케일.
 - `scripts/fit_timestep_norm.py` (신규) — 데이터셋에서 σ(t)의 a/s 피팅.
 - `configs/presets/roco_board.yaml` (신규).
 - `tests/test_configurable_ard.py` (신규).
@@ -152,20 +187,32 @@ config = SmolVLAConfig(input_features=..., output_features=..., **overrides)
   거부.
 - `action_space="ee"`가 `lac_mirror_sign`을 강제로 `None`으로 덮어쓰고 경고를 남기는지(그리고
   `"joint"`에서는 그대로 두는지). 잘못된 값 거부.
-- RoCo 프리셋 yaml이 유효한 `SmolVLAConfig`로 로드되는지(derived 값 포함), 그리고 그 값
-  그대로(14차원=7+7) 작은 합성 모델에서 몇 스텝 학습(loss.backward())/추론
-  (predict_action_chunk)이 정상 동작하는지.
-- 기존 전체 테스트 스위트(130개, `test_ard*`/`test_lac*`/`test_closed_loop*`/`test_judge*`
+- RoCo 프리셋 yaml이 유효한 `SmolVLAConfig`로 로드되는지(derived 값 포함, `ard_angle_dims`
+  포함), 그리고 그 값 그대로(14차원=7+7) 작은 합성 모델에서 몇 스텝 학습(loss.backward())/
+  추론(predict_action_chunk)이 정상 동작하는지.
+- `wrap_to_pi`가 2π 경계 불연속을 없애는지, `build_angle_channel_mask`가 양팔 블록 둘 다에
+  적용되고 패딩 채널은 건너뛰는지, `apply_angle_aware_target`이 마스크된 채널만 wrap하는지.
+  `ard_angle_dims=None`(기본)이면 `apply_angle_aware_target`이 **호출조차 되지 않는지**
+  (함수 호출 가로채기로 직접 확인 — bit-exact 보장의 근거). 잘못된 `ard_angle_dims`(빈
+  리스트/중복/범위 밖/`use_ard=False`와 조합) 거부.
+- `NormalizerProcessorStep`이 실제로 차원별 독립 통계(`(tensor-mean)/std`, 코드 직접 확인)를
+  쓰는지 — 위치(m)/회전(rad) 등 단위가 달라도 각 채널이 자기 자신의 mean/std로만 정규화되므로
+  문제없음(수정 불필요, 코드 확인만).
+- LAC(`lac.py`)의 ρ/ω가 `.norm(dim=-1)`/코사인 유사도로 계산되는 공간을 코드로 추적 —
+  `action_space`("joint"/"ee")와 무관하게 항상 "v_t가 사는 공간"(표준 정규화 + 선택적
+  `per_timestep_norm` 스케일이 적용된 공간)에서 계산됨을 확인(조사만, RoCo 프리셋은
+  `lac_mode="none"`이라 수정 보류).
+- 기존 전체 테스트 스위트(137개, `test_ard*`/`test_lac*`/`test_closed_loop*`/`test_judge*`
   등) 회귀 없음.
 
 **못 함 (범위 밖, 구조/합성 데이터 검증만 — README의 "검증됨 vs 미검증" 관례)**:
-- RoCo Challenge 공식 데이터셋 스키마를 직접 열어보지 못함(HF Hub 차단) — `ard_arm_dim=7`/
-  `ard_gripper_dim=1`/`action_space="ee"`/`role_map`은 공개 스펙에서의 **가정**이고, 실제
-  데이터로 재확인이 필요함.
 - `per_timestep_norm_a`/`_s`를 실제 데이터로 피팅하지 못함(`scripts/fit_timestep_norm.py`
   자체는 작성했지만 실행 불가) — 프리셋은 항등값(a=1,s=0)으로 둠.
-- 실제 SmolVLM2 가중치, 실제 로봇/시뮬레이터, chunk_size=20/n_action_steps=5가 실제 RoCo
-  과제에서 적절한 값인지 전혀 실측하지 않음.
+- 실제 SmolVLM2 가중치, 실제 로봇/시뮬레이터, chunk_size=20/n_action_steps=5, 10fps/시연
+  200개가 실제 RoCo 과제에서 적절한 값인지 전혀 실측하지 않음. "대부분 왼팔만 사용"(→
+  `role_map`의 근거)도 공개 설명 그대로이고 스키마처럼 직접 재확인한 건 아님.
+- `ard_angle_dims`의 [-π,π) 경계가 표준 z-score 정규화 이후에도 정확한지(실제로는 그
+  채널의 std로 나뉜 `2π/std` 경계여야 함) — std를 모델에 전달하지 않아 근사치로만 구현.
 - `per_timestep_norm`+`lac_mode`를 동시에 켠 상태의 실제 효과(ρ/ω 임계값 재캘리브레이션
   필요 여부)는 분석만 했고 실측하지 않음 — RoCo 프리셋은 이 조합을 피함(`lac_mode="none"`).
 

@@ -170,9 +170,11 @@ ARD-VLA는 원래 OpenArm 16채널/왼팔=Stabilizer/chunk 50/L2 손실 전제�
 바뀌는 RoCo Challenge 같은 쓰임을 위해 이 전제들을 전부 config로 뺐습니다: `role_map`(역할-팔
 매핑), `action_space`("joint"\|"ee", "ee"면 `lac_mirror_sign` 자동 비활성), `pos_loss_type`
 ("l2"\|"l1"\|"smooth_l1", L2의 목표 근처 기울기 소실 문제 회피), `per_timestep_norm`(청크 내
-위치별 정규화 스케일). 전부 기본값이 기존과 bit-for-bit 동일합니다. `configs/presets/
-roco_board.yaml`이 RoCo용 조합을 담고 있습니다(7+7=14차원, ee, l1, chunk 20/실행 5 등 —
-**공개 스펙 기반 가정**, 실제 데이터셋 스키마는 HF Hub 차단으로 미확인). 조사 결과("뭐가 진짜
+위치별 정규화 스케일), `ard_angle_dims`(회전 채널의 2π 경계 불연속을 pos_loss에서 감싸는
+각도-인식 래핑). 전부 기본값이 기존과 bit-for-bit 동일합니다. `configs/presets/
+roco_board.yaml`이 RoCo용 조합을 담고 있습니다 — action 14차원 스키마(팔당 [xyz+rxryrz+
+그리퍼]=7채널, 왼팔/오른팔 순)는 **사용자가 공식 데이터셋에서 직접 확인**했고, 그 외
+(10fps/시연 200개/왼팔 우세 등)는 여전히 공개 설명 기반 가정입니다. 조사 결과("뭐가 진짜
 하드코딩이었나"), 각 필드의 수식적 근거, 검증된 것/미확인 사항은
 **[docs/configurable_ard.md](docs/configurable_ard.md)** 에 있습니다.
 

@@ -903,3 +903,74 @@ chunk_size=20/n_action_steps=5가 실제 RoCo 과제에 적절한 값인지, `pe
   `ard_arm_dim`/`ard_gripper_dim`/`action_space` 가정 재확인, `scripts/train_ard.py`로
   작은 규모 실제 학습.
 - `per_timestep_norm` + `lac_mode`를 함께 쓰고 싶다면 ρ/ω 임계값 재캘리브레이션 필요.
+
+---
+
+# RoCo 스키마 확인 반영 + 각도 래핑(ard_angle_dims) (branch: configurable-ard, 후속)
+
+사용자가 RoCo 공식 데이터셋의 `meta/info.json`을 직접 열어서 action 14차원 순서를 확인해
+전달했다: `left_ee_x/y/z/rx/ry/rz/gripper, right_ee_x/y/z/rx/ry/rz/gripper` — 팔별로
+연속된 [ee pose 6 + 그리퍼 1] = 7채널 블록. 4가지를 확인/수정 요청받았다.
+
+## 1. `ard_arm_dim`이 그리퍼 포함/제외 중 어느 쪽인지
+
+코드 확인 결과(`configuration_smolvla.py:126` 주석 "팔 하나당 자유도 (관절 7 + 그리퍼
+1)"): **`ard_arm_dim`은 그리퍼를 포함한 블록 전체 크기**이고, `ard_gripper_dim`은 그 안의
+마지막 N채널(그리퍼로 간주해 smooth/traj 손실에서만 제외)이다. 따라서 RoCo(팔당 7=ee
+pose 6+그리퍼 1)는 **이미 설정된 `ard_arm_dim=7`/`ard_gripper_dim=1`이 정확히 맞다** —
+사용자가 예상한 "그리퍼 제외 의미면 arm_dim=6" 가설은 틀렸고, 변경 불필요. 대신 액션
+차원 일치(`2*ard_arm_dim == 14`)를 테스트로 명시적으로 고정했다.
+
+## 2. rx/ry/rz 각도 래핑(`ard_angle_dims`, 신규)
+
+±π 경계 불연속(3.14 vs -3.14 — 거의 같은 각도인데 raw 차이는 ~2π) 문제를 막기 위해:
+- `ard.py`: `wrap_to_pi`(순수 함수), `build_angle_channel_mask`(각 팔 블록 내 상대
+  인덱스를 양팔 블록 둘 다에 적용, 패딩 채널은 제외), `apply_angle_aware_target`
+  (`u_t - wrap_to_pi(u_t-v_t)`로 "각도-인식" v_t를 만들어 **기존 F.mse_loss/F.l1_loss/
+  F.smooth_l1_loss 호출부를 바꾸지 않고** 그 자리에 넣는 트릭).
+- `configuration_smolvla.py`: `ard_angle_dims: list[int] | None = None` 필드 + 검증
+  (빈 리스트/중복/범위 밖 거부, `use_ard=True` 필요).
+- `modeling_smolvla.py`: pos_loss 계산 직전에 `ard_angle_dims`가 있으면
+  `apply_angle_aware_target` 호출, 없으면(기본) `v_t_for_loss = v_t`로 **함수 호출조차
+  없음** — bit-exact 보장.
+- **중요한 미검증 사항**: 이 wrap은 입력이 실제 라디안일 때만 정확하다. 하지만 이 지점의
+  u_t/v_t는 이미 `NormalizerProcessorStep`의 표준 차원별(z-score) 정규화를 거친 값이라서
+  (코드 확인: `policy.forward()` 호출 **전에** `preprocessor(batch)`가 적용됨,
+  `scripts/train_ard.py:375`), 그 채널의 std가 1이 아니면 실제 경계는 `2π`가 아니라
+  `2π/std`다. 모델에 std가 전달되지 않아 이 보정을 못 한다 — RoCo 프리셋의
+  `ard_angle_dims=[3,4,5]`는 **근사치**로 명시했다.
+- RoCo 프리셋에 `ard_angle_dims=[3, 4, 5]` 추가(위 확인된 스키마의 rx/ry/rz 인덱스).
+
+## 3. 정규화가 차원별로 되는지(위치 m vs 회전 rad)
+
+`normalize_processor.py` 코드 직접 확인: `(tensor - mean) / (std + eps)` — mean/std가
+피처(채널)별 텐서라 위치/회전처럼 단위가 달라도 각 채널이 자기 자신의 통계로만
+정규화된다. **문제없음, 수정 불필요** — 확인만 하고 docs에 기록.
+
+## 4. LAC의 ρ/ω가 정규화된 값 기준으로 계산되는지
+
+`lac.py` 코드 확인: `E_s`/`E_r`/`rho`/`omega`는 전부 `apply_lac_step()`에 들어오는
+shared/residual 벡터에 `.norm(dim=-1)`/코사인 유사도를 직접 적용한다. 이 벡터들은
+`_denoise_loop()`/`combine_by_role()`을 거쳐 온 것이라 **항상 v_t가 사는 공간**(표준
+정규화 + `per_timestep_norm` 스케일이 적용된 공간)에서 계산된다 — `action_space`
+("joint"/"ee")와 무관하게 일관된 동작이고, ee 전용 특이사항은 없다. **조사만 하고
+수정은 보류**(RoCo 프리셋은 `lac_mode="none"`이라 당장 영향 없음).
+
+## 테스트/문서
+
+`tests/test_configurable_ard.py`에 10개 추가(총 24개): `wrap_to_pi`/
+`build_angle_channel_mask`/`apply_angle_aware_target` 순수 함수, `ard_angle_dims` 검증
+(빈 리스트/중복/범위 밖/use_ard=False 거부), 기본값(None)일 때 `apply_angle_aware_target`
+호출 없음을 몽키패치로 직접 확인, 설정 시 호출됨 + finite 유지, RoCo 프리셋 로드에
+`ard_angle_dims`/차원 일치 어서션 추가. `docs/configurable_ard.md`에 확인된 스키마·각도
+래핑 설명·단위 미검증 사항 반영, README.md 요약 갱신.
+
+`pytest tests/`(137개 전부 통과 — 기존 130 + 신규 7 테스트 함수 중 일부는 추가 assert만
+포함돼 개수가 10개 늘었지만 신규 함수는 7개). 회귀 없음.
+
+## 다음에 할 일
+
+- `ard_angle_dims`의 `2π/std` 정확한 경계 처리가 필요해지면, 모델에 정규화 std를 전달하는
+  경로(현재는 전혀 없음)를 추가해야 함 — 지금은 범위 밖.
+- "대부분 왼팔만 사용"(role_map의 근거)과 10fps/시연 200개는 여전히 공개 설명 기반 가정 —
+  스키마처럼 사용자가 직접 재확인하면 갱신 필요.
