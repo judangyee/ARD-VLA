@@ -115,6 +115,19 @@ class SmolVLAConfig(PreTrainedConfig):
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
 
+    # --- 회전 채널 unwrap/rewrap (데이터 전처리, ARD와 무관 — use_ard 여부와 상관없이 동작) ---
+    # 액션 벡터의 절대 채널 인덱스(예: RoCo 14차원 스키마의 양팔 rx,ry,rz = [3,4,5,10,11,12]).
+    # 지정하면 processor_smolvla.py의 AngleUnwrapProcessorStep이 학습 배치의 raw 액션(정규화
+    # 전)을 액션 청크의 시간축으로 연속으로 펴고(np.unwrap과 동일한 원리), AngleRewrapProcessorStep
+    # 이 추론 후 로봇에 보내기 직전 [-pi, pi)로 다시 감싼다 — 메인 손실(pos_loss)은 전혀
+    # 건드리지 않는다(flow-matching 속도장 u_t/v_t에 각도 주기성을 적용하는 건 틀린 설계라
+    # 되돌렸다, PROGRESS.md 참고). None(기본)이면 두 ProcessorStep이 파이프라인에 들어가지도
+    # 않아 완전히 동일하다. **주의**: 이 전처리는 각 채널이 독립적으로 주기적인 표현(오일러각)
+    # 일 때만 올바르다 — 회전벡터(axis-angle)라면 부적절하다(docs/configurable_ard.md 참고,
+    # rx/ry/rz가 어느 쪽인지 아직 확인 못함). scripts/check_rotation_range.py로 실제 데이터가
+    # ±pi 경계를 넘는지 먼저 확인하고 켜는 걸 권장한다.
+    angle_unwrap_dims: list[int] | None = None
+
     # --- ARD: Asymmetric Role Decomposition (비대칭 역할 분리, 양손 도구 조작 파인튜닝용) ---
     # ARD-VLA 연구계획서 참고. 선두 `2 * ard_arm_dim`개 액션 채널을 Stabilizer 팔(작업물을
     # 붙잡아 고정)과 Actuator 팔(정밀한 도구 조작 수행)로 나누고, 각각 전용 residual head로
@@ -131,14 +144,6 @@ class SmolVLAConfig(PreTrainedConfig):
     # 즉 그리퍼는 "L_pos만 받고 smooth/traj 추가 벌점은 받지 않는다". 0이면 과거와 완전히
     # 동일하게 그리퍼도 smooth/traj에 포함된다.
     ard_gripper_dim: int = 1
-    # ard_arm_dim개 채널 중 회전(라디안) 채널의 상대 인덱스(0..ard_arm_dim-1, 양팔 블록 둘
-    # 다에 동일하게 적용). 메인 pos_loss(L_pos) 계산에서 이 채널들의 (목표-예측) 차이를
-    # [-pi, pi)로 감싸서 2*pi 경계 불연속(예: 3.14 vs -3.14)에 의한 거짓 큰 손실/그래디언트를
-    # 없앤다 — action_space="ee"(엔드이펙터 pose)에서 rx/ry/rz 같은 회전 채널에 필요
-    # (configuration_smolvla.py 밖 docs/configurable_ard.md의 정규화 단위 관련 미검증 항목
-    # 참고). None(기본)이면 기존과 완전히 동일하다(이 채널 개념 자체가 use_ard=True에서만
-    # 의미가 있다).
-    ard_angle_dims: list[int] | None = None
     ard_default_actuator_arm: str = "right"  # "left" 또는 "right"; 이 팔이 항상 Actuator 역할
     ard_alpha: float = 0.3  # Stabilizer 손실 가중치
     ard_beta: float = 0.7  # Actuator 손실 가중치
@@ -310,6 +315,16 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+        if self.angle_unwrap_dims is not None:
+            if len(self.angle_unwrap_dims) == 0:
+                raise ValueError("`angle_unwrap_dims`가 리스트면 비어 있을 수 없습니다(None으로 끄세요).")
+            if len(set(self.angle_unwrap_dims)) != len(self.angle_unwrap_dims):
+                raise ValueError(f"`angle_unwrap_dims`에 중복된 인덱스가 있습니다: {self.angle_unwrap_dims}")
+            if any(i < 0 or i >= self.max_action_dim for i in self.angle_unwrap_dims):
+                raise ValueError(
+                    f"`angle_unwrap_dims`의 각 인덱스는 0 이상 `max_action_dim`({self.max_action_dim}) "
+                    f"미만이어야 합니다. 현재 값: {self.angle_unwrap_dims}"
+                )
         if self.vlm_layer_indices is not None:
             if len(self.vlm_layer_indices) == 0:
                 raise ValueError("`vlm_layer_indices`가 비어 있습니다 — 최소 1개 이상의 레이어 인덱스가 필요합니다.")
@@ -382,18 +397,6 @@ class SmolVLAConfig(PreTrainedConfig):
                     f"`ard_gripper_dim`은 0 이상 `ard_arm_dim`({self.ard_arm_dim}) 미만이어야 "
                     f"합니다(최소 1개의 관절 채널은 남아야 함). 현재 값: {self.ard_gripper_dim}"
                 )
-            if self.ard_angle_dims is not None:
-                if len(self.ard_angle_dims) == 0:
-                    raise ValueError("`ard_angle_dims`가 리스트면 비어 있을 수 없습니다(None으로 끄세요).")
-                if len(set(self.ard_angle_dims)) != len(self.ard_angle_dims):
-                    raise ValueError(f"`ard_angle_dims`에 중복된 인덱스가 있습니다: {self.ard_angle_dims}")
-                if any(i < 0 or i >= self.ard_arm_dim for i in self.ard_angle_dims):
-                    raise ValueError(
-                        f"`ard_angle_dims`의 각 인덱스는 0 이상 `ard_arm_dim`({self.ard_arm_dim}) "
-                        f"미만이어야 합니다. 현재 값: {self.ard_angle_dims}"
-                    )
-        elif self.ard_angle_dims is not None:
-            raise ValueError("`ard_angle_dims`는 `use_ard=True`일 때만 의미가 있습니다.")
         if self.use_gradnorm and not self.use_ard:
             raise ValueError("`use_gradnorm`은 `use_ard=True`일 때만 의미가 있습니다.")
         if self.ard_use_force_head and not self.use_ard:
