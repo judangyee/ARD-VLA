@@ -7,14 +7,20 @@
 #   overrides = yaml.safe_load(open("configs/presets/roco_board.yaml"))
 #   config = SmolVLAConfig(input_features=..., output_features=..., **overrides)
 #
-# **미확인 사항(docs/configurable_ard.md 참고)**: 이 샌드박스는 Hugging Face Hub 접근이
-# 막혀 있어 공식 데이터셋(rocochallenge2025/rocochallenge2026_Industrial_Assembly, LeRobot
-# v3.0, ~1.1GB)의 meta/info.json을 직접 열어보지 못했다. 아래 ard_arm_dim/ard_gripper_dim은
-# 과제 설명에 공개된 스펙(action 14차원 = 7-DoF 양팔 엔드이펙터 목표+그리퍼)으로부터의
-# **가정값**이다 — 실제로는 7이 "6D pose + 그리퍼 1"인지 다른 분해인지 확인되지 않았다.
-# per_timestep_norm_a/_s도 실제 데이터로 피팅하지 못해 항등(identity, a=1,s=0)으로 둔다 —
+# **스키마 확인됨(2026-10-29, 사용자가 공식 데이터셋 meta/info.json을 직접 확인)**:
+# action 14차원 순서는
+#   left_ee_x, left_ee_y, left_ee_z, left_ee_rx, left_ee_ry, left_ee_rz, left_gripper,
+#   right_ee_x, right_ee_y, right_ee_z, right_ee_rx, right_ee_ry, right_ee_rz, right_gripper
+# 즉 팔별로 연속된 [엔드이펙터 pose 6(xyz+rxryrz) + 그리퍼 1] = 7채널 블록이 왼팔, 오른팔
+# 순서로 이어진다 — 아래 ard_arm_dim=7/ard_gripper_dim=1(마지막 1채널=그리퍼)과 정확히
+# 일치한다(이 샌드박스는 여전히 HF Hub에 직접 접근하지 못해서, 이 스키마는 사용자가 전달한
+# 값을 그대로 반영한 것이다 — 재확인은 사용자가 했음).
+#
+# **아직 미확인**: per_timestep_norm_a/_s는 실제 데이터로 피팅하지 못해 항등(identity,
+# a=1,s=0)으로 둔다 —
 # scripts/fit_timestep_norm.py --dataset-repo-id rocochallenge2025/rocochallenge2026_Industrial_Assembly
-# --chunk-size 20 를 돌려서 갱신해야 한다.
+# --chunk-size 20 를 돌려서 갱신해야 한다. chunk_size=20/n_action_steps=5가 실제 과제에
+# 적절한지, 10fps/시연 200개 외 세부 통계도 미확인.
 
 use_ard: true  # 비대칭 역할 분리(Stabilizer/Actuator) 자체는 RoCo에서도 그대로 유효한 전제
 
@@ -25,9 +31,9 @@ role_map:
   stabilizer: right
   actuator: left
 
-# 공개 스펙: action 14차원 = 7-DoF 양팔(vega_1u) 엔드이펙터 목표. 팔 하나당 7채널 중 1개를
-# 그리퍼로 가정(나머지 6=pose). **미확인** — 실제로는 ard_arm_dim/ard_gripper_dim 조합이
-# 다를 수 있다(위 상단 주석 참고).
+# 확인된 스키마: 팔당 [ee pose 6 + 그리퍼 1] = 7채널(위 상단 주석 참고). 마지막 1채널이
+# 그리퍼라서 ard_gripper_dim=1(기존 의미 그대로 — smooth_loss/traj_loss에서만 제외, L_pos는
+# 그대로 받음).
 ard_arm_dim: 7
 ard_gripper_dim: 1
 
@@ -35,6 +41,14 @@ ard_gripper_dim: 1
 # configuration_smolvla.py의 __post_init__이 lac_mirror_sign(관절 축 미러링 가정)을 자동으로
 # 무효화한다(lac_mode=none이라 당장은 영향 없지만, 나중에 LAC를 켜게 될 경우를 대비).
 action_space: ee
+
+# 확인된 스키마에서 각 팔 블록의 상대 인덱스 3,4,5가 rx,ry,rz(라디안) — 메인 pos_loss
+# 계산에서 이 채널들의 (목표-예측) 차이를 [-pi,pi)로 감싸 2*pi 경계 불연속(예: 3.14 vs
+# -3.14)에 의한 거짓 큰 손실/그래디언트를 막는다. **주의(미검증)**: 이 경계는 raw 라디안
+# 기준이고, 실제로는 표준 차원별 정규화(z-score) 이후 공간에서 적용돼서 그 채널의 std가
+# 1이 아니면 근사치다(ard.py의 wrap_to_pi 주석, docs/configurable_ard.md 참고) — 실제
+# std로 재확인 전까지는 근사로 취급.
+ard_angle_dims: [3, 4, 5]
 
 # RoCo Challenge 1회 우승팀이 목표 근처에서 기울기가 사라지는 L2 대신 L1로 바꿔 끝까지
 # 정밀하게 밀어넣는 효과를 봤다고 보고함(arXiv 2603.15469).
