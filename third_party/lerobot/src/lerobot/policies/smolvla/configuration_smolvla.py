@@ -131,6 +131,14 @@ class SmolVLAConfig(PreTrainedConfig):
     # 즉 그리퍼는 "L_pos만 받고 smooth/traj 추가 벌점은 받지 않는다". 0이면 과거와 완전히
     # 동일하게 그리퍼도 smooth/traj에 포함된다.
     ard_gripper_dim: int = 1
+    # ard_arm_dim개 채널 중 회전(라디안) 채널의 상대 인덱스(0..ard_arm_dim-1, 양팔 블록 둘
+    # 다에 동일하게 적용). 메인 pos_loss(L_pos) 계산에서 이 채널들의 (목표-예측) 차이를
+    # [-pi, pi)로 감싸서 2*pi 경계 불연속(예: 3.14 vs -3.14)에 의한 거짓 큰 손실/그래디언트를
+    # 없앤다 — action_space="ee"(엔드이펙터 pose)에서 rx/ry/rz 같은 회전 채널에 필요
+    # (configuration_smolvla.py 밖 docs/configurable_ard.md의 정규화 단위 관련 미검증 항목
+    # 참고). None(기본)이면 기존과 완전히 동일하다(이 채널 개념 자체가 use_ard=True에서만
+    # 의미가 있다).
+    ard_angle_dims: list[int] | None = None
     ard_default_actuator_arm: str = "right"  # "left" 또는 "right"; 이 팔이 항상 Actuator 역할
     ard_alpha: float = 0.3  # Stabilizer 손실 가중치
     ard_beta: float = 0.7  # Actuator 손실 가중치
@@ -374,6 +382,18 @@ class SmolVLAConfig(PreTrainedConfig):
                     f"`ard_gripper_dim`은 0 이상 `ard_arm_dim`({self.ard_arm_dim}) 미만이어야 "
                     f"합니다(최소 1개의 관절 채널은 남아야 함). 현재 값: {self.ard_gripper_dim}"
                 )
+            if self.ard_angle_dims is not None:
+                if len(self.ard_angle_dims) == 0:
+                    raise ValueError("`ard_angle_dims`가 리스트면 비어 있을 수 없습니다(None으로 끄세요).")
+                if len(set(self.ard_angle_dims)) != len(self.ard_angle_dims):
+                    raise ValueError(f"`ard_angle_dims`에 중복된 인덱스가 있습니다: {self.ard_angle_dims}")
+                if any(i < 0 or i >= self.ard_arm_dim for i in self.ard_angle_dims):
+                    raise ValueError(
+                        f"`ard_angle_dims`의 각 인덱스는 0 이상 `ard_arm_dim`({self.ard_arm_dim}) "
+                        f"미만이어야 합니다. 현재 값: {self.ard_angle_dims}"
+                    )
+        elif self.ard_angle_dims is not None:
+            raise ValueError("`ard_angle_dims`는 `use_ard=True`일 때만 의미가 있습니다.")
         if self.use_gradnorm and not self.use_ard:
             raise ValueError("`use_gradnorm`은 `use_ard=True`일 때만 의미가 있습니다.")
         if self.ard_use_force_head and not self.use_ard:

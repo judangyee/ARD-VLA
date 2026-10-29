@@ -70,7 +70,9 @@ from lerobot.policies.smolvla.ard import (
     AsymmetricResidualHeads,
     ForceHead,
     GradNormLambdas,
+    apply_angle_aware_target,
     apply_timestep_norm,
+    build_angle_channel_mask,
     combine_by_role,
     compute_ard_losses,
     compute_symmetric_losses,
@@ -1249,15 +1251,27 @@ class VLAFlowMatching(nn.Module):
                 dim=-1,
             )
 
+        # ard_angle_dims가 있으면(기본 None) 그 채널들의 (u_t-v_t) 차이를 [-pi,pi)로 감싼
+        # "각도-인식" v_t_for_loss로 바꿔치기한다 — rx/ry/rz 같은 회전 채널에서 3.14 vs -3.14
+        # 처럼 실제로는 거의 같은 각도가 raw로는 ~2*pi 차이로 보이는 거짓 큰 손실/그래디언트를
+        # 막는다(configuration_smolvla.py의 ard_angle_dims 필드 주석 참고, 단위 관련 미검증
+        # 사항 포함). None이면 v_t를 그대로 참조해서(함수 호출조차 없음) bit-exact다.
+        v_t_for_loss = v_t
+        if self.config.use_ard and self.config.ard_angle_dims:
+            angle_mask = build_angle_channel_mask(
+                self.config.ard_angle_dims, self.config.ard_arm_dim, v_t.shape[-1], v_t.device
+            )
+            v_t_for_loss = apply_angle_aware_target(u_t, v_t, angle_mask)
+
         # pos_loss_type="l2"(기본)는 기존과 완전히 동일한 MSE. "l1"/"smooth_l1"은 목표 근처에서
         # L2의 기울기가 사라지는 문제(RoCo Challenge 1회 우승팀 보고, arXiv 2603.15469)를 겨냥한
         # 대안 — configuration_smolvla.py의 pos_loss_type 필드 주석 참고.
         if self.config.pos_loss_type == "l1":
-            losses = F.l1_loss(u_t, v_t, reduction="none")
+            losses = F.l1_loss(u_t, v_t_for_loss, reduction="none")
         elif self.config.pos_loss_type == "smooth_l1":
-            losses = F.smooth_l1_loss(u_t, v_t, reduction="none")
+            losses = F.smooth_l1_loss(u_t, v_t_for_loss, reduction="none")
         else:
-            losses = F.mse_loss(u_t, v_t, reduction="none")
+            losses = F.mse_loss(u_t, v_t_for_loss, reduction="none")
 
         # use_ard와 무관하게 켤 수 있으므로, ard_extras가 None이 아니게 되는 조건에
         # use_freq_policy/judge도 포함시킨다 — SmolVLAPolicy.forward()가 이 dict에서 "freq_loss"

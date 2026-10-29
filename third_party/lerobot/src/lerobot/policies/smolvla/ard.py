@@ -25,6 +25,7 @@ ARD는 선두 `2 * ard_arm_dim`개 액션 채널을 Stabilizer 블록과 Actuato
 (이 프로젝트에서는 항상 오른팔 — `resolve_actuator_is_first` 참고).
 """
 
+import math
 import warnings
 from dataclasses import dataclass
 
@@ -465,6 +466,42 @@ def apply_timestep_norm(actions: Tensor, sigma: Tensor) -> Tensor:
 def invert_timestep_norm(scaled_actions: Tensor, sigma: Tensor) -> Tensor:
     """apply_timestep_norm의 역연산."""
     return scaled_actions * sigma[None, : scaled_actions.shape[1], :]
+
+
+def wrap_to_pi(x: Tensor) -> Tensor:
+    """x를 [-pi, pi) 구간으로 감싼다 — 각도 차이의 2pi 경계 불연속(예: 3.14 vs -3.14가
+    실제로는 거의 같은 각도인데 raw 차이는 ~6.28)을 없앤다.
+
+    **단위 주의**: 이 함수는 입력이 실제로 라디안 단위일 때만 수학적으로 정확하다.
+    `config.ard_angle_dims`가 적용되는 지점(modeling_smolvla.py의 pos_loss 계산)의 u_t/v_t는
+    이미 표준 차원별(평균/표준편차) 정규화를 거친 값이라 — 그 채널의 std가 정확히 1이 아닌
+    한 경계가 2*pi가 아니라 2*pi/std다. 이 구현은 그 보정을 하지 않는다(모델에 std가
+    전달되지 않음) — docs/configurable_ard.md의 미검증 항목 참고."""
+    return x - 2 * math.pi * torch.round(x / (2 * math.pi))
+
+
+def build_angle_channel_mask(angle_dims: list[int], arm_dim: int, total_dim: int, device: torch.device) -> Tensor:
+    """`angle_dims`(각 팔 블록 내 상대 인덱스, 0..arm_dim-1)를 왼팔·오른팔 블록 둘 다에 적용한
+    (total_dim,) bool 마스크를 만든다. `2*arm_dim`을 넘는 패딩 채널은 항상 False."""
+    mask = torch.zeros(total_dim, dtype=torch.bool, device=device)
+    for i in angle_dims:
+        if i < total_dim:
+            mask[i] = True
+        if arm_dim + i < total_dim:
+            mask[arm_dim + i] = True
+    return mask
+
+
+def apply_angle_aware_target(u_t: Tensor, v_t: Tensor, angle_mask: Tensor) -> Tensor:
+    """pos_loss 계산에 쓸 "각도-인식" v_t를 반환한다 — `angle_mask`가 True인 채널의
+    (u_t - v_t) 차이를 `wrap_to_pi`로 감싼 뒤 `u_t - wrapped_diff`로 재구성한다. 이러면
+    기존 `F.mse_loss(u_t, v_t)`/`F.l1_loss`/`F.smooth_l1_loss` 호출부를 전혀 바꾸지 않고
+    반환값을 그 자리에 넣기만 하면 각도-인식 손실이 된다(이 함수들은 내부적으로 입력-타깃
+    차이만 보기 때문). `angle_mask`가 전부 False면(기본) `u_t - (u_t - v_t) == v_t`라서
+    bit-for-bit 동일하다."""
+    diff = u_t - v_t
+    wrapped_diff = torch.where(angle_mask, wrap_to_pi(diff), diff)
+    return u_t - wrapped_diff
 
 
 def compute_ard_losses(
