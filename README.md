@@ -170,17 +170,21 @@ ARD-VLA는 원래 OpenArm 16채널/왼팔=Stabilizer/chunk 50/L2 손실 전제�
 바뀌는 RoCo Challenge 같은 쓰임을 위해 이 전제들을 전부 config로 뺐습니다: `role_map`(역할-팔
 매핑), `action_space`("joint"\|"ee", "ee"면 `lac_mirror_sign` 자동 비활성), `pos_loss_type`
 ("l2"\|"l1"\|"smooth_l1", L2의 목표 근처 기울기 소실 문제 회피), `per_timestep_norm`(청크 내
-위치별 정규화 스케일), `ard_angle_dims`(회전 채널의 2π 경계 불연속을 pos_loss에서 감싸는
-각도-인식 래핑). 전부 기본값이 기존과 bit-for-bit 동일합니다. `configs/presets/
-roco_board.yaml`이 RoCo용 조합을 담고 있습니다 — action 14차원 스키마(팔당 [xyz+rxryrz+
-그리퍼]=7채널, 왼팔/오른팔 순)는 **사용자가 공식 데이터셋에서 직접 확인**했고, 그 외
-(10fps/시연 200개/왼팔 우세 등)는 여전히 공개 설명 기반 가정입니다. 조사 결과("뭐가 진짜
+위치별 정규화 스케일). 손실과는 완전히 독립적인 데이터 전처리 옵션 `angle_unwrap_dims`
+(회전 채널을 학습 전 시간축으로 펴고 추론 후 로봇에 보내기 직전 다시 `[-π,π)`로 감싸는
+전처리, `processor_smolvla.py`)도 추가했습니다 — pos_loss(u_t/v_t는 raw 액션이 아니라
+flow-matching 속도장이라 거기서 각도 래핑을 하면 틀린 설계였습니다, docs 참고)는 건드리지
+않습니다. 전부 기본값이 기존과 bit-for-bit 동일합니다. `configs/presets/roco_board.yaml`이
+RoCo용 조합을 담고 있습니다 — action 14차원 스키마(팔당 [xyz+rxryrz+그리퍼]=7채널, 왼팔/
+오른팔 순)는 **사용자가 공식 데이터셋에서 직접 확인**했고, rx/ry/rz가 오일러각인지
+회전벡터인지는 미확인이라 `angle_unwrap_dims`는 꺼둔 채입니다. 조사 결과("뭐가 진짜
 하드코딩이었나"), 각 필드의 수식적 근거, 검증된 것/미확인 사항은
 **[docs/configurable_ard.md](docs/configurable_ard.md)** 에 있습니다.
 
 ```bash
 pytest tests/test_configurable_ard.py
 python scripts/fit_timestep_norm.py --dataset-repo-id <HF_USER>/<DATASET> --chunk-size 20
+python scripts/check_rotation_range.py --dataset-repo-id <HF_USER>/<DATASET>
 ```
 
 ## 학습 (로컬 GPU 환경)

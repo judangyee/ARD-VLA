@@ -974,3 +974,113 @@ shared/residual 벡터에 `.norm(dim=-1)`/코사인 유사도를 직접 적용�
   경로(현재는 전혀 없음)를 추가해야 함 — 지금은 범위 밖.
 - "대부분 왼팔만 사용"(role_map의 근거)과 10fps/시연 200개는 여전히 공개 설명 기반 가정 —
   스키마처럼 사용자가 직접 재확인하면 갱신 필요.
+
+---
+
+# ard_angle_dims 되돌림 + angle_unwrap_dims 전처리로 재설계 + 2가지 보고 (branch: configurable-ard, 후속)
+
+사용자가 직전 `ard_angle_dims`(pos_loss에서 회전 채널을 `[-π,π)`로 감싸는 설계)를
+되돌리라고 지시했다. 이유: (1) `u_t`/`v_t`는 액션이 아니라 flow-matching **속도장**
+(`noise - actions`)이라 각도 주기성이 적용되지 않고, 속도 오차를 접으면 정상적인 큰
+오차까지 왜곡된다. (2) `ard_angle_dims=[3,4,5]`가 왼팔 회전만 포함하고 오른팔[10,11,12]이
+빠진 것처럼 보임. 대신 데이터 전처리 단계(학습 전 unwrap/추론 후 rewrap)로 다시
+설계하라는 요청과, 회전 표현(오일러각/회전벡터) 근거 조사, 데이터 점검 스크립트, 그리고
+이전부터 밀려 있던 두 가지 보고(기존 기능 브랜치 조사, freeze_vision_encoder/LoRA 현황)
+요청.
+
+## 1. `ard_angle_dims` 되돌림
+
+`ard.py`의 `wrap_to_pi`/`build_angle_channel_mask`/`apply_angle_aware_target`,
+`configuration_smolvla.py`의 `ard_angle_dims` 필드+검증, `modeling_smolvla.py`의
+pos_loss 분기 앞 각도-인식 바꿔치기를 전부 제거했다. pos_loss는 다시 순수하게
+`F.*_loss(u_t, v_t)`만 계산한다(기본 동작 bit-exact 재확인). RoCo 프리셋에서도
+`ard_angle_dims: [3, 4, 5]` 제거.
+
+**참고**: `build_angle_channel_mask`는 실제로는 왼팔[3,4,5]과 오른팔[10,11,12] 둘 다에
+자동으로 마스크를 적용하도록 설계돼 있었다(설정값 자체가 "팔 블록 내 상대 인덱스"라는
+의도였음) — 그래서 사용자가 말한 "오른팔이 빠짐" 문제는 실제 라우팅 버그는 아니었다.
+다만 (1)번 이유(속도장에 각도 래핑을 거는 것 자체가 틀린 설계)가 더 근본적이라 되돌리는
+게 맞다.
+
+## 2. `angle_unwrap_dims` — 데이터 전처리로 재설계
+
+- `processor_smolvla.py`(신규): `AngleUnwrapProcessorStep`(학습 전,
+  `NormalizerProcessorStep`보다 먼저 — raw 액션의 회전 채널을 **액션 청크의 시간축을
+  따라** `np.unwrap`과 동일한 원리로 연속으게 편다)과 `AngleRewrapProcessorStep`(추론 후,
+  파이프라인 마지막 단계 — 로봇에 보내기 직전 `[-π,π)`로 다시 감싼다, Unwrap의 정확한
+  역연산). 둘 다 `NormalizerProcessorStep`과 같은 패턴으로 배치에 액션이 없으면(실제
+  추론 입력) 에러 없이 통과시킨다.
+- **"에피소드 경계를 넘어 펴지 않는다"는 요구는 설계상 자동으로 만족된다** —
+  `LeRobotDataset`의 `delta_timestamps` 윈도우(학습 배치의 액션 청크)는 항상 한
+  에피소드 내부에서만 뽑히므로, "청크 안에서만" unwrap하는 것으로 충분하다(전체 에피소드를
+  한 번에 펼 필요 없음 — 모델은 청크 내부의 상대적 연속성만 필요).
+- `configuration_smolvla.py`: `angle_unwrap_dims: list[int] | None`(절대 채널 인덱스,
+  `use_ard`와 무관하게 동작) 필드 + 검증. 기본 None이면 두 ProcessorStep이
+  `make_smolvla_pre_post_processors()`의 파이프라인에 들어가지도 않아 bit-exact.
+- RoCo 프리셋은 이 옵션을 **꺼둔 채로** 둔다(아래 3번 참고).
+
+## 3. 오일러각 vs 회전벡터(axis-angle) 조사
+
+이 레포/RoCo 스키마 자체에는 직접적인 증거가 없다. 간접 근거 두 가지를 찾았다:
+1. 이 레포가 vendor로 들고 있는 LeRobot 자체가 `env_processor.py`의
+   `LiberoProcessorStep`에서 엔드이펙터 회전을 쿼터니언 → **axis-angle(회전벡터)**로
+   변환해서 쓰는 선례가 있다(`utils/rotation.py`에 `as_rotvec`/`from_rotvec`도 있음).
+2. 산업용 로봇(Universal Robots 등)의 통상적인 TCP pose 표기 "x,y,z,rx,ry,rz"에서
+   rx,ry,rz는 관례적으로 회전벡터를 가리키는 경우가 많다(오일러각이면 보통
+   roll/pitch/yaw로 부름).
+
+**결론: 확정적이지 않지만 회전벡터일 가능성을 시사하는 간접 근거가 있다.** 회전벡터면
+`angle_unwrap_dims`(축별 unwrap)는 수학적으로 부적절하다(세 채널이 하나의 회전을 이루는
+벡터라 축별 주기성 가정이 성립하지 않음) — 그래서 RoCo 프리셋은 이 옵션을 켜지 않았다.
+`docs/configurable_ard.md`에 이 근거와 불확실성을 명시했다.
+
+## 4. `scripts/check_rotation_range.py`(신규)
+
+에피소드별 회전 채널 min/max, ±π 경계 도약 횟수를 출력. 채널 수가 3의 배수면(기본
+[3,4,5,10,11,12]) 3개씩 묶어 "삼중값" 노름(||[rx,ry,rz]||) 통계도 출력 — 회전벡터는
+보통 노름이 회전각 자체라 `≤ π` 안에 들어오는 경향이 있어, 오일러각/회전벡터 판별에
+참고용 힌트가 된다(합성 데이터로 두 경우를 시뮬레이션해서 이 힌트가 실제로 구분되는지
+확인함: 회전벡터형 0% 초과 vs 오일러형 55% 초과). HF Hub 차단으로 실제 데이터로는
+실행 못 해봄.
+
+## 보고 1: 기존 기능 브랜치 조사 (합치지 않음, 조사만)
+
+`git branch -a` + `git log configurable-ard..<branch>`로 전체 브랜치(`claude/smolvla-
+research-setup-x29mi7`, `closed-loop-structure`, `lac-inference`, `lac-closed-loop`,
+`main`)를 확인 — **전부 0개**(configurable-ard에 없는 커밋 없음), 즉 quantization/
+GradNorm/token_pruning/gradient_checkpointing/profile_memory.py/layer_importance.py
+전부 이미 configurable-ard에 머지돼 있다(quantization은 애초에 어디에도 없음). 합칠
+별도 브랜치가 없었다. 충돌 가능성도 전부 낮음(GradNorm만 per_timestep_norm과 약한
+상호작용 있음 — x0_hat 스케일이 바뀌면 GradNorm이 균형 잡는 그래디언트 norm 크기도
+같이 바뀔 수 있음, 버그는 아니고 참고 사항). 상세 표는 `docs/configurable_ard.md` 참고.
+
+## 보고 2: `freeze_vision_encoder`/액션 expert/VLM LoRA 현황 (요구사항 6, 미수정)
+
+- `freeze_vision_encoder`(기본 True) 존재하지만, 다른 기본값 `train_expert_only=True`가
+  이미 VLM 전체(비전 인코더 포함)를 얼려서 기본 조합에서는 중복.
+- "액션 expert 전체 학습"은 기본적으로 이미 그렇다(`lm_expert`는 PEFT 없이는 얼지 않음).
+- **"VLM은 LoRA"는 구현돼 있지 않다** — `_get_default_peft_targets()`가 잡는 "lm_expert"는
+  VLM이 아니라 **액션 expert**(완전히 별개 모델 인스턴스)다. 실제 VLM(`self.vlm`)은 PEFT
+  타겟에 전혀 없고, 게다가 PEFT 진입점(`wrap_with_peft()`) 자체가 `scripts/train_ard.py`
+  에서 호출되지 않는다(CLI 플래그 없음). VLM에 LoRA를 적용하려면 타겟 정규식 추가 +
+  train_ard.py에 PEFT CLI 경로 추가가 둘 다 필요 — 이번엔 보고만, 수정 안 함.
+
+## 테스트/문서
+
+`tests/test_configurable_ard.py`: 옛 `ard_angle_dims` 테스트 7개 제거, `angle_unwrap_dims`
+테스트 7개 추가(unwrap 연속화, rewrap 역연산+round-trip, 액션 없음/옵션 꺼짐 통과,
+`make_smolvla_pre_post_processors()`가 실제로 만드는 파이프라인에 설정 시에만 두
+ProcessorStep이 들어가는지 — 토크나이저 로드만 몽키패치, 나머지는 실제 함수 호출로
+직접 확인). RoCo 프리셋 테스트의 `ard_angle_dims` 어서션을 `angle_unwrap_dims is None`
+으로 교체. `docs/configurable_ard.md`에 되돌림 이유, 새 설계, 오일러/회전벡터 근거, 두
+보고 섹션 추가. README.md 요약 갱신.
+
+`pytest tests/`(136개 전부 통과). 회귀 없음.
+
+## 다음에 할 일
+
+- Hub 접근이 되는 환경에서 `scripts/check_rotation_range.py` 실행 → rx/ry/rz가 어느
+  표현인지 확정 → 회전벡터면 `angle_unwrap_dims` 자체를 쓰지 말고 SO(3)-인식 처리를
+  고려, 오일러각이면 그때 `angle_unwrap_dims` 켜고 A/B 비교.
+- "VLM은 LoRA"를 실제로 구현하려면: `_get_default_peft_targets()`에 `model.vlm_with_
+  expert.vlm.*` 타겟 추가 + `train_ard.py`에 `--use-peft` 경로 추가(이번 범위 밖, 보고만).
