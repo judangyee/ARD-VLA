@@ -42,13 +42,12 @@ ard_gripper_dim: 1
 # 무효화한다(lac_mode=none이라 당장은 영향 없지만, 나중에 LAC를 켜게 될 경우를 대비).
 action_space: ee
 
-# 확인된 스키마에서 각 팔 블록의 상대 인덱스 3,4,5가 rx,ry,rz(라디안) — 메인 pos_loss
-# 계산에서 이 채널들의 (목표-예측) 차이를 [-pi,pi)로 감싸 2*pi 경계 불연속(예: 3.14 vs
-# -3.14)에 의한 거짓 큰 손실/그래디언트를 막는다. **주의(미검증)**: 이 경계는 raw 라디안
-# 기준이고, 실제로는 표준 차원별 정규화(z-score) 이후 공간에서 적용돼서 그 채널의 std가
-# 1이 아니면 근사치다(ard.py의 wrap_to_pi 주석, docs/configurable_ard.md 참고) — 실제
-# std로 재확인 전까지는 근사로 취급.
-ard_angle_dims: [3, 4, 5]
+# angle_unwrap_dims(rx/ry/rz 채널을 학습 전 시간축으로 펴고 추론 후 다시 [-pi,pi)로 감싸는
+# 전처리 옵션, processor_smolvla.py 참고)는 일단 꺼둔다(기본 None) — scripts/
+# check_rotation_range.py로 실제 데이터가 ±pi 경계를 넘는지 먼저 확인하고, rx/ry/rz가
+# 오일러각인지 회전벡터(axis-angle)인지도 아직 불확실하다(회전벡터면 이 전처리 자체가
+# 틀린 접근이다 — docs/configurable_ard.md 참고). 켜려면 angle_unwrap_dims: [3,4,5,10,11,12]
+# (왼팔+오른팔 rx,ry,rz, 절대 인덱스)로 명시해야 한다.
 
 # RoCo Challenge 1회 우승팀이 목표 근처에서 기울기가 사라지는 L2 대신 L1로 바꿔 끝까지
 # 정밀하게 밀어넣는 효과를 봤다고 보고함(arXiv 2603.15469).
