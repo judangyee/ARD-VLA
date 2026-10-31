@@ -1265,3 +1265,127 @@ scatter 정확성과 원본 불변(위 테스트), `min_std=None` bit-exact, RoC
 
 `pytest tests/`(**156개 전부 통과** — 기존 155 + 신규 1). 양자화는 건드리지 않음, push
 안 함.
+
+# 무료 Colab 스모크/베이스라인 학습 환경 (branch: configurable-ard, 후속)
+
+목표: GPU 종류 보장 없음(T4 가능성 높음)/세션이 예고 없이 끊김/백그라운드 실행
+불가인 무료 Colab에서 RoCo 데이터로 작은 학습을 돌릴 수 있는 실행 환경을
+`scripts/colab/`에 만든다. `scripts/train_ard.py`를 최대한 재사용하되, 그 스크립트의
+"argparse로 SmolVLAConfig 직접 조립" 부분은 재사용하지 않았다 — OpenArm 8DoF 기본값
+(`ard_arm_dim=8`)과 `roco_board.yaml` 프리셋(`ard_arm_dim=7` 등)이 충돌해서다. 대신
+`split_policy_features`/`warn_if_action_layout_looks_wrong`만 재사용하고, 나머지는
+프리셋 오버라이드 + 데이터셋 피처만으로 config를 조립한다.
+
+## 1. GPU 감지 + dtype/배치 크기 (`env_setup.py`)
+
+`torch.cuda.is_bf16_supported(including_emulation=True)`(기본값)는 네이티브 지원이
+없는 GPU에서도 "에뮬레이션 가능"으로 `True`를 낼 수 있다는 점을 코드로 확인하고,
+`including_emulation=False`로 호출해서 T4(Turing, compute capability 7.5, bf16
+네이티브 없음)와 A100/L4(Ampere+, 네이티브 있음)를 정확히 가른다. bf16 네이티브면
+bf16, 아니면 fp16 autocast+GradScaler, GPU 없으면 fp32 — 실제 GPU가 없는 이
+샌드박스에서는 `torch.cuda.*`를 몽키패치해 T4/A100 두 경우를 재현하는 단위 테스트로만
+검증했다(미검증: 실제 GPU 위에서 돌려본 적 없음). 배치 크기 자동 추정(VRAM 기준
+테이블)은 실측 없는 추정치임을 코드 주석/문서에 명시.
+
+## 2. 데이터 받기(`dataset_fetch.py`), 분할(`episode_split.py`), 스키마 검증(`schema_check.py`)
+
+`HfApi.dataset_info(files_metadata=True)`로 전체 용량을 먼저 로그로 보여주고
+`shutil.disk_usage`로 Drive 여유와 비교(부족해도 경고만 하고 계속 진행 — 호출부가
+더 엄격하게 막을 수 있게 설계). `snapshot_download`의 `cache_dir`를 Drive 경로로 줘서
+세션이 끊겨도 받은 파일을 다시 받지 않게 한다. 에피소드 분할은 `random.Random(seed)`로
+결정론적이고(같은 seed면 항상 같은 190/10 분할), 분할 파일이 이미 있으면 그걸 그대로
+재사용(데이터셋을 다시 받아도 분할이 안 바뀌게).
+
+`state_select 적용 후 30채널 순서([왼팔 EE 7][오른팔 EE 7][왼팔 관절위치 7][오른팔
+관절위치 7][왼쪽 그리퍼][오른쪽 그리퍼])` 검증은 **정확한 문자열이 아니라 "left/right"
++ "ee/pos/quat"·"joint"·"gripper" 부분 문자열 휴리스틱**으로 했다 — 실제 info.json의
+정확한 글자 표기(`left_ee_x` 같은 리터럴)는 이 샌드박스가 Hub 접근이 막혀 있어 확인한
+적이 없어서, 완전히 다른 로봇/스키마는 반드시 잡되 철자 변형까지 전부 거부하지 않도록
+구조 기반으로 짰다(모듈 docstring에 이 판단 이유를 명시). 다르면 `SchemaMismatchError`로
+즉시 중단.
+
+## 3. 정규화 통계(`norm_stats.py`) — 학습 에피소드만, min_std 리포트
+
+`compute_train_stats()`가 학습 에피소드의 프레임만 스트리밍으로 돌며 평균/표준편차를
+계산한다(평가 에피소드는 전혀 안 봄). 하한 적용 자체는 새로 안 만들고
+`processor_smolvla.py`의 기존 `_apply_action_min_std`/`_apply_state_min_std`를 그대로
+재사용 — 대신 어느 채널이 하한에 걸렸는지(원래 std vs 바뀐 std)를 사람이 읽을 수 있게
+리포트로 뽑아내는 레이어만 새로 얹었다.
+
+## 4. 체크포인트(`checkpoint.py`, `batch_source.py`) — 10분마다 Drive에 전체 상태 저장
+
+모델/옵티마이저/스케줄러/GradScaler/스텝/`python`·`numpy`·`torch`(+cuda) RNG 상태를
+한 파일에 저장, 임시 파일에 먼저 쓰고 성공 후 rename(쓰다가 끊겨도 반쪽짜리가 "최신"으로
+보이지 않게). **데이터 순서 상태**는 `DataLoader(shuffle=True)`가 그 자체로 노출하는
+상태가 없다는 걸 확인하고, 매 에포크를 `data_seed + epoch`로 명시적으로 재시드해서
+"에포크 번호만 알면 그 순서를 정확히 재구성할 수 있게" 설계했다(`BatchSource`) —
+재시작 시엔 그 지점까지 배치를 다시 읽고 버려서(fast-forward) 같은 위치로 돌아간다(완전
+무비용 재개가 아니라는 한계를 문서에 명시).
+
+## 5. 오프라인 평가(`eval_offline.py`)
+
+보류 평가 에피소드마다 중간 지점 청크 하나를 대표로 써서(에피소드 맨 처음을 쓰면
+"직전 action"이 존재하지 않아서) 모델 예측과 "평균 action 상수 예측"/"직전 action
+유지" 두 베이스라인의 채널 그룹별(왼팔 위치/회전/그리퍼, 오른팔 위치/회전/그리퍼) L1을
+JSON으로 저장한다.
+
+## 6. --smoke 모드 — 실제로 돌려서 검증
+
+처음 작성한 버전을 실제로 실행해보며 **3개의 실제 버그를 찾아 고쳤다**(정직하게 기록):
+1. 합성 데이터의 `state_min_std`/`state_select`를 30차원 합성 state에 그대로 적용하면
+   `state_select`가 44차원 raw를 가정해 인덱스 범위 밖 에러가 났다 — 학습 루프 스모크는
+   이 세 옵션을 빼고(30/14차원 자체 비교는 norm_stats 스모크에서 44차원 raw로 별도 검증),
+   용도를 분리했다.
+2. `make_smolvla_pre_post_processors()`가 만드는 `TokenizerProcessorStep`이 실제로
+   `AutoTokenizer.from_pretrained(...)`를 호출한다는 걸 실행하며 발견 — 기존 테스트가
+   쓰는 `object()` 스텁은 파이프라인 "구성"만 해볼 때는 충분했지만, 실제
+   `preprocessor(batch)`를 호출하면 `TypeError: 'object' object is not callable`로
+   죽는다. 호출 가능한 최소 토크나이저 스텁(`_CallableStubTokenizer`)으로 교체.
+3. `TokenizerProcessorStep`이 사전 토큰화된 텐서가 아니라 `batch["task"]`(raw 문자열)를
+   그 자리에서 토크나이즈하는 구조라는 것도 실행하며 발견 — 합성 배치를
+   `OBS_LANGUAGE_TOKENS` 텐서 대신 `"task"` 문자열 리스트를 주도록 고쳤다.
+
+세 버그 모두 "실제로 실행해보지 않았으면 못 잡았을" 종류다 — 코드만 읽고 넘어갔으면
+Colab에서야 발견됐을 것들.
+
+## 테스트/문서
+
+`tests/test_colab_*.py` 8개 파일, 63개 테스트 신규(env_setup/episode_split/
+schema_check/checkpoint/batch_source/eval_offline/norm_stats/dataset_fetch 단위
+테스트 + `run_colab_training.py --smoke` 전체 파이프라인 통합 테스트, 실패 주입 시
+exit code 비정상 종료 확인 포함). `pytest tests/`(**219개 전부 통과** — 기존 156 +
+신규 63).
+
+`docs/colab_free_tier.md`(신규): 실행 순서(Secrets 토큰/Drive 마운트/클론/스모크
+먼저/실제 실행), 끊겼을 때 이어하는 방법, 알려진 한계 표(bf16/fp16 미검증, 배치 크기
+추정 미검증, 용량 조회 미검증, ffmpeg/영상 코덱 미검증, 스키마 검증 휴리스틱, 체크포인트
+재시작 데이터 순서 비용, 평가 샘플 단순화), Colab에서 처음 돌릴 때 예상되는 실패 지점
+우선순위 목록. README.md에 요약 추가.
+
+## 검증한 것 / 못 한 것
+
+**검증함**: GPU/dtype 분기 로직(몽키패치, T4/A100 재현), 에피소드 분할 재현성/저장
+복원, 스키마 검증 통과·중단 양쪽 다, 정규화 통계가 학습 에피소드만 쓰는지 + min_std
+리포트, 체크포인트 저장→복원이 모델/옵티마이저/스케줄러/RNG를 정확히 되돌리는지,
+`BatchSource.fast_forward`가 끊김 없이 돌린 것과 정확히 같은 지점으로 돌아가는지,
+오프라인 평가 베이스라인 수식, **그리고 `--smoke` 전체 파이프라인을 실제 SmolVLAPolicy
+(작은 합성 백본)로 끝까지 실행해 통과시켰다**(학습 6스텝 → 체크포인트 → "세션 끊김"
+재현(새 policy/optimizer로 재시작) → 나머지 6스텝 → 오프라인 평가 JSON 저장).
+
+**못 함(범위 밖, 미확인 — 이 샌드박스는 GPU/HF Hub 접근이 모두 막혀 있음)**:
+- 실제 T4/A100 GPU에서의 bf16/fp16 학습 안정성(inf/nan 여부) 실측.
+- 배치 크기 자동 추정치가 실제 OOM 경계와 맞는지.
+- `rocochallenge2025/rocochallenge2026_Industrial_Assembly`를 실제로 받아서
+  `validate_schema`를 통과하는지 — 특히 `schema_check.py`의 "left/right" 등 부분
+  문자열 휴리스틱이 실제 데이터셋의 채널 이름 표기와 맞는지.
+- 영상 인코딩/디코딩(ffmpeg `libsvtav1`)이 Colab 기본 이미지에서 되는지(이 샌드박스엔
+  ffmpeg 자체가 없음, 확인됨).
+- 실제 수천 스텝 규모 학습에서 10분 간격 체크포인트/재시작이 실제로 문제없이 반복되는지.
+
+## 다음에 할 일
+
+- 실제 Colab(T4)에서 `--smoke` → 소규모 실제 실행 순으로 처음 돌려보고, 이 라운드의
+  "미확인" 항목들을 하나씩 검증/수정.
+- `schema_check.py`의 휴리스틱이 실제 데이터셋과 안 맞으면 정규식을 실제 이름에
+  맞게 조정.
+- 배치 크기 추정 테이블을 실측치로 교체.

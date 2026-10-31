@@ -240,6 +240,25 @@ python scripts/train_ard.py --dataset-repo-id <...> \
 직접 검증했고, import/인자 파싱도 확인했습니다. 실제 학습 루프 자체는 로컬 GPU 환경에서
 처음 돌려보실 때 검증해주세요.
 
+## 무료 Colab 스모크/베이스라인 학습 환경
+
+GPU 종류가 보장되지 않고(T4 가능성 높음, bf16 하드웨어 미지원) 세션이 예고 없이
+끊기는 무료 Colab에서 RoCo 데이터로 학습을 돌리기 위한 `scripts/colab/` 묶음을
+추가했습니다 — GPU/dtype 자동 감지(T4는 `is_bf16_supported(including_emulation=False)`
+로 네이티브 bf16 미지원을 직접 확인해 fp16 autocast+GradScaler로 분기), Drive 캐시
+기반 데이터셋 받기, 학습/평가 190/10 고정 분할, `observation.state`/`action` 채널
+순서 검증(기대 순서와 다르면 즉시 중단), 학습 에피소드만으로 계산한 정규화 통계 +
+`min_std` 하한 리포트, 10분마다 Drive에 모델/옵티마이저/RNG/데이터 순서까지 전부
+저장하는 체크포인트(재시작 시 자동 이어하기), 보류 평가에서 "평균 action 상수
+예측"/"직전 action 유지" 베이스라인과 함께 내는 차원별 L1, 그리고 실제 데이터 없이
+전 구간을 50~100스텝으로 검증하는 `--smoke` 모드까지 포함합니다. 실행 순서/Colab
+Secrets 토큰 설정/재시작 방법/알려진 한계는 **[docs/colab_free_tier.md](docs/colab_free_tier.md)**
+에 정리했습니다.
+
+```bash
+python scripts/colab/run_colab_training.py --smoke --smoke-steps 60
+```
+
 ## 파라미터/메모리 프로파일링 도구
 
 `scripts/count_params.py`(구성 요소별 파라미터 집계), `gradient_checkpointing_enable()`,
@@ -261,6 +280,7 @@ python scripts/train_ard.py --dataset-repo-id <...> \
 - `scripts/layer_importance.py` — SmolLM2 백본 레이어 중요도(코사인 유사도 기반) 분석.
 - `scripts/compare_lac_modes.py` — LAC none/covla/role_aware 모드 비교(`select_action()` 경로, 합성 백본, jerk/ρ/ω/α).
 - `scripts/compare_lac_closed_loop_modes.py` — 같은 비교를 ARD-VLA 2.0 폐루프 경로(`run_closed_loop`+Judge)로 끝까지.
+- `scripts/colab/` — 무료 Colab 스모크/베이스라인 학습 진입점(`run_colab_training.py`)과 보조 모듈(`env_setup.py`/`dataset_fetch.py`/`episode_split.py`/`schema_check.py`/`norm_stats.py`/`checkpoint.py`/`batch_source.py`/`eval_offline.py`) — 사용법은 [docs/colab_free_tier.md](docs/colab_free_tier.md).
 - `third_party/lerobot/` — vendored, editable LeRobot/SmolVLA source.
   - `src/lerobot/policies/smolvla/ard.py` — ARD heads/losses, `ForceHead`, GradNorm, Bridge Attention, 대칭 대조군 손실.
   - `src/lerobot/policies/smolvla/freq_policy.py` — FreqPolicy 주파수 일관성 손실.
@@ -273,5 +293,5 @@ python scripts/train_ard.py --dataset-repo-id <...> \
 - `tests/` — pytest 테스트 전부(`test_ard.py`, `test_ard_integration.py`, `test_freq_policy.py`, `test_token_pruning.py`, `test_judge.py`, `test_decision_logic.py`, `test_closed_loop.py`, `test_lac.py`, `test_lac_closed_loop.py`, `test_env.py`, `conftest.py`의 합성 SmolVLM fixture 포함).
 - `pytest.ini` — `pytest` 루트 실행 설정(`testpaths=tests`, `requires_hub` 마커).
 - `.github/workflows/tests.yml` — CPU 전용 pytest CI.
-- `docs/` — 기능별 상세 설계/사용법/검증 기록(`ard.md`, `bridge_attention.md`, `freq_policy.md`, `token_pruning.md`, `profiling_tools.md`, `closed_loop.md`, `lac.md`).
+- `docs/` — 기능별 상세 설계/사용법/검증 기록(`ard.md`, `bridge_attention.md`, `freq_policy.md`, `token_pruning.md`, `profiling_tools.md`, `closed_loop.md`, `lac.md`, `configurable_ard.md`, `recovery_data_design.md`, `colab_free_tier.md`).
 - `PROGRESS.md` — 멀티세션 작업 진행 기록(사용량 한도로 세션이 끊겨도 다음 세션이 이어갈 수 있도록).
