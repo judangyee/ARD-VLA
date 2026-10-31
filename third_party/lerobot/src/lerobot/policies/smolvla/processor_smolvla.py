@@ -38,7 +38,12 @@ from lerobot.processor import (
     UnnormalizerProcessorStep,
 )
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
-from lerobot.utils.constants import ACTION, POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+from lerobot.utils.constants import (
+    ACTION,
+    OBS_STATE,
+    POLICY_POSTPROCESSOR_DEFAULT_NAME,
+    POLICY_PREPROCESSOR_DEFAULT_NAME,
+)
 
 
 def _apply_action_min_std(
@@ -58,6 +63,41 @@ def _apply_action_min_std(
     floor = torch.as_tensor(min_std, dtype=torch.float32)
     action_stats["std"] = torch.maximum(std, floor)
     new_stats[ACTION] = action_stats
+    return new_stats
+
+
+def _apply_state_min_std(
+    dataset_stats: dict[str, dict[str, torch.Tensor]] | None,
+    min_std: float | list[float] | None,
+    state_select: list[int] | None,
+) -> dict[str, dict[str, torch.Tensor]] | None:
+    """`dataset_stats[OBS_STATE]["std"]`에 std 하한을 적용한 새 dict를 반환한다(원본은
+    바꾸지 않음) — `NormalizerProcessorStep`에 이 결과를 넘긴다.
+
+    **정규화는 `state_select`보다 먼저 일어난다**: `NormalizerProcessorStep`은
+    raw `observation.state` 전체(예: RoCo는 44차원)를 정규화하고, `state_select`는 그 뒤
+    `SmolVLAPolicy.prepare_state()` 안에서(즉 이미 정규화가 끝난 뒤) 채널을 고른다. 그래서
+    `min_std`는 `state_select`가 있으면 **그 selected 채널의 순서**(길이 ==
+    `len(state_select)`)로 주어지고, 이 함수가 그 인덱스를 이용해 raw std 배열의 해당
+    위치에만 적용한다 — 선택되지 않는 나머지 채널(예: RoCo의 관절 속도)은 어차피
+    `prepare_state()`가 버리므로 std를 바꿔도 안 바꿔도 결과에 영향이 없다. `state_select`가
+    없으면 raw 전체 순서(길이 == 실제 차원)로 직접 적용한다. `min_std=None`이거나
+    `dataset_stats`에 `OBS_STATE` 통계가 없으면 그대로 돌려준다."""
+    if min_std is None or not dataset_stats or OBS_STATE not in dataset_stats:
+        return dataset_stats
+    new_stats = dict(dataset_stats)
+    state_stats = dict(new_stats[OBS_STATE])
+    std = torch.as_tensor(state_stats["std"], dtype=torch.float32).clone()  # 원본 텐서와 공유 방지
+    floor = torch.as_tensor(min_std, dtype=torch.float32)
+    if state_select is not None:
+        idx = torch.as_tensor(state_select, dtype=torch.long)
+        if floor.ndim == 0:
+            floor = floor.expand(idx.shape[0])
+        std[idx] = torch.maximum(std[idx], floor)
+    else:
+        std = torch.maximum(std, floor)
+    state_stats["std"] = std
+    new_stats[OBS_STATE] = state_stats
     return new_stats
 
 
@@ -112,8 +152,11 @@ def make_smolvla_pre_post_processors(
     # action_min_std가 있으면(기본 None) ACTION 통계의 std를 max(std, min_std)로 한 번만
     # 바꿔서 Normalizer/Unnormalizer 둘 다에 똑같이 넘긴다 — 정규화·역정규화가 항상 같은
     # std를 쓰게 보장한다(원본 dataset_stats는 바꾸지 않음). None이면 원본 dataset_stats를
-    # 그대로 양쪽에 넘기므로 기존과 bit-exact.
+    # 그대로 양쪽에 넘기므로 기존과 bit-exact. state_min_std도 같은 방식으로 STATE 통계에
+    # 적용한다 — Unnormalizer는 output_features(ACTION)만 보고 STATE 항목은 아예 읽지
+    # 않으므로, 같은 stats 객체를 공유해도 Unnormalizer 쪽 동작에는 영향이 없다.
     normalization_stats = _apply_action_min_std(dataset_stats, config.action_min_std)
+    normalization_stats = _apply_state_min_std(normalization_stats, config.state_min_std, config.state_select)
     input_steps.append(
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},

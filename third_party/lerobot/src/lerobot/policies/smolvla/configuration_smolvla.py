@@ -66,6 +66,19 @@ class SmolVLAConfig(PreTrainedConfig):
     # 그대로 쓴다(완전히 동일).
     action_min_std: float | list[float] | None = None
 
+    # STATE 피처의 MEAN_STD 정규화에서 쓰는 차원별 표준편차 하한 — `action_min_std`와 같은
+    # 구조(processor_smolvla.py의 `_apply_state_min_std`가 `dataset_stats`를 복사해서 한 번만
+    # 바꾸고 `NormalizerProcessorStep`에 그 결과를 넘김, 원본은 안 바꿈). **정규화는
+    # `state_select`보다 먼저 일어난다** — `NormalizerProcessorStep`은 raw observation.state
+    # 전체(예: RoCo 44차원)를 정규화하고, `state_select`는 그 뒤 `SmolVLAPolicy.prepare_state()`
+    # 안에서(즉 이미 정규화가 끝난 뒤) 채널을 고른다(아래 "확인" 참고). 그래서 이 필드는
+    # `state_select`가 있으면 **그 selected 채널의 순서**(길이 == len(state_select))로,
+    # 없으면 raw observation.state 전체 순서(길이 == 실제 차원)로 값을 준다 — 내부적으로
+    # `state_select`의 인덱스를 이용해 raw 44차원 std 배열의 해당 위치에만 적용한다. 거의
+    # 상수인 채널(예: 보조 팔의 위치)을 실제 std 그대로 정규화하면 아주 작은 노이즈가
+    # 정규화 후 값으로 크게 증폭되는 걸 막는다. None(기본)이면 기존 std를 그대로 쓴다.
+    state_min_std: float | list[float] | None = None
+
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
 
@@ -365,6 +378,24 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("`action_min_std`가 리스트면 비어 있을 수 없습니다(None으로 끄세요).")
             if any(v <= 0 for v in min_std_values):
                 raise ValueError(f"`action_min_std`는 모두 양수여야 합니다. 현재 값: {self.action_min_std}")
+        if self.state_min_std is not None:
+            state_min_std_values = self.state_min_std if isinstance(self.state_min_std, list) else [self.state_min_std]
+            if len(state_min_std_values) == 0:
+                raise ValueError("`state_min_std`가 리스트면 비어 있을 수 없습니다(None으로 끄세요).")
+            if any(v <= 0 for v in state_min_std_values):
+                raise ValueError(f"`state_min_std`는 모두 양수여야 합니다. 현재 값: {self.state_min_std}")
+            if (
+                isinstance(self.state_min_std, list)
+                and self.state_select is not None
+                and len(self.state_min_std) != len(self.state_select)
+            ):
+                raise ValueError(
+                    f"`state_min_std` 길이({len(self.state_min_std)})가 `state_select` 길이"
+                    f"({len(self.state_select)})와 다릅니다 — state_select로 고른 채널 순서대로 "
+                    "값을 줘야 합니다."
+                )
+            # state_select가 없을 때의 상한(실제 observation.state 차원)은 데이터셋 피처를
+            # 알아야 하므로 validate_features()에서 검증한다.
         if self.vlm_layer_indices is not None:
             if len(self.vlm_layer_indices) == 0:
                 raise ValueError("`vlm_layer_indices`가 비어 있습니다 — 최소 1개 이상의 레이어 인덱스가 필요합니다.")
@@ -558,6 +589,16 @@ class SmolVLAConfig(PreTrainedConfig):
                     raise ValueError(
                         f"`state_select`의 인덱스가 실제 observation.state 차원({real_state_dim})을 "
                         f"벗어납니다. 현재 값: {self.state_select}"
+                    )
+
+        if self.state_min_std is not None and isinstance(self.state_min_std, list) and self.state_select is None:
+            state_feat = self.input_features.get(OBS_STATE)
+            if state_feat is not None:
+                real_state_dim = state_feat.shape[0]
+                if len(self.state_min_std) != real_state_dim:
+                    raise ValueError(
+                        f"`state_select`가 없으면 `state_min_std` 길이({len(self.state_min_std)})가 "
+                        f"실제 observation.state 차원({real_state_dim})과 같아야 합니다."
                     )
 
         if self.action_min_std is not None and isinstance(self.action_min_std, list) and self.action_feature is not None:
