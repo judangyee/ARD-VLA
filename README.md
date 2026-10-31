@@ -174,12 +174,17 @@ ARD-VLA는 원래 OpenArm 16채널/왼팔=Stabilizer/chunk 50/L2 손실 전제�
 (회전 채널을 학습 전 시간축으로 펴고 추론 후 로봇에 보내기 직전 다시 `[-π,π)`로 감싸는
 전처리, `processor_smolvla.py`)도 추가했습니다 — pos_loss(u_t/v_t는 raw 액션이 아니라
 flow-matching 속도장이라 거기서 각도 래핑을 하면 틀린 설계였습니다, docs 참고)는 건드리지
-않습니다. 전부 기본값이 기존과 bit-for-bit 동일합니다. `configs/presets/roco_board.yaml`이
-RoCo용 조합을 담고 있습니다 — action 14차원 스키마(팔당 [xyz+rxryrz+그리퍼]=7채널, 왼팔/
-오른팔 순)는 **사용자가 공식 데이터셋에서 직접 확인**했고, rx/ry/rz가 오일러각인지
-회전벡터인지는 미확인이라 `angle_unwrap_dims`는 꺼둔 채입니다. 조사 결과("뭐가 진짜
-하드코딩이었나"), 각 필드의 수식적 근거, 검증된 것/미확인 사항은
-**[docs/configurable_ard.md](docs/configurable_ard.md)** 에 있습니다.
+않습니다. `state_select`(`observation.state`가 `max_state_dim`보다 넓을 때 필요한 채널만
+골라 패딩 에러를 피함)와 `action_min_std`(거의 상수인 채널의 정규화 노이즈 증폭을 막는
+차원별 std 하한, 정규화·역정규화 양쪽에 동일 적용)도 추가했습니다. 전부 기본값이 기존과
+bit-for-bit 동일합니다. `configs/presets/roco_board.yaml`이 RoCo용 조합을 담고 있습니다 —
+action 14차원 스키마(팔당 [xyz+rxryrz+그리퍼]=7채널)와 state 44차원 구성은 **사용자가
+공식 시뮬 데이터셋 200 에피소드/121,454프레임 전체를 집계해 확인**했습니다. 그 실측
+결과 각도가 이미 연속(±π 경계 점프 0건)이라 `angle_unwrap_dims`는 꺼둔 채이고(켜면 오히려
+불연속을 만듦), `observation.state`는 관절 속도(14차원)를 뺀 30차원만 골라 쓰고
+(`state_select`), 사실상 상수인 오른팔 action 채널엔 `action_min_std`로 정규화 바닥을
+깔았습니다. 조사 결과("뭐가 진짜 하드코딩이었나"), 각 필드의 수식적 근거, 검증된 것/
+미확인 사항은 **[docs/configurable_ard.md](docs/configurable_ard.md)** 에 있습니다.
 
 ```bash
 pytest tests/test_configurable_ard.py

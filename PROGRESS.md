@@ -1084,3 +1084,92 @@ ProcessorStep이 들어가는지 — 토크나이저 로드만 몽키패치, 나
   고려, 오일러각이면 그때 `angle_unwrap_dims` 켜고 A/B 비교.
 - "VLM은 LoRA"를 실제로 구현하려면: `_get_default_peft_targets()`에 `model.vlm_with_
   expert.vlm.*` 타겟 추가 + `train_ard.py`에 `--use-peft` 경로 추가(이번 범위 밖, 보고만).
+
+---
+
+# RoCo 전체 통계(200 에피소드/121,454프레임) 반영: state_select + action_min_std (branch: configurable-ard, 후속)
+
+사용자가 RoCo 공식 시뮬 데이터셋 **전체**(200 에피소드, 121,454프레임)를 집계한 결과를
+전달했다: state 44차원 = EE pos+quat 14(0-13) + 관절 위치 14(14-27) + 관절 속도 14(28-41)
++ 그리퍼 2(42-43). action 14차원은 EE **절대** 목표(Euler XYZ, rad) — 각도는 이미 연속
+(±π 경계 점프 0건)이고 값 자체는 ±π 밖으로도 나간다(왼팔 rx 최대 4.10, rz 최대 7.00).
+오른팔 action은 사실상 상수(pos_x 범위 1.6e-5m 등). 양자화는 건드리지 말라는 명시적 지시.
+
+## 1. 확인(가정 없이 코드로)
+
+`max_state_dim`/`max_action_dim` 기본값 **둘 다 32**(`configuration_smolvla.py`). `pad_vector
+(vector, new_dim)`는 입력이 `new_dim`보다 **크면 자르지 않고 `RuntimeError`**를 던짐 — 직접
+재현 확인(`pad_vector(torch.randn(2,44), 32)` → `RuntimeError: ... non-singleton dimension 1`).
+RoCo raw state(44) > 기본 `max_state_dim`(32)이라 아무 조치 없이 쓰면 첫 배치에서 크래시.
+
+## 2. `state_select`(신규)
+
+`configuration_smolvla.py`에 `state_select: list[int] | None` 필드 + 검증(빈 리스트/중복/
+음수/`len > max_state_dim` 거부는 `__post_init__`, 실제 `observation.state` 차원을 넘는
+인덱스 거부는 `validate_features()`). `modeling_smolvla.py`의 `prepare_state()`가
+`ard_use_joint_torque` concat/`pad_vector`보다 먼저 `state.index_select(-1, idx)`를 적용 —
+학습(`forward()`)/추론(`predict_action_chunk` 등) 둘 다 이 메서드를 공유하므로 자동으로
+동일 적용된다. `None`(기본)이면 분기 자체가 없어 기존과 완전히 동일.
+
+`state_proj = nn.Linear(max_state_dim, hidden_size)`로 입력 폭이 항상 `max_state_dim`
+고정이라(기존 `ard_use_joint_torque`와 같은 패턴), 30채널(관절 속도 28-41 제외) <= 32이면
+사전학습 가중치를 그대로 쓸 수 있음을 확인. RoCo 프리셋: `state_select = list(range(28))
++ [42, 43]`(30차원).
+
+## 3. `action_min_std`(신규)
+
+`configuration_smolvla.py`에 `action_min_std: float | list[float] | None` 필드 + 검증(0
+이하 거부, 리스트 길이는 `validate_features()`에서 실제 액션 차원과 대조). 실제 적용은
+`processor_smolvla.py`의 `_apply_action_min_std(dataset_stats, min_std)` — `dataset_stats
+[ACTION]["std"]`를 `torch.maximum(std, min_std)`로 교체한 **새** dict를 한 번만 만들어서
+`NormalizerProcessorStep`과 `UnnormalizerProcessorStep` 둘 다에 **같은 결과**를 넘긴다(원본
+`dataset_stats`는 안 바꿈) — 이 구조 자체가 "정규화·역정규화가 항상 같은 std를 쓴다"를
+보장한다. `None`이면 원본을 그대로 양쪽에 넘기므로 bit-exact.
+
+RoCo 프리셋: 위치 0.01m/회전·그리퍼 0.05rad(둘 다 임시값), 왼팔(0-6)/오른팔(7-13) 구분 없이
+14채널 전체에 같은 패턴을 반복 — 테스트로 "극단적으로 std=1e-6인 14채널 전체가 일관되게
+보호되는지"(오른팔만 아니라) 직접 확인.
+
+## 4. 각도: 실측으로 더 강한 근거 확보
+
+이전 세션에서 "오일러각 vs 회전벡터 미확인"을 근거로 `angle_unwrap_dims`를 꺼뒀는데, 이번
+전체 통계로 **그 질문과 무관한 더 직접적인 이유**가 나왔다: 각도 점프가 0건이면서 값 자체는
+±π 밖(rz 최대 7.00)이라는 건 "데이터가 이미 unwrap된 채로 기록돼 있다"는 뜻이다. 그래서
+`AngleUnwrapProcessorStep`은 펼 게 없어 거의 항등 변환이고, `AngleRewrapProcessorStep`은
+오히려 데모에 없던 불연속을 만든다(예: 7.00을 보낼 자리에 0.717을 보냄). 오일러/회전벡터
+여부와 무관하게 결론 확정 — RoCo 프리셋은 `angle_unwrap_dims`를 아예 명시하지 않는다.
+
+## 테스트/문서
+
+`tests/test_configurable_ard.py`에 11개 추가: `state_select` 검증 거부(빈 리스트/중복/음수/
+개수초과/실제 차원 밖), `prepare_state()`가 선택한 채널을 정확한 순서로 가져오고 나머지는
+0 패딩하는지, `None` 기본값이 기존과 동일한지, `action_min_std` 검증 거부(0/음수/길이
+불일치), 정규화→역정규화 왕복이 min_std 켜도 원래 값으로 돌아오는지, std=1e-6인 14채널
+**전체**가 일관되게 보호되는지(왼팔/오른팔 구분 없이), 이미 큰 std는 안 낮추는지, RoCo
+프리셋이 `angle_unwrap_dims`를 아예 설정 안 하는지 + 실제 파이프라인에 Angle 스텝이 없는지.
+기존 `test_roco_preset_tiny_model_trains_and_infers`/`test_roco_preset_loads_into_valid_config`
+는 raw state 44차원(2*arm_dim 심메트릭 가정이 더 안 맞음)에 맞게 `input_features`/
+`max_state_dim`을 명시적으로 덮어쓰도록 수정.
+
+`docs/configurable_ard.md`: "RoCo 시뮬 실측" 절 추가(각도 연속성 근거), `state_select`/
+`action_min_std` 설명 절 추가(`pad_vector` 크래시 재현 코드 포함), action/state 스키마를
+전체 통계로 갱신. README.md 요약 갱신. `configs/presets/roco_board.yaml` 상단 주석을
+전체 통계로 갱신 + `state_select`/`action_min_std` 추가.
+
+`pytest tests/`(147개 전부 통과 — 기존 136 + 신규 11). 양자화는 건드리지 않음(그대로
+존재하지 않는 상태 유지).
+
+## 검증한 것 / 못 한 것
+
+**검증함**: 위 테스트 전부(합성 모델, Hub 접근 없음) + `pad_vector` 크래시 실제 재현.
+**못 함**(범위 밖/미확인): `action_min_std` 값(0.01/0.05)이 실제 RoCo 통계 기준으로
+적절한지 재튜닝 안 함, rx/ry/rz 오일러/회전벡터 여부는 여전히 미확인(다만 영향 없음 —
+위 4번 참고), `state_select`로 관절 속도를 빼는 게 실제 학습 성능에 미치는 영향은 실측
+안 함.
+
+## 다음에 할 일
+
+- `action_min_std` 값을 실제 오른팔 채널 표준편차(pos_x 1.6e-5m 등)에 맞춰 재튜닝할지
+  검토 — 지금 값(0.01/0.05)은 임시.
+- 관절 속도(28-41)를 뺀 30차원 state가 실제로 충분한지(관절 속도 정보가 성능에 중요하면
+  다시 넣고 `max_state_dim`을 44 이상으로 올려야 함) GPU 실험으로 확인 필요.

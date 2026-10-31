@@ -5,8 +5,8 @@
 ARD-VLA는 원래 OpenArm 16채널(팔당 8 DoF, 왼팔=Stabilizer 고정, chunk 50, pos_loss는 L2)
 전제로 설계됐습니다. RoCo Challenge처럼 대회마다 로봇/액션 공간/우세 팔이 바뀌는 과제에
 재사용하려고, 이 하드코딩을 config 손잡이 4개(`role_map`/`action_space`/`pos_loss_type`/
-`per_timestep_norm`)와, 손실과는 완전히 독립적인 데이터 전처리 옵션(`angle_unwrap_dims`)
-으로 뺐습니다. **이번 작업은 구조 구현 + 작은
+`per_timestep_norm`)와, 손실과는 완전히 독립적인 데이터 전처리/정규화 옵션
+(`angle_unwrap_dims`/`state_select`/`action_min_std`)으로 뺐습니다. **이번 작업은 구조 구현 + 작은
 합성 모델 검증까지입니다** — 실제 SmolVLM2 가중치나 RoCo 공식 데이터셋에서는 돌려보지
 않았습니다(아래 "검증한 것 / 못 한 것" 참고).
 
@@ -41,6 +41,8 @@ ARD-VLA는 원래 OpenArm 16채널(팔당 8 DoF, 왼팔=Stabilizer 고정, chunk
 | `per_timestep_norm` | `False` | 켜면 청크 내 실행 위치 t(0..chunk_size-1)마다 σ(t)=a+s·√t로 추가 스케일 |
 | `per_timestep_norm_a`/`per_timestep_norm_s` | `1.0`/`0.0` | 스칼라 또는 (실제 액션 차원,) 리스트. `scripts/fit_timestep_norm.py`로 피팅 |
 | `angle_unwrap_dims` | `None` | 액션 벡터의 절대 채널 인덱스 리스트. ARD/pos_loss와 완전히 독립 — `use_ard` 여부와 무관하게 동작하는 **데이터 전처리** 옵션(아래 참고) |
+| `state_select` | `None` | `observation.state`의 절대 채널 인덱스 리스트. 지정하면 `prepare_state()`가 패딩 전에 이 채널만 골라 쓴다(아래 참고) |
+| `action_min_std` | `None` | ACTION MEAN_STD 정규화의 차원별 std 하한 — `std = max(std, min_std)`를 정규화·역정규화 양쪽에 동일하게 적용(아래 참고) |
 
 전부 기본값이 기존 동작과 동일해서 **꺼져 있으면 bit-for-bit 동일**합니다
 (`tests/test_configurable_ard.py::test_new_config_fields_default_to_noop`).
@@ -137,34 +139,117 @@ RoCo 스키마 자체는 채널 이름만 알려줄 뿐 회전 표현 방식을 
 
 **결론: 확정적이지 않지만, rx/ry/rz가 오일러각보다 회전벡터일 가능성을 시사하는 간접
 근거가 있다.** 회전벡터라면 `angle_unwrap_dims`를 이 채널들에 적용하는 것은 **부적절**
-하다 — RoCo 프리셋은 그래서 이 옵션을 꺼둔 채로 둔다. `scripts/check_rotation_range.py`가
-실제 데이터의 삼중값(rx,ry,rz) 노름 통계를 출력해 참고용 힌트를 주지만(노름이 거의 항상
-`≤ π`면 회전벡터 쪽에 더 가까움), **최종 판단은 RoCo 데이터 생성 코드/스키마 문서를 직접
-확인해야 한다** — 이 레포에서는 그 소스에 접근하지 못했다.
+하다. `scripts/check_rotation_range.py`가 실제 데이터의 삼중값(rx,ry,rz) 노름 통계를
+출력해 참고용 힌트를 주지만(노름이 거의 항상 `≤ π`면 회전벡터 쪽에 더 가까움), 이
+질문 자체는 여전히 **미확인**으로 남아 있다 — 다만 아래 "RoCo 시뮬 실측"에서 보듯,
+이 질문과 무관하게 RoCo에서는 `angle_unwrap_dims`를 켜지 않는 게 맞다는 **더 직접적인
+증거**가 나왔다.
 
-### `action_space`/`role_map` — RoCo Challenge 공식 스키마와의 매핑
+### RoCo 시뮬 실측(200 에피소드/121,454프레임) — 각도가 이미 연속이라 wrap하지 않는다
+
+사용자가 RoCo 공식 시뮬 데이터셋 **전체**(200 에피소드, 121,454프레임)를 집계한 결과:
+
+- **각도 점프 0건**: 에피소드 전체에서 연속된 두 프레임 사이에 `±π` 경계를 넘는 불연속
+  (예: 3.14 → -3.14처럼 raw 차이가 `~2π`에 가까운 경우)이 **단 한 번도** 없었다.
+- **그런데 값 자체는 `±π` 밖으로도 나간다**: 왼팔 `rx` 최대 4.10 rad, `rz` 최대 7.00 rad.
+
+이 둘을 같이 보면 결론은 하나다 — **RoCo의 회전 채널은 이미 "unwrap된" 상태로
+기록돼 있다.** 로봇/시뮬레이터가 각도를 `[-π, π)`로 매 스텝 접어서 저장하는 대신, 실제
+누적 회전값을 그대로 기록한다는 뜻이다. 그래서:
+
+- `AngleUnwrapProcessorStep`을 켜도 고칠 불연속이 없다(펼 게 없으니 거의 항등 변환).
+- 반대로 `AngleRewrapProcessorStep`(추론 후 `[-π, π)`로 다시 감싸기)을 켜면 **데모에는
+  없던 불연속을 새로 만들어낸다** — 예를 들어 모델이 7.00을 예측해서 보내야 하는
+  상황에서 `0.717`(`7.00 - 2π`)을 보내게 된다. 데모 자체가 그 범위 밖 값을 쓴다는 건
+  로봇 API가 원래 그 값을 받아들인다는 뜻이라, 감쌀 이유가 없다 — 오히려 감싸는 쪽이
+  데이터와 안 맞는 값을 보내는 버그가 된다.
+
+**이 결론은 rx/ry/rz가 오일러각인지 회전벡터인지와 무관하다** — 어느 쪽이든 "raw
+데이터가 이미 연속"이라는 사실 자체가 `angle_unwrap_dims`를 켤 이유를 없앤다. 그래서
+RoCo 프리셋은 `angle_unwrap_dims`를 명시조차 하지 않는다(`configs/presets/roco_board.yaml`
+주석 참고).
+
+### `action_space`/`role_map`/`state_select` — RoCo Challenge 공식 스키마와의 매핑
 
 RoCo Challenge 공식 데이터셋(`rocochallenge2025/rocochallenge2026_Industrial_Assembly`,
 LeRobot v3.0, ~1.1GB)은 **이 샌드박스에서 여전히 HF Hub 접근이 막혀 있어 meta/info.json을
-직접 열어보지 못합니다**. 다만 **사용자가 직접 확인해서 전달한 스키마(2026-10-29)** 는
-다음과 같습니다 — action 14차원 순서:
+직접 열어보지 못합니다**. 다만 **사용자가 직접 전체 통계를 집계해 전달한 스키마(2026-10-29
+확인, 2026-10-31 전체 통계로 보강)** 는 다음과 같습니다:
 
-```
-left_ee_x, left_ee_y, left_ee_z, left_ee_rx, left_ee_ry, left_ee_rz, left_gripper,
-right_ee_x, right_ee_y, right_ee_z, right_ee_rx, right_ee_ry, right_ee_rz, right_gripper
-```
+- **action 14차원** 순서 — 엔드이펙터 **절대** 목표(Euler XYZ, 라디안):
+  ```
+  left_ee_x, left_ee_y, left_ee_z, left_ee_rx, left_ee_ry, left_ee_rz, left_gripper,
+  right_ee_x, right_ee_y, right_ee_z, right_ee_rx, right_ee_ry, right_ee_rz, right_gripper
+  ```
+  팔별로 연속된 **[엔드이펙터 pose 6(xyz+rxryrz) + 그리퍼 1] = 7채널** 블록이 왼팔,
+  오른팔 순서로 이어집니다.
+- **state 44차원** = EE 위치+쿼터니언 14(인덱스 0-13) + 관절 위치 14(14-27) + 관절 속도
+  14(28-41) + 그리퍼 2(42-43).
+- **오른팔 action은 사실상 상수**(보조/고정 역할과 일치): `pos_x` 범위 1.6e-5m, `pos_y`
+  4cm, `pos_z` 3cm, `rx∈[-3.22,-3.14]`rad, `ry·rz ≈ 1e-5~5e-4`rad, 그리퍼 항상 0.2256.
+  왼팔 그리퍼 범위는 0.060~0.301.
 
-즉 팔별로 연속된 **[엔드이펙터 pose 6(xyz+rxryrz) + 그리퍼 1] = 7채널** 블록이 왼팔,
-오른팔 순서로 이어집니다. 이로부터:
+이로부터:
 
 - `ard_arm_dim=7`, `ard_gripper_dim=1`(마지막 1채널=그리퍼) — **확인됨**, 추측이 아니라
   이 스키마와 정확히 일치합니다.
 - 채널이 관절이 아니라 엔드이펙터 목표 pose라서 `action_space="ee"`.
 - rx/ry/rz 세 채널이 오일러각인지 회전벡터(axis-angle)인지는 스키마 자체로는 알 수
-  없습니다 — **미확인**(위 "오일러각 vs 회전벡터" 참고).
+  없습니다 — **미확인**(위 "오일러각 vs 회전벡터" 참고). 다만 위에서 봤듯 `angle_unwrap_dims`
+  를 켤지 여부는 이 질문과 무관하게 결정됐습니다(꺼둠).
 - "대부분 왼팔만 사용"(공개 설명, 이 부분은 여전히 **미확인** — 스키마 자체와는 별개)
   → 왼팔이 실제 작업(Actuator), 오른팔이 보조(Stabilizer) →
   `role_map={"stabilizer": "right", "actuator": "left"}`.
+- `state_select = list(range(28)) + [42, 43]`(30차원) — raw state 44차원 중 관절 속도
+  (28-41)를 빼고 EE 위치+쿼터니언/관절 위치/그리퍼만 쓴다(아래 "state_select" 참고).
+
+### `state_select` — `max_state_dim`보다 넓은 raw state에서 필요한 채널만 고르기
+
+**확인(가정 아님, 코드로 직접 재현)**: `SmolVLAConfig`의 `max_state_dim`/`max_action_dim`
+기본값은 **둘 다 32**입니다. `modeling_smolvla.py`의 `pad_vector(vector, new_dim)`는
+`vector.shape[-1] == new_dim`이면 그대로, **작으면** 0으로 패딩하지만, **크면 그냥
+`RuntimeError`를 던집니다**(자동으로 자르지 않음) — 직접 재현:
+
+```python
+>>> pad_vector(torch.randn(2, 44), 32)
+RuntimeError: The expanded size of the tensor (32) must match the existing size (44)
+at non-singleton dimension 1.  Target sizes: [2, 32].  Tensor sizes: [2, 44].
+```
+
+RoCo의 raw state는 44차원(> 32)이라, `state_select` 없이 그대로 쓰면 **첫 배치에서
+크래시**합니다. `state_select`(절대 채널 인덱스 리스트)를 지정하면 `prepare_state()`가
+`ard_use_joint_torque` concat/`pad_vector`보다 먼저 그 채널들만 골라서(순서는 리스트
+순서) 쓰므로, 30채널로 줄인 RoCo state는 기본 `max_state_dim=32` 안에 들어가 크래시가
+안 납니다. 학습(`forward()`)과 추론(`predict_action_chunk`/`select_action`) 모두
+`prepare_state()`를 거치므로 자동으로 동일하게 적용됩니다. `None`(기본)이면 분기 자체가
+없어 기존과 완전히 동일합니다.
+
+**사전학습 `state_proj` 재사용 가능 여부**: `state_proj = nn.Linear(max_state_dim,
+hidden_size)`로, 입력 폭이 항상 `max_state_dim`(실제 쓰는 채널 수와 무관)으로 고정돼
+있습니다 — `state_select`로 30채널만 쓰고 나머지 2칸을 0으로 패딩해도 `state_proj`의
+가중치 shape은 전혀 바뀌지 않습니다. 즉 **30 ≤ max_state_dim(32)만 만족하면 사전학습된
+`state_proj` 가중치를 그대로 쓸 수 있습니다**(새 파라미터 없음, `ard_use_joint_torque`가
+이미 쓰던 것과 같은 패턴).
+
+### `action_min_std` — 거의 상수인 채널의 정규화 노이즈 증폭 방지
+
+오른팔(Stabilizer)이 사실상 상수라서(위 "오른팔 action은 사실상 상수" 참고) 그 채널들의
+실측 표준편차가 아주 작습니다. 표준 MEAN_STD 정규화(`(x - mean) / std`)를 그 작은 std
+그대로 쓰면, 아주 작은 관측 노이즈도 정규화 후에는 크게 증폭됩니다(예: std=1e-6인
+채널에서 1e-6 크기 노이즈가 정규화 후 값 1.0이 됨). `action_min_std`(스칼라 또는
+14차원 리스트)를 설정하면 `std = max(std, min_std)`를 쓰게 됩니다.
+
+**구현**: `processor_smolvla.py`의 `_apply_action_min_std(dataset_stats, min_std)`가
+`dataset_stats[ACTION]["std"]`를 한 번만 바꾸고, 그 **같은 결과**를
+`NormalizerProcessorStep`과 `UnnormalizerProcessorStep` 둘 다에 넘깁니다 — 그래서
+정규화·역정규화가 항상 같은 std를 쓰고(원본 `dataset_stats`는 바꾸지 않음), `min_std`가
+None이면 원본을 그대로 양쪽에 넘기므로 기존과 bit-exact입니다.
+
+RoCo 프리셋 값은 위치 0.01m, 회전 0.05rad, 그리퍼 0.05(모두 임시값, 실데이터로 재튜닝
+필요) — **왼팔(0-6)/오른팔(7-13) 구분 없이 14채널 전체에 같은 패턴을 반복** 적용합니다
+(왼팔 그리퍼도 범위가 좁은 편이라, 오른팔만 보호하면 왼팔 쪽 작은 std 채널이 안전하지
+않습니다 — `tests/test_configurable_ard.py::test_action_min_std_floors_every_dimension_uniformly`
+로 14채널 전체가 일관되게 바뀌는지 직접 확인).
 
 ## RoCo Challenge 프리셋 (`configs/presets/roco_board.yaml`)
 
@@ -183,7 +268,9 @@ config = SmolVLAConfig(input_features=..., output_features=..., **overrides)
 | `role_map` | `{stabilizer: right, actuator: left}` | 공개 설명: 왼팔이 실제 작업 수행(이 부분은 미확인) |
 | `ard_arm_dim`/`ard_gripper_dim` | `7`/`1` | **확인된 스키마**(팔당 ee pose 6 + 그리퍼 1) |
 | `action_space` | `ee` | 채널이 관절이 아니라 엔드이펙터 목표 |
-| `angle_unwrap_dims` | *(미설정, 꺼짐)* | rx/ry/rz가 오일러각인지 회전벡터인지 미확인이라 일단 꺼둠 — `scripts/check_rotation_range.py`로 확인 후 켤지 결정 |
+| `state_select` | `list(range(28)) + [42, 43]`(30차원) | raw state 44차원 중 관절 속도(28-41) 제외. `max_state_dim` 기본값(32) 안에 들어감 |
+| `action_min_std` | 위치 `0.01`/회전·그리퍼 `0.05`(14채널 반복) | 오른팔이 사실상 상수(실측 std가 아주 작음) — 정규화 노이즈 증폭 방지 |
+| *(angle_unwrap_dims, 미설정)* | — | RoCo 실측: 각도가 이미 연속(점프 0건)이라 wrap하면 오히려 불연속이 생김(위 "RoCo 시뮬 실측" 참고) |
 | `pos_loss_type` | `l1` | RoCo 1회 우승팀 보고(arXiv 2603.15469) |
 | `chunk_size`/`n_action_steps` | `20`/`5` | 조립 작업에 맞춘 재계획 빈도(공개 스펙 10fps 기준 가정) |
 | `per_timestep_norm` | `true`(a/s는 미피팅 항등값) | LeHome 보고(arXiv 2606.27163). 실데이터 피팅 필요 |
@@ -257,19 +344,21 @@ PR 병합 커밋이고 — 그 이후 모든 작업이 다른 브랜치 경로�
 ## 새/수정 파일
 
 - `configuration_smolvla.py` — `role_map`/`action_space`/`pos_loss_type`/`per_timestep_norm`
-  (+`_a`/`_s`)/`angle_unwrap_dims` 필드와 `__post_init__`/`validate_features()` 검증·파생
-  로직.
+  (+`_a`/`_s`)/`angle_unwrap_dims`/`state_select`/`action_min_std` 필드와
+  `__post_init__`/`validate_features()` 검증·파생 로직.
 - `ard.py` — `compute_timestep_norm_sigma`/`apply_timestep_norm`/`invert_timestep_norm`
   (순수 함수 3개, 패딩 채널은 identity로 채움). (`wrap_to_pi`/`build_angle_channel_mask`/
   `apply_angle_aware_target`은 추가했다가 되돌림 — 위 "되돌림" 참고.)
 - `modeling_smolvla.py` — `F.mse_loss` 호출을 `pos_loss_type` 3분기로 교체,
   `forward()`/`_denoise_loop()` 경계에서 `per_timestep_norm` 스케일/역스케일.
+  `prepare_state()`에 `state_select`(패딩/토크 concat 전 index_select) 추가.
 - `processor_smolvla.py` — `AngleUnwrapProcessorStep`/`AngleRewrapProcessorStep`(+ 내부
   `_wrap_to_pi`/`_unwrap_angles_along_time` 순수 함수), `angle_unwrap_dims` 설정 시에만
-  파이프라인에 삽입.
+  파이프라인에 삽입. `_apply_action_min_std()`가 `dataset_stats`를 한 번만 복사·수정해서
+  `Normalizer`/`UnnormalizerProcessorStep` 둘 다에 동일하게 넘김.
 - `scripts/fit_timestep_norm.py` (신규) — 데이터셋에서 σ(t)의 a/s 피팅.
 - `scripts/check_rotation_range.py` (신규) — 회전 채널 ±π 경계 도약/삼중값 노름 점검.
-- `configs/presets/roco_board.yaml` (신규).
+- `configs/presets/roco_board.yaml` (신규, 전체 통계 반영으로 갱신).
 - `tests/test_configurable_ard.py` (신규).
 
 ## 검증한 것 / 못 한 것
@@ -305,7 +394,20 @@ PR 병합 커밋이고 — 그 이후 모든 작업이 다른 브랜치 경로�
   `action_space`("joint"/"ee")와 무관하게 항상 "v_t가 사는 공간"(표준 정규화 + 선택적
   `per_timestep_norm` 스케일이 적용된 공간)에서 계산됨을 확인(조사만, RoCo 프리셋은
   `lac_mode="none"`이라 수정 보류).
-- 기존 전체 테스트 스위트(136개, `test_ard*`/`test_lac*`/`test_closed_loop*`/`test_judge*`
+- `pad_vector`가 입력 차원이 `max_state_dim`/`max_action_dim`보다 크면 자르지 않고
+  `RuntimeError`를 던지는지 직접 재현(위 "state_select" 참고).
+- `state_select`가 고른 채널을 정확한 순서로 가져오고 나머지는 0 패딩하는지(`prepare_state()`
+  직접 호출), 기본값(`None`)이면 분기 자체가 없어 기존과 완전히 동일한지, 선택 개수가
+  `max_state_dim`을 넘거나 실제 `observation.state` 차원을 벗어나는 인덱스를 거부하는지.
+- `action_min_std`: 정규화→역정규화 왕복이 min_std를 켜도 원래 값으로 정확히 돌아오는지
+  (`Normalizer`/`UnnormalizerProcessorStep`이 같은 `_apply_action_min_std()` 결과를
+  받으므로), `std=1e-6`인 극단적 케이스가 14채널 **전체**에서 일관되게(왼팔/오른팔
+  구분 없이) 하한으로 보호되는지, 이미 더 큰 std는 낮추지 않는지, 잘못된 값(0/음수/길이
+  불일치) 거부.
+- RoCo 프리셋이 `angle_unwrap_dims`를 설정하지 않는지(실제 YAML 내용 확인), 그리고
+  `make_smolvla_pre_post_processors()`가 실제로 만드는 파이프라인에
+  `AngleUnwrapProcessorStep`/`AngleRewrapProcessorStep`이 전혀 없는지.
+- 기존 전체 테스트 스위트(147개, `test_ard*`/`test_lac*`/`test_closed_loop*`/`test_judge*`
   등) 회귀 없음.
 
 **못 함 (범위 밖, 구조/합성 데이터 검증만 — README의 "검증됨 vs 미검증" 관례)**:
@@ -315,8 +417,12 @@ PR 병합 커밋이고 — 그 이후 모든 작업이 다른 브랜치 경로�
   200개가 실제 RoCo 과제에서 적절한 값인지 전혀 실측하지 않음. "대부분 왼팔만 사용"(→
   `role_map`의 근거)도 공개 설명 그대로이고 스키마처럼 직접 재확인한 건 아님.
 - rx/ry/rz가 오일러각인지 회전벡터인지 **미확인**(간접 근거만 있음, 위 참고) —
-  `scripts/check_rotation_range.py`도 HF Hub 차단으로 실행 못 해봄. 그래서
-  `angle_unwrap_dims`는 RoCo 프리셋에서 꺼둔 채로 둠.
+  `scripts/check_rotation_range.py`도 HF Hub 차단으로 실행 못 해봄. 다만 이 질문과
+  무관하게 RoCo 실측(각도 점프 0건)으로 `angle_unwrap_dims`를 꺼야 한다는 결론은 이미
+  확정적이다(위 "RoCo 시뮬 실측" 참고).
+- `action_min_std` 값(위치 0.01/회전·그리퍼 0.05)은 임시값 — 실제 RoCo 액션 통계에서
+  "거의 상수"로 집계된 채널들의 실제 std(예: 오른팔 `pos_x` 범위 1.6e-5m)와 비교해
+  재튜닝이 필요한지 실측하지 않음.
 - `per_timestep_norm`+`lac_mode`를 동시에 켠 상태의 실제 효과(ρ/ω 임계값 재캘리브레이션
   필요 여부)는 분석만 했고 실측하지 않음 — RoCo 프리셋은 이 조합을 피함(`lac_mode="none"`).
 
