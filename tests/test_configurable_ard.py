@@ -383,6 +383,189 @@ def test_angle_unwrap_dims_inserted_into_pipeline_only_when_set(monkeypatch):
     assert sum(isinstance(s, AngleRewrapProcessorStep) for s in post_on.steps) == 1
 
 
+# --- 9. state_select / action_min_std (RoCo 전체 통계 반영) ---
+
+
+def test_state_select_rejects_invalid_values():
+    with pytest.raises(ValueError, match="state_select"):
+        _minimal_config(state_select=[])
+    with pytest.raises(ValueError, match="state_select"):
+        _minimal_config(state_select=[3, 3])
+    with pytest.raises(ValueError, match="state_select"):
+        _minimal_config(state_select=[-1])
+    with pytest.raises(ValueError, match="state_select"):
+        _minimal_config(max_state_dim=4, state_select=[0, 1, 2, 3, 4])  # 선택 개수 > max_state_dim
+
+
+def test_state_select_rejects_index_beyond_real_state_dim():
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+
+    config = SmolVLAConfig(
+        input_features={"observation.state": PolicyFeature(type=FeatureType.STATE, shape=(44,))},
+        output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(14,))},
+        max_action_dim=14,
+        state_select=[50],  # 44차원 밖
+        device="cpu",
+    )
+    with pytest.raises(ValueError, match="state_select"):
+        config.validate_features()
+
+
+def test_state_select_picks_and_pads_correct_channels(build_tiny_policy, build_tiny_batch):
+    """state_select로 고른 채널이 정확히 그 값 그대로 앞쪽에 오고, 나머지는 0 패딩인지
+    `prepare_state()`로 직접 확인한다(학습/추론 공용 경로)."""
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.utils.constants import OBS_IMAGE, OBS_STATE
+
+    raw_state_dim = 10
+    state_select = [0, 2, 4, 6, 8]  # 짝수 인덱스만
+    input_features = {
+        OBS_IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)),
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(raw_state_dim,)),
+    }
+    policy = build_tiny_policy(
+        arm_dim=4, input_features=input_features, max_state_dim=8, state_select=state_select
+    )
+
+    raw_state = torch.arange(2 * raw_state_dim, dtype=torch.float32).reshape(2, raw_state_dim)
+    out = policy.prepare_state({OBS_STATE: raw_state})
+
+    assert out.shape == (2, 8)
+    assert torch.equal(out[:, : len(state_select)], raw_state[:, state_select])
+    assert torch.equal(out[:, len(state_select) :], torch.zeros(2, 8 - len(state_select)))
+
+
+def test_state_select_default_none_matches_existing_prepare_state(build_tiny_policy):
+    """state_select=None(기본)이면 prepare_state()가 기존과 완전히 동일하게 동작해야 한다
+    (index_select 분기 자체가 실행되지 않음)."""
+    policy = build_tiny_policy(arm_dim=4)
+    raw_state = torch.randn(2, 8)
+    out = policy.prepare_state({"observation.state": raw_state})
+    assert torch.equal(out, raw_state)  # max_state_dim == arm_dim*2 == 8이라 패딩도 없음
+
+
+def test_action_min_std_rejects_invalid_values():
+    with pytest.raises(ValueError, match="action_min_std"):
+        _minimal_config(action_min_std=[])
+    with pytest.raises(ValueError, match="action_min_std"):
+        _minimal_config(action_min_std=0.0)
+    with pytest.raises(ValueError, match="action_min_std"):
+        _minimal_config(action_min_std=-0.01)
+    with pytest.raises(ValueError, match="action_min_std"):
+        _minimal_config(action_min_std=[0.01, -0.02])
+
+
+def test_action_min_std_rejects_length_mismatch():
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+
+    config = SmolVLAConfig(
+        input_features={"observation.state": PolicyFeature(type=FeatureType.STATE, shape=(16,))},
+        output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(14,))},
+        max_action_dim=14,
+        action_min_std=[0.01] * 10,  # 14가 아님
+        device="cpu",
+    )
+    with pytest.raises(ValueError, match="action_min_std"):
+        config.validate_features()
+
+
+def test_action_min_std_normalize_unnormalize_round_trip_is_identity():
+    """정규화->역정규화가 min_std를 켜도 켜기 전과 똑같이 원래 값으로 돌아와야 한다 —
+    Normalizer/Unnormalizer가 똑같이 바뀐 std를 쓰기 때문(_apply_action_min_std가 한 번만
+    계산해서 양쪽에 넘김)."""
+    from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+    from lerobot.policies.smolvla.processor_smolvla import _apply_action_min_std
+    from lerobot.processor import NormalizerProcessorStep, TransitionKey, UnnormalizerProcessorStep
+    from lerobot.utils.constants import ACTION
+
+    features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(4,))}
+    norm_map = {"ACTION": NormalizationMode.MEAN_STD}
+    stats = {ACTION: {"mean": torch.zeros(4), "std": torch.tensor([1e-6, 0.5, 0.02, 2.0])}}
+    new_stats = _apply_action_min_std(stats, [0.01, 0.01, 0.01, 0.01])
+
+    normalizer = NormalizerProcessorStep(features=features, norm_map=norm_map, stats=new_stats)
+    unnormalizer = UnnormalizerProcessorStep(features=features, norm_map=norm_map, stats=new_stats)
+
+    raw = torch.tensor([[1e-6, 0.3, 0.01, 1.0]])
+    t = {TransitionKey.ACTION: raw.clone(), TransitionKey.OBSERVATION: None, TransitionKey.COMPLEMENTARY_DATA: {}}
+    normalized = normalizer(t)[TransitionKey.ACTION]
+    back = unnormalizer(
+        {TransitionKey.ACTION: normalized, TransitionKey.OBSERVATION: None, TransitionKey.COMPLEMENTARY_DATA: {}}
+    )[TransitionKey.ACTION]
+    assert torch.allclose(back, raw, atol=1e-5)
+
+
+def test_action_min_std_floors_every_dimension_uniformly():
+    """std=1e-6인 차원이 하한으로 보호되는지, 그리고 이게 특정 인덱스(예: 오른팔 7-13)에만
+    적용되는 게 아니라 14차원 전체에 일관되게 적용되는지 확인한다."""
+    from lerobot.policies.smolvla.processor_smolvla import _apply_action_min_std
+    from lerobot.utils.constants import ACTION
+
+    n = 14
+    tiny_std = torch.full((n,), 1e-6)  # 전부 거의 0인 극단적 케이스
+    stats = {ACTION: {"mean": torch.zeros(n), "std": tiny_std}}
+    min_std = [0.01, 0.01, 0.01, 0.05, 0.05, 0.05, 0.05] * 2  # 왼팔+오른팔 동일 패턴
+
+    new_stats = _apply_action_min_std(stats, min_std)
+    floored = new_stats[ACTION]["std"]
+
+    assert torch.equal(floored, torch.tensor(min_std))  # 전부 1e-6 < min_std라 전부 교체됨
+    assert torch.all(floored >= tiny_std)  # 원래 std보다 작아지지 않음(하한이므로)
+    # 왼팔(0-6)만 보호되고 오른팔(7-13)은 그대로인 게 아니라 둘 다 바뀌었는지 명시적으로 확인.
+    assert torch.equal(floored[:7], torch.tensor(min_std[:7]))
+    assert torch.equal(floored[7:], torch.tensor(min_std[7:]))
+
+
+def test_action_min_std_does_not_lower_an_already_larger_std():
+    from lerobot.policies.smolvla.processor_smolvla import _apply_action_min_std
+    from lerobot.utils.constants import ACTION
+
+    stats = {ACTION: {"mean": torch.zeros(2), "std": torch.tensor([10.0, 0.001])}}
+    new_stats = _apply_action_min_std(stats, 0.01)
+    assert torch.equal(new_stats[ACTION]["std"], torch.tensor([10.0, 0.01]))  # 큰 쪽은 안 바뀜
+
+
+# --- 10. RoCo 시뮬 실측: 각도는 이미 연속 -> AngleUnwrap/Rewrap 끈 채로 둠 ---
+
+
+def test_roco_preset_leaves_angle_unwrap_off():
+    """RoCo 실측(200 에피소드/121,454프레임)에서 각도가 이미 연속(±pi 경계 점프 0건)임을
+    확인했으므로, 프리셋은 angle_unwrap_dims를 설정하지 않아야 한다(설정하면 오히려
+    불연속을 만든다 — docs/configurable_ard.md 참고)."""
+    overrides = yaml.safe_load(ROCO_PRESET_PATH.read_text())
+    assert "angle_unwrap_dims" not in overrides
+
+
+def test_roco_preset_pipeline_has_no_angle_steps(monkeypatch):
+    """make_smolvla_pre_post_processors()가 실제로 만드는 파이프라인에
+    AngleUnwrapProcessorStep/AngleRewrapProcessorStep이 전혀 없어야 한다(토크나이저
+    로드만 몽키패치, 나머지는 실제 함수 호출)."""
+    import transformers
+
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+    from lerobot.policies.smolvla.processor_smolvla import (
+        AngleRewrapProcessorStep,
+        AngleUnwrapProcessorStep,
+        make_smolvla_pre_post_processors,
+    )
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", staticmethod(lambda *a, **k: object()))
+
+    overrides = yaml.safe_load(ROCO_PRESET_PATH.read_text())
+    config = SmolVLAConfig(
+        input_features={"observation.state": PolicyFeature(type=FeatureType.STATE, shape=(44,))},
+        output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(14,))},
+        max_action_dim=14, device="cpu",
+        **overrides,
+    )
+    pre, post = make_smolvla_pre_post_processors(config)
+    assert not any(isinstance(s, AngleUnwrapProcessorStep) for s in pre.steps)
+    assert not any(isinstance(s, AngleRewrapProcessorStep) for s in post.steps)
+
+
 # --- 7. RoCo Challenge 프리셋 ---
 
 
@@ -394,7 +577,8 @@ def test_roco_preset_loads_into_valid_config():
     config = SmolVLAConfig(
         input_features={"observation.state": PolicyFeature(type=FeatureType.STATE, shape=(44,))},
         output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(14,))},
-        max_state_dim=44,
+        # max_state_dim은 일부러 지정하지 않는다 — 프리셋의 state_select(30채널)가 기본값
+        # (32) 안에 들어간다는 걸 그대로 보여주는 게 이 테스트의 핵심 주장 중 하나다.
         max_action_dim=14,
         device="cpu",
         **overrides,
@@ -414,16 +598,36 @@ def test_roco_preset_loads_into_valid_config():
     assert config.ard_gripper_dim == 1
     assert config.angle_unwrap_dims is None  # 전처리 unwrap은 일단 꺼둠(docs 참고)
     assert 2 * config.ard_arm_dim == config.action_feature.shape[0] == 14
+    # state_select: 관절 속도(28-41) 제외, 30채널 — 기본 max_state_dim(32) 안에 들어간다.
+    assert config.state_select == list(range(28)) + [42, 43]
+    assert len(config.state_select) == 30 <= config.max_state_dim == 32
+    # action_min_std: 위치 0.01/회전 0.05/그리퍼 0.05, 양팔 14채널 전체(한쪽만 보호 아님).
+    assert config.action_min_std == [0.01, 0.01, 0.01, 0.05, 0.05, 0.05, 0.05] * 2
 
 
 def test_roco_preset_tiny_model_trains_and_infers(build_tiny_policy, build_tiny_batch):
-    """RoCo 프리셋(14차원=7+7)을 작은 합성 모델에 그대로 적용해 몇 스텝 학습/추론이 정상
-    동작하는지 확인한다 — 실제 RoCo 데이터셋으로는 이 샌드박스에서 돌릴 수 없다(HF Hub
-    차단, docs/configurable_ard.md의 "미확인" 참고)."""
+    """RoCo 프리셋(action 14차원=7+7, 실측 state 44차원 raw -> state_select로 30차원)을
+    작은 합성 모델에 그대로 적용해 몇 스텝 학습/추론이 정상 동작하는지 확인한다 — 실제
+    RoCo 데이터셋으로는 이 샌드박스에서 돌릴 수 없다(HF Hub 차단, docs/configurable_ard.md
+    의 "미확인" 참고)."""
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.utils.constants import OBS_IMAGE, OBS_STATE
+
     overrides = yaml.safe_load(ROCO_PRESET_PATH.read_text())
-    policy = build_tiny_policy(arm_dim=7, num_steps=2, **overrides)
+    # 실측 RoCo state는 raw 44차원이라(state_select가 그중 30개를 고름), 기본 fixture의
+    # "state_dim == 2*arm_dim"(symmetric) 가정이 더 안 맞는다 — observation.state 피처와
+    # max_state_dim을 실제 raw 차원에 맞게 명시적으로 덮어쓴다(32 ⇐ 기본값, 30 <= 32).
+    raw_state_dim = 44
+    input_features = {
+        OBS_IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 64, 64)),
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(raw_state_dim,)),
+    }
+    policy = build_tiny_policy(
+        arm_dim=7, num_steps=2, input_features=input_features, max_state_dim=32, **overrides
+    )
     policy.train()
     batch = build_tiny_batch(batch_size=2, arm_dim=7, chunk=overrides["chunk_size"], lang_len=6)
+    batch[OBS_STATE] = torch.randn(2, raw_state_dim)  # 실제 raw state 차원으로 교체
 
     loss, loss_dict = policy.forward(dict(batch))
     assert torch.isfinite(loss)
@@ -435,3 +639,6 @@ def test_roco_preset_tiny_model_trains_and_infers(build_tiny_policy, build_tiny_
         actions = policy.predict_action_chunk(dict(batch))
     assert torch.isfinite(actions).all()
     assert actions.shape == (2, policy.config.chunk_size, policy.config.action_feature.shape[0])
+    # angle_unwrap_dims를 설정하지 않았으니(프리셋 off) 액션이 변형(unwrap/rewrap)되지 않는다
+    # — 이 자체는 모델 출력이라 직접 비교할 수 없지만, 설정값이 정말 비어 있는지는 확인한다.
+    assert policy.config.angle_unwrap_dims is None
