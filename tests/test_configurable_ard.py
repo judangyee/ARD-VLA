@@ -527,6 +527,114 @@ def test_action_min_std_does_not_lower_an_already_larger_std():
     assert torch.equal(new_stats[ACTION]["std"], torch.tensor([10.0, 0.01]))  # 큰 쪽은 안 바뀜
 
 
+# --- 9b. state_min_std: STATE도 action처럼 std 하한 — 단 state_select보다 "먼저" 정규화된다 ---
+
+
+def test_state_min_std_rejects_invalid_values():
+    with pytest.raises(ValueError, match="state_min_std"):
+        _minimal_config(state_min_std=[])
+    with pytest.raises(ValueError, match="state_min_std"):
+        _minimal_config(state_min_std=0.0)
+    with pytest.raises(ValueError, match="state_min_std"):
+        _minimal_config(state_min_std=-0.01)
+    with pytest.raises(ValueError, match="state_min_std"):
+        _minimal_config(state_min_std=[0.01, -0.02])
+
+
+def test_state_min_std_rejects_length_mismatch_with_state_select():
+    with pytest.raises(ValueError, match="state_min_std"):
+        _minimal_config(state_select=[0, 1, 2, 3, 4], state_min_std=[0.01, 0.01])  # 5 vs 2
+
+
+def test_state_min_std_rejects_length_mismatch_with_real_state_dim_when_no_state_select():
+    """state_select가 없으면 state_min_std 길이는 (state_select가 있을 때의 '선택된 채널
+    순서'가 아니라) 실제 raw observation.state 차원과 같아야 한다."""
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+
+    config = SmolVLAConfig(
+        input_features={"observation.state": PolicyFeature(type=FeatureType.STATE, shape=(16,))},
+        output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(14,))},
+        max_action_dim=14,
+        state_min_std=[0.01] * 10,  # 16이 아님, state_select도 없음
+        device="cpu",
+    )
+    with pytest.raises(ValueError, match="state_min_std"):
+        config.validate_features()
+
+
+def test_state_min_std_applies_before_state_select_via_scatter():
+    """정규화는 state_select보다 먼저 일어난다(NormalizerProcessorStep이 raw 전체를 정규화한
+    뒤 SmolVLAPolicy.prepare_state()가 채널을 고름) — 그래서 _apply_state_min_std는
+    state_min_std(길이==len(state_select))를 state_select 인덱스를 이용해 raw std 배열에
+    "흩뿌려" 넣어야 한다. 선택되지 않은 채널은 영향받지 않아야 한다(어차피 버려지는 채널)."""
+    from lerobot.policies.smolvla.processor_smolvla import _apply_state_min_std
+    from lerobot.utils.constants import OBS_STATE
+
+    raw_std = torch.full((10,), 1e-6)
+    raw_std[5] = 10.0  # 선택되지 않을 채널 중 하나는 이미 크다 — 바뀌면 안 됨
+    stats = {OBS_STATE: {"mean": torch.zeros(10), "std": raw_std.clone()}}
+    state_select = [0, 2, 4, 6, 8]
+    min_std = [0.01, 0.02, 0.03, 0.04, 0.05]
+
+    new_stats = _apply_state_min_std(stats, min_std, state_select)
+    floored = new_stats[OBS_STATE]["std"]
+
+    assert torch.equal(floored[state_select], torch.tensor(min_std))
+    unselected = [1, 3, 5, 7, 9]
+    assert torch.equal(floored[unselected], raw_std[unselected])  # 선택 안 된 채널은 원본 그대로
+    assert torch.equal(stats[OBS_STATE]["std"], raw_std)  # 원본 dataset_stats는 안 바뀜
+
+
+def test_state_min_std_without_state_select_applies_directly():
+    from lerobot.policies.smolvla.processor_smolvla import _apply_state_min_std
+    from lerobot.utils.constants import OBS_STATE
+
+    stats = {OBS_STATE: {"mean": torch.zeros(4), "std": torch.tensor([1e-6, 0.5, 0.02, 2.0])}}
+    new_stats = _apply_state_min_std(stats, [0.01, 0.01, 0.01, 0.01], None)
+    assert torch.equal(new_stats[OBS_STATE]["std"], torch.tensor([0.01, 0.5, 0.02, 2.0]))
+
+
+def test_state_min_std_floors_every_selected_dimension_uniformly():
+    """std=1e-6인 극단 케이스가 state_select로 고른 30채널 전체에서(왼팔/오른팔 구분 없이)
+    일관되게 보호되는지 확인한다 — RoCo 프리셋의 실제 패턴(30채널)으로 직접 테스트."""
+    from lerobot.policies.smolvla.processor_smolvla import _apply_state_min_std
+    from lerobot.utils.constants import OBS_STATE
+
+    state_select = list(range(28)) + [42, 43]
+    min_std = (
+        [0.01, 0.01, 0.01, 0.05, 0.05, 0.05, 0.05] * 2  # EE 위치+쿼터니언, 양팔
+        + [0.05] * 14  # 관절 위치
+        + [0.05, 0.05]  # 그리퍼
+    )
+    assert len(min_std) == len(state_select) == 30
+
+    tiny_std = torch.full((44,), 1e-6)  # 전부 거의 0인 극단적 케이스
+    stats = {OBS_STATE: {"mean": torch.zeros(44), "std": tiny_std}}
+
+    new_stats = _apply_state_min_std(stats, min_std, state_select)
+    floored = new_stats[OBS_STATE]["std"]
+
+    assert torch.equal(floored[state_select], torch.tensor(min_std))
+    assert torch.all(floored[state_select] >= tiny_std[state_select])
+    # 왼팔 쪽(0-13의 앞부분)만 보호되고 오른팔 쪽은 그대로인 게 아니라, 양팔 다 바뀌었는지.
+    assert floored[0] == 0.01 and floored[7] == 0.01  # 왼팔/오른팔 pos 둘 다
+    assert floored[3] == 0.05 and floored[10] == 0.05  # 왼팔/오른팔 quat 둘 다
+
+
+def test_state_min_std_default_none_keeps_pipeline_stats_unchanged():
+    from lerobot.policies.smolvla.processor_smolvla import _apply_state_min_std
+    from lerobot.utils.constants import OBS_STATE
+
+    stats = {OBS_STATE: {"mean": torch.zeros(4), "std": torch.tensor([1e-6, 0.5, 0.02, 2.0])}}
+    assert _apply_state_min_std(stats, None, [0, 1, 2, 3]) is stats
+
+
+def test_roco_preset_state_min_std_matches_state_select_length():
+    overrides = yaml.safe_load(ROCO_PRESET_PATH.read_text())
+    assert len(overrides["state_min_std"]) == len(overrides["state_select"]) == 30
+
+
 # --- 10. RoCo 시뮬 실측: 각도는 이미 연속 -> AngleUnwrap/Rewrap 끈 채로 둠 ---
 
 

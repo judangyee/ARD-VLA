@@ -182,8 +182,10 @@ action 14차원 스키마(팔당 [xyz+rxryrz+그리퍼]=7채널)와 state 44차�
 공식 시뮬 데이터셋 200 에피소드/121,454프레임 전체를 집계해 확인**했습니다. 그 실측
 결과 각도가 이미 연속(±π 경계 점프 0건)이라 `angle_unwrap_dims`는 꺼둔 채이고(켜면 오히려
 불연속을 만듦), `observation.state`는 관절 속도(14차원)를 뺀 30차원만 골라 쓰고
-(`state_select`), 사실상 상수인 오른팔 action 채널엔 `action_min_std`로 정규화 바닥을
-깔았습니다. 조사 결과("뭐가 진짜 하드코딩이었나"), 각 필드의 수식적 근거, 검증된 것/
+(`state_select`), 사실상 상수인 오른팔 action 채널엔 `action_min_std`로, state 채널엔
+`state_min_std`로 정규화 바닥을 깔았습니다 — STATE 정규화는 `state_select`보다 **먼저**
+일어나므로 `state_min_std`는 선택 후 채널 순서로 값을 주고 내부적으로 raw 위치에 scatter
+적용합니다. 조사 결과("뭐가 진짜 하드코딩이었나"), 각 필드의 수식적 근거, 검증된 것/
 미확인 사항은 **[docs/configurable_ard.md](docs/configurable_ard.md)** 에 있습니다.
 
 ```bash

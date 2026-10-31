@@ -43,6 +43,7 @@ ARD-VLA는 원래 OpenArm 16채널(팔당 8 DoF, 왼팔=Stabilizer 고정, chunk
 | `angle_unwrap_dims` | `None` | 액션 벡터의 절대 채널 인덱스 리스트. ARD/pos_loss와 완전히 독립 — `use_ard` 여부와 무관하게 동작하는 **데이터 전처리** 옵션(아래 참고) |
 | `state_select` | `None` | `observation.state`의 절대 채널 인덱스 리스트. 지정하면 `prepare_state()`가 패딩 전에 이 채널만 골라 쓴다(아래 참고) |
 | `action_min_std` | `None` | ACTION MEAN_STD 정규화의 차원별 std 하한 — `std = max(std, min_std)`를 정규화·역정규화 양쪽에 동일하게 적용(아래 참고) |
+| `state_min_std` | `None` | STATE MEAN_STD 정규화의 차원별 std 하한 — `action_min_std`와 같은 구조지만 STATE는 정규화만 되고(Unnormalizer는 ACTION만 봄) `state_select`보다 **먼저** 정규화되므로, `state_select`가 있으면 그 선택 순서(길이 일치)로 값을 줘야 한다(아래 참고) |
 
 전부 기본값이 기존 동작과 동일해서 **꺼져 있으면 bit-for-bit 동일**합니다
 (`tests/test_configurable_ard.py::test_new_config_fields_default_to_noop`).
@@ -251,6 +252,49 @@ RoCo 프리셋 값은 위치 0.01m, 회전 0.05rad, 그리퍼 0.05(모두 임시
 않습니다 — `tests/test_configurable_ard.py::test_action_min_std_floors_every_dimension_uniformly`
 로 14채널 전체가 일관되게 바뀌는지 직접 확인).
 
+### `state_min_std` — STATE도 거의 상수인 채널이 있다, 단 정규화가 `state_select`보다 먼저다
+
+**확인(item 1)**: `SmolVLAConfig.normalization_mapping`의 기본값은
+`{"VISUAL": IDENTITY, "STATE": MEAN_STD, "ACTION": MEAN_STD}` — STATE도 ACTION과 똑같이
+MEAN_STD(`(x-mean)/std`)로 정규화된다. 그리고 **정규화가 `state_select`보다 먼저
+일어난다**: `make_smolvla_pre_post_processors()`가 만드는 `NormalizerProcessorStep`은
+`config.input_features`의 **원본(raw) `observation.state`** 전체(RoCo는 44차원)를 정규화하고,
+`scripts/train_ard.py`의 `batch = preprocessor(batch); loss, loss_dict = policy.forward(batch)`
+순서에서 보듯 전처리기(Normalizer 포함)는 `policy.forward()`보다 먼저 끝난다. `state_select`는
+그 안쪽, `SmolVLAPolicy.prepare_state()`에서(`pad_vector`/`ard_use_joint_torque` concat보다
+먼저) 수행되므로, **`state_select`는 이미 정규화가 끝난 뒤의 채널을 고르는 것**이다.
+
+오른팔(Stabilizer) state도 action과 마찬가지로 사실상 상수에 가까울 거라 예상되는데(보조/고정
+역할이라 거의 안 움직임), 실측 std 그대로 MEAN_STD 정규화를 쓰면 작은 관측 노이즈가 정규화
+후 값에서 크게 부풀어 보인다(action_min_std와 동일한 문제). `state_min_std`(스칼라 또는
+리스트)를 설정하면 `std = max(std, min_std)`를 쓰게 된다.
+
+**구현**: `processor_smolvla.py`의 `_apply_state_min_std(dataset_stats, min_std, state_select)`가
+`dataset_stats[OBS_STATE]["std"]`를 한 번만 바꾸고, 그 결과를 `NormalizerProcessorStep`에
+넘긴다(원본 `dataset_stats`는 바꾸지 않음 — 구현 중 `torch.as_tensor()`가 이미 같은 dtype인
+텐서는 복사 없이 그대로 돌려준다는 걸 확인해서, `.clone()`을 명시적으로 추가해 원본 텐서를
+의도치 않게 in-place로 바꾸는 걸 막았다). `action_min_std`와 달리 `UnnormalizerProcessorStep`에는
+넘길 필요가 없다 — `UnnormalizerProcessorStep(features=config.output_features, ...)`는
+`output_features`(ACTION만)를 보고 STATE 항목은 아예 읽지 않으므로, STATE는 역정규화되는 적이
+없다(round-trip 보장이 필요 없는 이유).
+
+정규화가 `state_select`보다 먼저 일어나므로, `min_std`는 **`state_select`가 고른 뒤의 순서**
+(길이 == `len(state_select)`)로 주어지고, `_apply_state_min_std`가 `state_select`를 인덱스
+맵으로 써서 raw(44차원) std 배열의 해당 위치에만 값을 적용(scatter)한다 — 선택되지 않는 나머지
+채널(RoCo의 관절 속도)은 `prepare_state()`가 어차피 버리므로 std를 바꿔도 결과에 영향이 없다.
+`state_select`가 `None`이면 raw 전체 순서로 직접 적용한다(길이는 실제 `observation.state`
+차원과 일치해야 함 — `validate_features()`에서 검증). 길이가 안 맞으면 `__post_init__`/
+`validate_features()`가 명확한 에러를 던진다(item 2).
+
+RoCo 프리셋 값(item 3, `state_select` 적용 후 30채널 순서)은 EE 위치 0.01m/쿼터니언
+0.05/관절 위치 0.05/그리퍼 0.05 — **왼팔/오른팔 구분 없이 30채널 전체에 같은 패턴을 반복**
+적용한다(`action_min_std`와 같은 이유: 한쪽만 보호하면 안전하지 않음). **단, EE
+위치+쿼터니언 14채널(인덱스 0-13) 안에서 "왼팔 pos(3)+quat(4), 오른팔 pos(3)+quat(4)"
+순서인지는 미확인 가정이다** — 사용자가 확인해준 건 블록 단위("EE 위치+쿼터니언 14")까지고,
+그 안의 팔별 서브순서는 action 14차원의 확인된 "팔별 pos→rot" 블록 구조를 그대로 가져와
+추정한 것이다(`configs/presets/roco_board.yaml` 주석 참고). 전부 임시값, 실데이터로 재튜닝
+필요.
+
 ## RoCo Challenge 프리셋 (`configs/presets/roco_board.yaml`)
 
 ```python
@@ -270,6 +314,7 @@ config = SmolVLAConfig(input_features=..., output_features=..., **overrides)
 | `action_space` | `ee` | 채널이 관절이 아니라 엔드이펙터 목표 |
 | `state_select` | `list(range(28)) + [42, 43]`(30차원) | raw state 44차원 중 관절 속도(28-41) 제외. `max_state_dim` 기본값(32) 안에 들어감 |
 | `action_min_std` | 위치 `0.01`/회전·그리퍼 `0.05`(14채널 반복) | 오른팔이 사실상 상수(실측 std가 아주 작음) — 정규화 노이즈 증폭 방지 |
+| `state_min_std` | EE 위치 `0.01`/쿼터니언·관절 위치·그리퍼 `0.05`(`state_select` 적용 후 30채널 반복) | 오른팔 state도 사실상 상수로 예상 — STATE 정규화는 `state_select`보다 먼저라 선택 후 순서로 scatter 적용 |
 | *(angle_unwrap_dims, 미설정)* | — | RoCo 실측: 각도가 이미 연속(점프 0건)이라 wrap하면 오히려 불연속이 생김(위 "RoCo 시뮬 실측" 참고) |
 | `pos_loss_type` | `l1` | RoCo 1회 우승팀 보고(arXiv 2603.15469) |
 | `chunk_size`/`n_action_steps` | `20`/`5` | 조립 작업에 맞춘 재계획 빈도(공개 스펙 10fps 기준 가정) |
@@ -355,7 +400,9 @@ PR 병합 커밋이고 — 그 이후 모든 작업이 다른 브랜치 경로�
 - `processor_smolvla.py` — `AngleUnwrapProcessorStep`/`AngleRewrapProcessorStep`(+ 내부
   `_wrap_to_pi`/`_unwrap_angles_along_time` 순수 함수), `angle_unwrap_dims` 설정 시에만
   파이프라인에 삽입. `_apply_action_min_std()`가 `dataset_stats`를 한 번만 복사·수정해서
-  `Normalizer`/`UnnormalizerProcessorStep` 둘 다에 동일하게 넘김.
+  `Normalizer`/`UnnormalizerProcessorStep` 둘 다에 동일하게 넘김. `_apply_state_min_std()`가
+  같은 패턴으로 STATE std에 하한을 적용하되(`state_select`가 있으면 그 인덱스로 raw 위치에
+  scatter), `Normalizer`에만 넘김(STATE는 역정규화되지 않음).
 - `scripts/fit_timestep_norm.py` (신규) — 데이터셋에서 σ(t)의 a/s 피팅.
 - `scripts/check_rotation_range.py` (신규) — 회전 채널 ±π 경계 도약/삼중값 노름 점검.
 - `configs/presets/roco_board.yaml` (신규, 전체 통계 반영으로 갱신).
@@ -404,6 +451,16 @@ PR 병합 커밋이고 — 그 이후 모든 작업이 다른 브랜치 경로�
   받으므로), `std=1e-6`인 극단적 케이스가 14채널 **전체**에서 일관되게(왼팔/오른팔
   구분 없이) 하한으로 보호되는지, 이미 더 큰 std는 낮추지 않는지, 잘못된 값(0/음수/길이
   불일치) 거부.
+- `state_min_std`: STATE가 MEAN_STD로 정규화되는지와 그 정규화가 `state_select`보다 먼저
+  일어나는지(item 1, 코드 추적으로 확인). `_apply_state_min_std()`가 `state_select`를
+  인덱스 맵으로 써서 선택 후 순서로 주어진 `min_std`를 raw 위치에 정확히 scatter하는지(선택
+  안 된 위치는 그대로, 원본 `dataset_stats` 텐서는 안 바뀌는지 — `.clone()` 없이 썼으면
+  생겼을 in-place 공유 버그를 직접 재현해서 확인). `state_select`가 없을 때 raw 전체에
+  직접 적용되는지. `std=1e-6`인 극단적 케이스가 RoCo 실제 30채널 패턴(왼팔/오른팔 양쪽)
+  전체에서 일관되게 보호되는지. `min_std=None`(기본)이면 `dataset_stats`를 그대로
+  반환(객체 동일성까지 확인)해서 기존과 bit-exact인지. 잘못된 값(0/음수/빈 리스트/
+  `state_select`와 길이 불일치/`state_select` 없을 때 실제 state 차원과 길이 불일치) 거부.
+  RoCo 프리셋의 `state_min_std` 길이가 `state_select` 길이(30)와 일치하는지.
 - RoCo 프리셋이 `angle_unwrap_dims`를 설정하지 않는지(실제 YAML 내용 확인), 그리고
   `make_smolvla_pre_post_processors()`가 실제로 만드는 파이프라인에
   `AngleUnwrapProcessorStep`/`AngleRewrapProcessorStep`이 전혀 없는지.
@@ -423,6 +480,12 @@ PR 병합 커밋이고 — 그 이후 모든 작업이 다른 브랜치 경로�
 - `action_min_std` 값(위치 0.01/회전·그리퍼 0.05)은 임시값 — 실제 RoCo 액션 통계에서
   "거의 상수"로 집계된 채널들의 실제 std(예: 오른팔 `pos_x` 범위 1.6e-5m)와 비교해
   재튜닝이 필요한지 실측하지 않음.
+- `state_min_std` 값(EE 위치 0.01/쿼터니언·관절 위치·그리퍼 0.05)도 임시값이고, 더해서
+  EE 위치+쿼터니언 14채널(0-13) 안의 "왼팔 pos(3)+quat(4), 오른팔 pos(3)+quat(4))" **서브순서
+  자체가 미확인 가정**이다(위 "state_min_std" 참고) — 사용자가 확인해준 건 블록 단위까지라,
+  실제 서브순서가 다르면(예: 팔별이 아니라 "pos 7채널 전부 먼저, quat 7채널 전부 나중"처럼
+  타입별로 묶여 있으면) 지금 값(0.01/0.05 패턴)이 엉뚱한 채널에 적용될 수 있다. 실제
+  스키마를 재확인하기 전까지는 미확정 위험으로 남겨둔다.
 - `per_timestep_norm`+`lac_mode`를 동시에 켠 상태의 실제 효과(ρ/ω 임계값 재캘리브레이션
   필요 여부)는 분석만 했고 실측하지 않음 — RoCo 프리셋은 이 조합을 피함(`lac_mode="none"`).
 

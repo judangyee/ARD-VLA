@@ -1173,3 +1173,71 @@ RoCo 프리셋: 위치 0.01m/회전·그리퍼 0.05rad(둘 다 임시값), 왼�
   검토 — 지금 값(0.01/0.05)은 임시.
 - 관절 속도(28-41)를 뺀 30차원 state가 실제로 충분한지(관절 속도 정보가 성능에 중요하면
   다시 넣고 `max_state_dim`을 44 이상으로 올려야 함) GPU 실험으로 확인 필요.
+
+# `state_min_std` 추가: STATE도 action처럼 std 하한 (branch: configurable-ard, 후속)
+
+`action_min_std`와 같은 구조를 STATE 정규화에도 적용해달라는 요청. 핵심 질문은 정규화와
+`state_select`의 순서였다.
+
+## 1. 확인: STATE 정규화 방식과 순서
+
+`SmolVLAConfig.normalization_mapping` 기본값(`{"VISUAL": IDENTITY, "STATE": MEAN_STD,
+"ACTION": MEAN_STD}`)을 확인해 STATE도 ACTION과 동일한 MEAN_STD임을 확인. 순서는
+`scripts/train_ard.py`의 `batch = preprocessor(batch); loss, loss_dict = policy.forward(batch)`
+와 `make_smolvla_pre_post_processors()`가 raw `config.input_features`로 `Normalizer`를
+만든다는 점, `state_select`는 `SmolVLAPolicy.prepare_state()`(즉 `policy.forward()` 안쪽)
+에서만 적용된다는 점을 코드로 추적해서, **정규화가 `state_select`보다 먼저, raw
+observation.state 전체를 대상으로 일어난다**는 걸 확정했다 — `state_select`는 이미
+정규화된 채널을 고르는 것이다.
+
+## 2. `state_min_std`(신규)
+
+이 순서 때문에, 사용자가 선택 후(post-`state_select`) 30채널 순서로 값을 주면 내부적으로
+raw 44채널 위치에 scatter해야 한다. `configuration_smolvla.py`에 `state_min_std: float |
+list[float] | None` 필드 + 검증(0 이하/빈 리스트 거부는 `__post_init__`, `state_select`가
+있으면 그 길이와 대조, 없으면 `validate_features()`에서 실제 `observation.state` 차원과
+대조) 추가. `processor_smolvla.py`에 `_apply_state_min_std(dataset_stats, min_std,
+state_select)` 추가 — `state_select`가 있으면 그걸 인덱스 맵으로 써서 raw std 배열의 해당
+위치만 `max(std, min_std)`로 바꾸고, 없으면 raw 전체에 직접 적용. `Normalizer`에만 넘기고
+`Unnormalizer`에는 안 넘긴다 — `UnnormalizerProcessorStep(features=config.output_features,
+...)`가 ACTION만 보고 STATE를 전혀 안 읽으므로 STATE는 역정규화되는 적이 없다(action과
+달리 round-trip 보장이 필요 없는 이유).
+
+**구현 중 발견한 위험(선제 수정)**: `torch.as_tensor(std, dtype=torch.float32)`는 이미
+같은 dtype인 텐서를 **복사 없이** 그대로 돌려준다 — 그 뒤 `std[idx] = ...`로 in-place
+수정하면 호출자의 원본 `dataset_stats` 텐서가 같이 바뀐다. `.clone()`을 명시적으로 추가해
+원본이 안 바뀌는 걸 직접 재검증했다(action_min_std는 `torch.maximum()`이 새 텐서를
+반환해서 이 문제가 없었음 — 다른 구현 패턴이라 별도로 확인이 필요했던 지점).
+
+RoCo 프리셋(`configs/presets/roco_board.yaml`): `state_select` 적용 후 30채널 순서로
+EE 위치 0.01/쿼터니언 0.05/관절 위치 0.05/그리퍼 0.05, 왼팔/오른팔 구분 없이 반복(모두
+임시값). EE 위치+쿼터니언 14채널(0-13) 안의 "팔별 pos+quat" 서브순서는 action 14차원의
+확인된 구조를 가져온 **미확인 가정**이라고 YAML 주석과 docs에 명시.
+
+## 테스트/문서
+
+`tests/test_configurable_ard.py`에 8개 추가: 잘못된 값 거부(빈 리스트/0/음수/길이 불일치
+2종), `state_select`를 통한 scatter 정확성(선택 안 된 위치는 그대로, 원본 텐서 불변
+직접 검증), `state_select` 없을 때 직접 적용, RoCo 실제 30채널 패턴으로 양팔 전체가
+일관되게 보호되는지, `min_std=None`이면 객체 동일성까지 bit-exact, RoCo 프리셋의
+`state_min_std` 길이가 `state_select`와 일치하는지.
+
+`docs/configurable_ard.md`: `### state_min_std` 절 추가(정규화 순서 확인 내용 포함),
+필드 테이블/프리셋 요약 테이블/"검증한 것"/"못 한 것" 절 갱신(서브순서 미확인 가정을
+"못 한 것"에도 명시). README.md 요약 갱신.
+
+`pytest tests/`(**155개 전부 통과** — 기존 147 + 신규 8). 양자화는 건드리지 않음.
+
+## 검증한 것 / 못 한 것
+
+**검증함**: STATE가 MEAN_STD이고 정규화가 `state_select`보다 먼저라는 것(코드 추적),
+scatter 정확성과 원본 불변(위 테스트), `min_std=None` bit-exact, RoCo 프리셋 길이 일치.
+**못 함**(범위 밖/미확인): `state_min_std` 값(0.01/0.05)과 EE 위치+쿼터니언 14채널 안의
+팔별 서브순서 둘 다 미확인 가정 — 실제 RoCo state 스키마를 채널 단위로 재확인하기 전까지
+남아 있는 위험(docs의 "못 함" 절 참고).
+
+## 다음에 할 일
+
+- `state_min_std`/`action_min_std` 값 전체를 실제 RoCo 통계로 재튜닝.
+- EE 위치+쿼터니언 14채널(0-13)의 정확한 서브순서(왼팔/오른팔 각각 pos→quat인지, 아니면
+  타입별로 묶여 있는지)를 실제 데이터셋 메타데이터나 사용자 재확인으로 검증.
