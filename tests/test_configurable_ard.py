@@ -635,6 +635,66 @@ def test_roco_preset_state_min_std_matches_state_select_length():
     assert len(overrides["state_min_std"]) == len(overrides["state_select"]) == 30
 
 
+def test_state_select_and_state_min_std_match_info_json_channel_names():
+    """`observation.state` 44개 채널의 실제 이름 순서(info.json으로 확인됨, 2026-10-31
+    이후)로 `state_select`/`state_min_std`가 정확한 채널에 대응하는지 검증한다.
+
+    확인된 순서: EE(0-13) = 왼팔 EE 7(pos 3 + quat 4) 다음 오른팔 EE 7(pos 3 + quat 4),
+    관절 위치(14-27) = 왼팔 7 다음 오른팔 7, 관절 속도(28-41) = 왼팔 7 다음 오른팔 7,
+    그리퍼(42-43) = 왼쪽 다음 오른쪽 — 전부 "팔별로 묶이고 왼팔이 먼저"다. 아래 이름들은
+    이 확인된 구조/순서를 그대로 인코딩한 것이고(실제 info.json 문자열 그대로는 아님 —
+    이 샌드박스는 HF Hub 접근이 막혀 있어 원본을 직접 열어볼 수 없다, docs 참고), 검증
+    대상은 이름 자체가 아니라 **순서와 그룹화**다."""
+    from lerobot.policies.smolvla.processor_smolvla import _apply_state_min_std
+    from lerobot.utils.constants import OBS_STATE
+
+    raw_names = (
+        [f"left_ee_{c}" for c in ("pos_x", "pos_y", "pos_z", "quat_x", "quat_y", "quat_z", "quat_w")]
+        + [f"right_ee_{c}" for c in ("pos_x", "pos_y", "pos_z", "quat_x", "quat_y", "quat_z", "quat_w")]
+        + [f"left_joint_pos_{i}" for i in range(7)]
+        + [f"right_joint_pos_{i}" for i in range(7)]
+        + [f"left_joint_vel_{i}" for i in range(7)]
+        + [f"right_joint_vel_{i}" for i in range(7)]
+        + ["left_gripper", "right_gripper"]
+    )
+    assert len(raw_names) == 44
+
+    overrides = yaml.safe_load(ROCO_PRESET_PATH.read_text())
+    state_select = overrides["state_select"]
+    state_min_std = overrides["state_min_std"]
+
+    selected_names = [raw_names[i] for i in state_select]
+    expected_order = (
+        [f"left_ee_{c}" for c in ("pos_x", "pos_y", "pos_z", "quat_x", "quat_y", "quat_z", "quat_w")]
+        + [f"right_ee_{c}" for c in ("pos_x", "pos_y", "pos_z", "quat_x", "quat_y", "quat_z", "quat_w")]
+        + [f"left_joint_pos_{i}" for i in range(7)]
+        + [f"right_joint_pos_{i}" for i in range(7)]
+        + ["left_gripper", "right_gripper"]
+    )
+    assert selected_names == expected_order
+
+    # state_min_std가 EE pos 채널엔 0.01을, 그 외(quat/관절 위치/그리퍼)엔 0.05를 주는지 —
+    # 이름으로 직접 확인(왼팔/오른팔 양쪽 다).
+    for name, floor in zip(selected_names, state_min_std, strict=True):
+        if "_pos_" in name and "ee" in name:
+            assert floor == 0.01, f"{name}은 EE 위치 채널이라 0.01이어야 하는데 {floor}"
+        else:
+            assert floor == 0.05, f"{name}은 0.05여야 하는데 {floor}"
+
+    # _apply_state_min_std가 실제로 scatter한 뒤에도 이름-값 대응이 깨지지 않는지(raw 44
+    # 차원 쪽에서 직접 확인).
+    raw_std = torch.full((44,), 1e-6)
+    stats = {OBS_STATE: {"mean": torch.zeros(44), "std": raw_std}}
+    new_stats = _apply_state_min_std(stats, state_min_std, state_select)
+    floored = new_stats[OBS_STATE]["std"]
+    for name, idx in zip(selected_names, state_select, strict=True):
+        expected = 0.01 if ("_pos_" in name and "ee" in name) else 0.05
+        assert floored[idx].item() == pytest.approx(expected), name
+    # 선택되지 않은 채널(관절 속도)은 그대로 1e-6.
+    for i in range(28, 42):
+        assert floored[i].item() == pytest.approx(1e-6)
+
+
 # --- 10. RoCo 시뮬 실측: 각도는 이미 연속 -> AngleUnwrap/Rewrap 끈 채로 둠 ---
 
 

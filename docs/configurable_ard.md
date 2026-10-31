@@ -286,14 +286,19 @@ MEAN_STD(`(x-mean)/std`)로 정규화된다. 그리고 **정규화가 `state_sel
 차원과 일치해야 함 — `validate_features()`에서 검증). 길이가 안 맞으면 `__post_init__`/
 `validate_features()`가 명확한 에러를 던진다(item 2).
 
+**selected 30채널 순서는 info.json의 `observation.state` 44개 채널 이름으로 확인됐다**
+(2026-10-31 이후 추가 확인) — `[왼팔 EE 7(pos 3 + quat 4)][오른팔 EE 7(pos 3 + quat
+4)][왼팔 관절 위치 7][오른팔 관절 위치 7][왼쪽 그리퍼][오른쪽 그리퍼]`. 더 이상 가정이
+아니다 — 이전 버전의 이 문서/YAML은 EE 블록 내 팔별 pos→quat 서브순서를 "미확인 가정"으로
+표기했었는데, 실제 채널 이름이 그 가정과 일치함을 확인했다. `tests/test_configurable_ard.py::
+test_state_select_and_state_min_std_match_info_json_channel_names`가 이 확인된 44개 이름
+목록을 직접 써서 `state_select`가 고르는 30채널과 `state_min_std`가 적용되는 위치가 이
+순서와 정확히 일치하는지 검증한다.
+
 RoCo 프리셋 값(item 3, `state_select` 적용 후 30채널 순서)은 EE 위치 0.01m/쿼터니언
 0.05/관절 위치 0.05/그리퍼 0.05 — **왼팔/오른팔 구분 없이 30채널 전체에 같은 패턴을 반복**
-적용한다(`action_min_std`와 같은 이유: 한쪽만 보호하면 안전하지 않음). **단, EE
-위치+쿼터니언 14채널(인덱스 0-13) 안에서 "왼팔 pos(3)+quat(4), 오른팔 pos(3)+quat(4)"
-순서인지는 미확인 가정이다** — 사용자가 확인해준 건 블록 단위("EE 위치+쿼터니언 14")까지고,
-그 안의 팔별 서브순서는 action 14차원의 확인된 "팔별 pos→rot" 블록 구조를 그대로 가져와
-추정한 것이다(`configs/presets/roco_board.yaml` 주석 참고). 전부 임시값, 실데이터로 재튜닝
-필요.
+적용한다(`action_min_std`와 같은 이유: 한쪽만 보호하면 안전하지 않음). 전부 임시값,
+실데이터로 재튜닝 필요.
 
 ## RoCo Challenge 프리셋 (`configs/presets/roco_board.yaml`)
 
@@ -461,6 +466,12 @@ PR 병합 커밋이고 — 그 이후 모든 작업이 다른 브랜치 경로�
   반환(객체 동일성까지 확인)해서 기존과 bit-exact인지. 잘못된 값(0/음수/빈 리스트/
   `state_select`와 길이 불일치/`state_select` 없을 때 실제 state 차원과 길이 불일치) 거부.
   RoCo 프리셋의 `state_min_std` 길이가 `state_select` 길이(30)와 일치하는지.
+- `state_select`가 고르는 30채널과 `state_min_std`가 적용되는 위치가 info.json으로 확인된
+  44개 `observation.state` 채널 이름 순서(`[왼팔 EE 7][오른팔 EE 7][왼팔 관절 위치
+  7][오른팔 관절 위치 7][왼쪽 그리퍼][오른쪽 그리퍼]`)와 정확히 일치하는지 —
+  `test_state_select_and_state_min_std_match_info_json_channel_names`가 이름 목록을 직접
+  써서 확인(이전엔 EE 블록 내 팔별 서브순서가 "미확인 가정"이었으나, 이제 이 이름들로
+  확인됐다).
 - RoCo 프리셋이 `angle_unwrap_dims`를 설정하지 않는지(실제 YAML 내용 확인), 그리고
   `make_smolvla_pre_post_processors()`가 실제로 만드는 파이프라인에
   `AngleUnwrapProcessorStep`/`AngleRewrapProcessorStep`이 전혀 없는지.
@@ -480,12 +491,10 @@ PR 병합 커밋이고 — 그 이후 모든 작업이 다른 브랜치 경로�
 - `action_min_std` 값(위치 0.01/회전·그리퍼 0.05)은 임시값 — 실제 RoCo 액션 통계에서
   "거의 상수"로 집계된 채널들의 실제 std(예: 오른팔 `pos_x` 범위 1.6e-5m)와 비교해
   재튜닝이 필요한지 실측하지 않음.
-- `state_min_std` 값(EE 위치 0.01/쿼터니언·관절 위치·그리퍼 0.05)도 임시값이고, 더해서
-  EE 위치+쿼터니언 14채널(0-13) 안의 "왼팔 pos(3)+quat(4), 오른팔 pos(3)+quat(4))" **서브순서
-  자체가 미확인 가정**이다(위 "state_min_std" 참고) — 사용자가 확인해준 건 블록 단위까지라,
-  실제 서브순서가 다르면(예: 팔별이 아니라 "pos 7채널 전부 먼저, quat 7채널 전부 나중"처럼
-  타입별로 묶여 있으면) 지금 값(0.01/0.05 패턴)이 엉뚱한 채널에 적용될 수 있다. 실제
-  스키마를 재확인하기 전까지는 미확정 위험으로 남겨둔다.
+- `state_min_std` 값(EE 위치 0.01/쿼터니언·관절 위치·그리퍼 0.05)은 여전히 임시값 — 실제
+  RoCo state 통계에서 "거의 상수"로 집계된 채널들의 실제 std와 비교해 재튜닝이 필요한지는
+  실측하지 않음. (EE 위치+쿼터니언 14채널 안의 팔별 서브순서는 info.json 채널 이름으로
+  **확인됐으므로** 더는 미확인 사항이 아니다 — 위 "state_min_std" 참고.)
 - `per_timestep_norm`+`lac_mode`를 동시에 켠 상태의 실제 효과(ρ/ω 임계값 재캘리브레이션
   필요 여부)는 분석만 했고 실측하지 않음 — RoCo 프리셋은 이 조합을 피함(`lac_mode="none"`).
 

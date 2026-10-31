@@ -1241,3 +1241,27 @@ scatter 정확성과 원본 불변(위 테스트), `min_std=None` bit-exact, RoC
 - `state_min_std`/`action_min_std` 값 전체를 실제 RoCo 통계로 재튜닝.
 - EE 위치+쿼터니언 14채널(0-13)의 정확한 서브순서(왼팔/오른팔 각각 pos→quat인지, 아니면
   타입별로 묶여 있는지)를 실제 데이터셋 메타데이터나 사용자 재확인으로 검증.
+
+# EE 위치+쿼터니언 서브순서 확인: info.json 채널 이름 (branch: configurable-ard, 후속)
+
+위 "다음에 할 일"의 서브순서 질문이 사용자가 직접 info.json의 `observation.state` 44개
+채널 이름을 확인해서 해결됐다: `[왼팔 EE 7(pos 3 + quat 4)][오른팔 EE 7(pos 3 + quat
+4)][왼팔 관절 위치 7][오른팔 관절 위치 7][왼쪽 그리퍼][오른쪽 그리퍼]` — 팔별로 묶이고
+왼팔이 먼저인 구조로, 이전에 "미확인 가정"으로 표기했던 EE 블록 내 "팔별 pos→quat" 순서와
+정확히 일치했다.
+
+`configs/presets/roco_board.yaml`/`docs/configurable_ard.md`의 "미확인 가정" 표기를
+"확인됨"으로 바꿨다 — 값(`state_min_std`/`action_min_std` 자체의 튜닝 필요성)은 여전히
+임시지만, 어느 채널에 어느 값이 가는지의 **순서**는 더 이상 불확실하지 않다.
+
+`tests/test_configurable_ard.py`에
+`test_state_select_and_state_min_std_match_info_json_channel_names` 추가: 확인된 44개
+채널 이름 순서(이름 문자열 자체는 이 샌드박스가 HF Hub 접근이 막혀 있어 재현 불가능해
+구조를 그대로 인코딩한 것이지만, 검증 대상은 순서/그룹화) 위에서 실제 YAML의
+`state_select`가 고르는 30채널이 `[왼팔 EE][오른팔 EE][왼팔 관절 위치][오른팔 관절
+위치][그리퍼 2]` 순서와 정확히 일치하는지, `state_min_std`가 EE pos 채널엔 0.01/나머지엔
+0.05를 이름 기준으로 정확히 주는지, `_apply_state_min_std()`로 scatter한 뒤에도 이름-값
+대응이 깨지지 않는지(raw 44차원 쪽에서 직접 재확인) 검증.
+
+`pytest tests/`(**156개 전부 통과** — 기존 155 + 신규 1). 양자화는 건드리지 않음, push
+안 함.
