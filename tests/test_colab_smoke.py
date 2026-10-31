@@ -28,10 +28,12 @@ def test_smoke_mode_passes_all_stages_and_produces_eval_report(tmp_path):
     import json
 
     report = json.loads(report_path.read_text())
-    assert report["num_samples"] == 3
-    assert "overall" in report["model"]
-    assert "overall" in report["constant_mean_baseline"]
-    assert "overall" in report["repeat_last_baseline"]
+    assert report["num_points"] == 3
+    assert report["num_episodes"] == 2  # _smoke_data.build_smoke_eval_samples가 episode_id=i%2로 만듦
+    for key in ("model", "constant_mean_baseline", "repeat_last_baseline"):
+        assert "overall" in report[key]
+        assert "mean" in report[key]["overall"]
+        assert "std" in report[key]["overall"]
 
 
 def test_smoke_mode_reports_failure_exit_code_on_broken_stage(tmp_path, monkeypatch):

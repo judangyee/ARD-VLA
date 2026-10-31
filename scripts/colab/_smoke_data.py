@@ -69,6 +69,28 @@ def build_smoke_batch(
     return batch
 
 
+def build_smoke_sample(
+    camera_names: tuple[str, ...] = CAMERA_NAMES,
+    image_shape: tuple[int, int, int] = (3, 64, 64),
+    state_dim: int = STATE_DIM,
+    action_dim: int = ACTION_DIM,
+    chunk_size: int = 8,
+) -> dict:
+    """`default_collate([...])`로 모아 배치를 만들 **배치 차원 없는 단일 샘플**을
+    만든다 — `BatchSource`의 인덱스 기반 로딩(`batch_source.py`)을 스모크에서도
+    똑같이 쓰기 위한 "데이터셋의 샘플 하나" 역할이다."""
+    from lerobot.utils.constants import ACTION, OBS_STATE
+
+    sample = {
+        OBS_STATE: torch.randn(state_dim),
+        ACTION: torch.randn(chunk_size, action_dim),
+        "task": "스모크 테스트용 가짜 지시문",
+    }
+    for cam in camera_names:
+        sample[image_key(cam)] = torch.rand(*image_shape)
+    return sample
+
+
 def build_smoke_frames(num_frames: int, state_dim: int = STATE_DIM, action_dim: int = ACTION_DIM) -> list[dict]:
     """`norm_stats.compute_train_stats`용 — 단일 프레임(청크 없음) 딕셔너리 목록."""
     from lerobot.utils.constants import ACTION, OBS_STATE
@@ -95,7 +117,7 @@ def build_smoke_eval_samples(
     from eval_offline import EvalSample  # noqa: PLC0415 (경량 스크립트, 순환 임포트 회피)
 
     samples = []
-    for _ in range(num_samples):
+    for i in range(num_samples):
         batch = build_smoke_batch(
             batch_size=1, camera_names=camera_names, image_shape=image_shape, state_dim=state_dim,
             action_dim=action_dim, chunk_size=1, lang_len=lang_len,
@@ -106,6 +128,7 @@ def build_smoke_eval_samples(
                 batch=batch,
                 target_chunk=torch.randn(chunk_size, action_dim),
                 prev_action=torch.randn(action_dim),
+                episode_id=i % 2,  # 여러 지점이 적은 수의 "평가 에피소드"에 걸치는 상황을 흉내냄
             )
         )
     return samples

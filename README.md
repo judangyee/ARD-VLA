@@ -280,7 +280,7 @@ python scripts/colab/run_colab_training.py --smoke --smoke-steps 60
 - `scripts/layer_importance.py` — SmolLM2 백본 레이어 중요도(코사인 유사도 기반) 분석.
 - `scripts/compare_lac_modes.py` — LAC none/covla/role_aware 모드 비교(`select_action()` 경로, 합성 백본, jerk/ρ/ω/α).
 - `scripts/compare_lac_closed_loop_modes.py` — 같은 비교를 ARD-VLA 2.0 폐루프 경로(`run_closed_loop`+Judge)로 끝까지.
-- `scripts/colab/` — 무료 Colab 스모크/베이스라인 학습 진입점(`run_colab_training.py`)과 보조 모듈(`env_setup.py`/`dataset_fetch.py`/`episode_split.py`/`schema_check.py`/`norm_stats.py`/`checkpoint.py`/`batch_source.py`/`eval_offline.py`) — 사용법은 [docs/colab_free_tier.md](docs/colab_free_tier.md).
+- `scripts/colab/` — 무료 Colab 스모크/베이스라인 학습 진입점(`run_colab_training.py`)과 보조 모듈(`env_setup.py`/`dataset_fetch.py`/`episode_split.py`/`schema_check.py`/`norm_stats.py`/`checkpoint.py`/`batch_source.py`/`eval_offline.py`/`video_backend_check.py`) — 사용법은 [docs/colab_free_tier.md](docs/colab_free_tier.md).
 - `third_party/lerobot/` — vendored, editable LeRobot/SmolVLA source.
   - `src/lerobot/policies/smolvla/ard.py` — ARD heads/losses, `ForceHead`, GradNorm, Bridge Attention, 대칭 대조군 손실.
   - `src/lerobot/policies/smolvla/freq_policy.py` — FreqPolicy 주파수 일관성 손실.

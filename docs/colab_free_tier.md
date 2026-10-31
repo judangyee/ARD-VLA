@@ -43,9 +43,9 @@ drive.mount("/content/drive")
 
 ### 0-3. 스모크 먼저 (권장)
 
-실제 데이터/가중치 없이 전체 파이프라인(GPU 감지 → 스키마 검증 → 정규화 통계 → 학습
-→ 체크포인트 재시작 → 오프라인 평가)이 이 Colab 인스턴스에서 안 깨지는지 1분 내로
-확인한다:
+실제 데이터/가중치 없이 전체 파이프라인(영상 디코딩 백엔드 확인 → GPU 감지 → 스키마
+검증 → 정규화 통계 → 학습 → 체크포인트 재시작 → 오프라인 평가)이 이 Colab 인스턴스에서
+안 깨지는지 1분 내로 확인한다:
 
 ```bash
 python scripts/colab/run_colab_training.py --smoke --smoke-steps 60
@@ -99,28 +99,33 @@ python scripts/colab/run_colab_training.py \
 | bf16/fp16 분기 로직(`env_setup.py`) | `torch.cuda.is_bf16_supported(including_emulation=False)`로 T4/A100을 가르는 로직은 몽키패치로 검증됨. **실제 T4 위에서 돌려본 적 없음** — fp16 autocast+GradScaler 조합이 SmolVLA 규모에서 실제로 안정적인지(inf/nan 없이)는 미검증. |
 | 배치 크기 자동 추정(`_AUTO_BATCH_SIZE_TABLE`) | VRAM만 보고 추정한 값이고 **실측 없음**. 카메라 3대(240×320) + chunk_size=20 조합에서 실제 OOM 경계가 어딘지 전혀 모른다 — `--batch-size 1`로 시작해서 점점 올려보는 걸 권장. |
 | 데이터셋 전체 용량 조회(`dataset_fetch.query_dataset_size`) | `HfApi.dataset_info(files_metadata=True)` 호출 자체가 이 샌드박스에서 실행 불가(네트워크 차단) — API 시그니처만 보고 작성, 실제 응답 형태(일부 파일 size가 비는 경우 등)는 미확인. |
-| 영상 인코딩(`use_videos=True`, 기본 코덱 `libsvtav1`) | 이 샌드박스에 `ffmpeg` 자체가 없다(확인됨, `which ffmpeg` 실패) — Colab 기본 이미지엔 보통 ffmpeg가 있지만 `libsvtav1` 인코더가 포함돼 있는지는 미확인. 데이터셋을 직접 만드는 게 아니라 **받기만** 하므로 이 스크립트 경로에서는 영향이 제한적이지만, LeRobotDataset 내부가 비디오 디코딩에 어떤 backend를 쓰는지도 미확인. |
-| `schema_check.py`의 이름 판정 | 정확한 문자열이 아니라 "left/right"·"ee/pos/quat"·"joint"·"gripper" 부분 문자열 휴리스틱이다(모듈 docstring 참고) — 실제 RoCo info.json이 이 휴리스틱을 통과하는지 **미확인**. 처음 실행할 때 반드시 로그에 찍히는 실제 채널 이름을 눈으로 한 번 더 확인할 것. |
-| 체크포인트 재시작의 "데이터 순서" | `BatchSource`가 에포크를 `data_seed + epoch`로 재시드하고, 재시작 시 그 지점까지 배치를 "다시 읽고 버려서" 되돌린다(`batch_source.py`/`checkpoint.py` docstring) — 완전한 무비용 재개가 아니라, 재시작 지점이 늦을수록(에포크 후반) 그만큼 느리다. |
-| 오프라인 평가의 `prev_action` 근사 | 평가 에피소드마다 **중간 지점** 청크 하나만 대표로 쓴다(에피소드 전체를 다 평가하지 않음) — "방향이 맞는지" 수준의 신호이고 엄밀한 평가가 아니다. |
+| 영상 디코딩 백엔드(`torchcodec`/`pyav`) | **이제 "확인됨"에 가깝다**: `video_backend_check.py`가 합성 h264 클립을 실제로 인코딩+디코딩해서 판정한다(가짜 import 체크가 아님). 이 샌드박스에서 실측한 결과: `torchcodec`은 **import는 되지만 시스템 FFmpeg 공유 라이브러리(`libavutil.so.*`)가 없어 실제 디코딩 시점에 `RuntimeError`로 죽는다** — 반면 `pyav`는 같은 환경에서 h264를 끝까지 디코딩했다. `lerobot`의 `get_safe_default_codec()`은 import 가능 여부만 보고 torchcodec을 우선 선택하므로, **이 환경 조합이 Colab에서도 재현되면 torchcodec이 "선택"되고도 실제로는 못 쓰는 상황**이 될 수 있다 — `run_colab_training.py`는 실행 시작 시 이걸 미리 확인해서 둘 다 안 되면 즉시 중단한다(다운로드 전에). 다만 **Colab 자체 환경에서 재현한 적은 없다**(미확인) — 이 샌드박스와 다를 수 있음. `libsvtav1`은 레포 코드를 직접 확인한 결과 **인코딩(데이터셋 생성) 경로에만 있고 디코딩 경로에는 전혀 없다**(검증됨, 섞여 있지 않음 — 이전 버전의 "미확인" 표기를 정정). |
+| `schema_check.py`의 이름 판정 | **정확한 문자열 완전 일치**로 바꿨다(이전 버전의 부분 문자열 휴리스틱을 제거) — state 44개/action 14개 기대 이름이 정확히 주어져서, 이제 다르면 첫 불일치 위치+기대값/실제값을 그대로 보여주고 중단한다. **그 정확한 이름 규칙 자체가 실제 RoCo info.json과 맞는지는 이 샌드박스에서 여전히 확인 못 했다**(네트워크 차단) — 처음 실행에서 `SchemaMismatchError` 메시지를 반드시 읽을 것. |
+| 체크포인트 재시작의 "데이터 순서" | **더는 "읽고 버리는" 방식이 아니다** — `BatchSource`가 `torch.randperm(n, data_seed+epoch로 시드)`로 인덱스 순열만 계산하고, 재시작(`fast_forward`)은 순수 인덱스 연산이라 영상 디코딩이 전혀 일어나지 않는다(단위 테스트로 `load_batch`가 호출 0번임을 직접 확인). 다만 실제 `DataLoader`의 멀티프로세스 워커 프리페치는 포기했다(배치 하나 분량만 스레드풀로 병렬 로드) — 대규모 학습에서 I/O가 느릴 수 있다는 트레이드오프는 남아있다. |
+| 오프라인 평가 | 평가 에피소드마다 **`stride`(기본 10프레임)마다 여러 지점**에서 청크를 뽑아 평균/표준편차를 낸다(이전 버전은 에피소드당 청크 하나). 그래도 각 에피소드 전체 프레임을 전부 평가하는 건 아니고, `prev_action`은 그 지점 바로 직전 프레임의 실제 값을 쓴다(근사 없음). |
 | GPU 메모리 로깅 | `torch.cuda.max_memory_allocated()`는 CUDA에서만 의미 있다 — CPU(스모크)에서는 항상 `N/A`. |
-| 실제 RoCo 데이터셋 스키마 자체 | `docs/configurable_ard.md`가 확인한 블록 구조(44/14차원, state_select 등)에 근거해 설계했지만, **이 샌드박스는 그 데이터셋을 한 번도 직접 열어본 적이 없다** — 처음 실행에서 `validate_schema`가 던지는 에러 메시지를 사람이 반드시 읽고 판단할 것(통과했다고 안심하지 말 것 — 휴리스틱 통과가 "완전히 맞다"는 보장은 아니다). |
+| 실제 RoCo 데이터셋 스키마 자체 | `docs/configurable_ard.md`가 확인한 블록 구조(44/14차원, state_select 등)에 근거해 설계했지만, **이 샌드박스는 그 데이터셋을 한 번도 직접 열어본 적이 없다** — 처음 실행에서 `validate_schema`가 던지는 에러 메시지를 사람이 반드시 읽고 판단할 것. |
 
 ## 3. Colab에서 처음 돌릴 때 예상되는 실패 지점 (우선순위 순)
 
 1. **`--dataset-repo-id`가 비공개/게이트 데이터셋인데 `HF_TOKEN`을 안 줬을 때** —
    `LeRobotDatasetMetadata`/`snapshot_download`가 403/401로 실패. Secrets에
    `HF_TOKEN`을 제대로 등록했는지 먼저 확인.
-2. **`validate_schema`가 중단시킬 때** — `schema_check.py`의 휴리스미스틱이 실제
-   RoCo 채널 이름과 안 맞아서(예: "left"/"right" 표기가 전혀 다른 컨벤션) 정상
-   데이터인데도 중단되는 경우. 에러 메시지가 실제 채널 이름을 그대로 보여주니,
-   `schema_check.py`의 정규식을 그 이름에 맞게 조정해야 할 수 있다.
+2. **`validate_schema`가 중단시킬 때** — `schema_check.py`가 정확한 이름 완전 일치를
+   요구하는데, 실제 RoCo info.json의 문자열 표기가 이번에 확정한 규칙과 다른 경우
+   (예: 대소문자, 구분자, 축약 방식이 다름). 에러 메시지가 **첫 번째로 어긋나는
+   위치와 기대값/실제값**을 그대로 보여주니, `schema_check.py`의
+   `EXPECTED_STATE_NAMES`/`EXPECTED_ACTION_NAMES`를 그 실제 이름에 맞게 고쳐야 한다.
 3. **OOM(메모리 부족)** — `--batch-size auto` 추정치가 실측 없이 정한 값이라 T4
    16GB에서 넘칠 가능성이 있다. `--batch-size 1`로 낮춰서 재시도.
-4. **`libsvtav1` 인코더/디코더 관련 에러** — `ffmpeg`에 해당 코덱이 없으면
-   `LeRobotDataset`이 영상 디코딩에서 실패할 수 있다(미확인 영역). 에러가 나면
-   `!apt-get install -y ffmpeg` 등으로 최신 ffmpeg를 깔아보거나, lerobot 쪽
-   `video_backend` 옵션을 확인할 것.
+4. **영상 디코딩 백엔드가 둘 다 안 될 때** — `run_colab_training.py`가 다운로드 전에
+   `video_backend_check.py`로 미리 걸러내므로, 이 단계에서 멈추면 "데이터셋을 받고
+   나서야 실패"하는 낭비는 없다. 이 샌드박스에서는 `torchcodec`이 import는 되지만
+   시스템 FFmpeg 공유 라이브러리가 없어 실패하고 `pyav`는 됐다 — Colab에서도 비슷한
+   증상이면 `!apt-get install -y ffmpeg libavutil-dev` 등으로 시스템 FFmpeg를
+   채워보거나, `pip install --force-reinstall av`로 pyav를 재설치해볼 것.
+   `libsvtav1`은 디코딩 경로와 무관하다(검증됨) — 이 에러를 보고 `libsvtav1`
+   인코더를 찾을 필요는 없다.
 5. **fp16 학습이 몇 스텝 뒤 loss가 NaN이 될 때** — T4에서 fp16 autocast+GradScaler를
    썼는데도 불안정하면, `--dtype fp32`로 강제하고(느리지만 안전) 원인을 좁혀갈 것.
 6. **Drive 쓰기 권한/할당량 에러** — 체크포인트가 쌓이면서(기본 3개까지만 보관,

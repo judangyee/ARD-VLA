@@ -1386,6 +1386,121 @@ exit code 비정상 종료 확인 포함). `pytest tests/`(**219개 전부 통�
 
 - 실제 Colab(T4)에서 `--smoke` → 소규모 실제 실행 순으로 처음 돌려보고, 이 라운드의
   "미확인" 항목들을 하나씩 검증/수정.
-- `schema_check.py`의 휴리스틱이 실제 데이터셋과 안 맞으면 정규식을 실제 이름에
-  맞게 조정.
 - 배치 크기 추정 테이블을 실측치로 교체.
+
+# Colab 환경 4가지 개선: 정확한 스키마 비교/무비용 재개/다중지점 평가/영상 백엔드 확인 (branch: configurable-ard, 후속)
+
+이전 라운드가 "미확인"으로 남겼던 네 가지를 이번에 전부 바꿨다.
+
+## 1. `schema_check.py` — 부분 문자열 휴리스틱 제거, 정확한 이름 완전 일치로 교체
+
+실제 info.json 이름 규칙이 이번에 정확히 주어졌다(`{s}_ee_{a}`/`{s}_jpos_{i}`/
+`{s}_jvel_{i}`/`{"left","right"}_gripper` 패턴, action은 기존 확인된 14개). `_LEFT_RE`/
+`_RIGHT_RE`/`_EE_RE` 등 부분 문자열 정규식을 전부 지우고, `EXPECTED_STATE_NAMES`(44개)/
+`EXPECTED_ACTION_NAMES`(14개)를 하드코딩한 뒤 완전 일치(exact match)만 통과시킨다.
+다르면 **첫 번째로 어긋나는 인덱스와 그 자리의 기대값/실제값**을 담아
+`SchemaMismatchError`를 던진다. `run_colab_training.py`의 스모크 단계도 이 상수를
+직접 재사용하도록 바꿔서(손으로 베낀 사본이 따로 어긋날 위험 제거) 일관성을 확보했다.
+`tests/test_colab_schema_check.py`를 전면 재작성 — `schema_check.EXPECTED_*` 자체를
+"실제 info.json" 역할의 픽스처로 그대로 쓰고, 왼팔/오른팔 블록 전체 교환, 그리퍼 순서
+교환, 쿼터니언 성분(`qw`/`qx`) 하나만 바뀌는 미세한 경우까지 전부 첫 불일치 위치로
+잡히는지 확인했다.
+
+## 2. `batch_source.py` — "읽고 버리기"를 "인덱스만 계산"으로 교체
+
+이전 설계는 재시작 시 `make_iter_for_epoch(epoch)`로 실제 배치 이터레이터를 다시
+만들어 그 자리에서 `next()`로 읽고 버렸다(영상까지 전부 디코딩). 이번엔
+`torch.utils.data.RandomSampler`가 내부적으로 쓰는 것과 똑같은 방식
+(`torch.randperm(n, generator=seeded_generator)`)으로 **인덱스 순열만** 매 에포크
+`data_seed + epoch`로 재계산하고, `next_batch()`가 그 순열에서 현재 위치의 배치
+크기만큼만 실제로 `load_batch(indices)`를 호출한다. `fast_forward(n)`은 순열 재계산 +
+위치 계산뿐이라 **`load_batch`를 단 한 번도 호출하지 않는다**(단위 테스트로 직접
+카운트해서 확인: 재시작 전후 `load_calls`가 정확히 0건 증가). 이 API 변경에 맞춰
+`run_colab_training.py`의 real/smoke 양쪽 배치 소스 구성 코드도 다시 썼다 — 실제
+경로는 `train_dataset[i]`를 직접 인덱싱하고(`num_workers>0`이면 그 배치 분량만
+스레드풀로 병렬 로드, 매 배치마다 멀티프로세스 워커를 새로 띄우는 낭비를 피함),
+스모크 경로는 8개 합성 "샘플"을 만들어 같은 방식으로 인덱싱한다.
+`tests/test_colab_batch_source.py`를 전면 재작성(10개 테스트) — 핵심은
+`test_fast_forward_does_not_call_load_batch_at_all`로, fast_forward 자체가 로드를
+안 일으킨다는 걸 직접 카운터로 확인한다.
+
+## 3. `eval_offline.py` — 에피소드당 청크 하나 → 여러 지점 + 평균/표준편차
+
+`build_real_eval_samples()`에 `stride`(기본 10프레임) 인자를 추가해서, 평가
+에피소드마다 `range(stride, len(ep_dataset), stride)` 지점 전부에서 청크를 뽑는다
+(인덱스 0은 "직전 action"이 없어 제외, 에피소드가 stride보다 짧으면 중간 지점 하나로
+후퇴). `EvalSample`에 `episode_id`를 추가해서 지점이 몇 개 에피소드에서 나온 건지
+추적한다. `_average_group_dicts`(평균만)를 쓰던 자리를 전부
+`_stats_group_dicts`(평균+모표준편차, `torch.Tensor.std(unbiased=False)`)로 바꾸고,
+`OfflineEvalResult`를 `num_points`(지점 수)/`num_episodes`로 확장, `model`/
+`constant_mean_baseline`/`repeat_last_baseline` 전부 `{"그룹명": {"mean":..., "std":...}}`
+형태로 바뀌었다(이전엔 평균 스칼라 하나였음). `tests/test_colab_eval_offline.py`에
+표준편차가 지점 간 분산을 정확히 반영하는지(직접 계산한 모표준편차와 비교) 테스트
+추가.
+
+## 4. `video_backend_check.py`(신규) — import 체크가 아니라 실제 디코딩 확인
+
+**실제로 실행해보며 중요한 사실을 발견했다**: 이 샌드박스에서 `torchcodec`은
+`importlib.util.find_spec("torchcodec")`로는 `True`가 나오지만(패키지 자체는 설치돼
+있음), 실제로 `VideoDecoder`를 쓰는 순간 `RuntimeError: Could not load libtorchcodec`로
+죽는다(`libavutil.so.*` 등 시스템 FFmpeg 공유 라이브러리가 없어서) — 그런데
+`lerobot`의 `get_safe_default_codec()`(`third_party/lerobot/.../video_utils.py:117`)은
+정확히 이 import-체크만 보고 torchcodec을 기본값으로 고른다. 반면 `pyav`(`av`
+패키지)는 같은 환경에서 h264 영상을 실제로 끝까지 디코딩했다(자체 바이너리 휠에
+FFmpeg를 번들링하는 경우가 많아서로 보임, 확인은 안 함). 그래서 "import 가능 여부"가
+아니라 **작은 합성 h264 클립을 PyAV로 실제 인코딩하고, torchcodec/pyav 둘 다로
+실제 디코딩까지 해보고** 판정하는 `check_video_backends()`를 만들었다.
+
+`libsvtav1`(RoCo 영상 인코딩과 무관, RoCo는 h264) 의존성이 디코딩 경로에 섞여
+있는지도 레포 코드를 직접 확인했다 — **섞여 있지 않다**(검증됨). `vcodec=
+"libsvtav1"`은 `LeRobotDataset.create()`/`dataset_tools.py`의 **인코딩**(새
+데이터셋을 만들 때) 경로에만 있고, `decode_video_frames`/`get_safe_default_codec`/
+`VideoDecoderCache` 등 디코딩 경로 어디에도 `libsvtav1`이 나오지 않는다(grep 0건).
+이 스크립트는 RoCo 영상을 **읽기만** 하므로(`.create()`를 호출하지 않음) `libsvtav1`과
+아예 무관하다 — 이전 라운드가 "미확인"으로 남겼던 "디코딩 의존성이 섞여 있을 가능성"은
+확인 결과 **사실이 아니었다**(제거할 것이 없었음, 지우거나 선택사항으로 돌릴 코드
+자체가 없다).
+
+이 확인을 `run_smoke()`의 **맨 처음 단계**로 넣었고(실제 경로 `prepare_real_run()`
+에도 데이터셋 다운로드 **전에** 넣어서, 수백 MB~GB를 받은 뒤에야 디코딩이 안 된다는
+걸 알게 되는 낭비를 막는다), 둘 다 안 되면 `RuntimeError`로 즉시 중단한다.
+`tests/test_colab_video_backend_check.py`(4개)는 실제로 이 샌드박스에서 실행돼서
+"적어도 하나는 된다"/"선택 로직이 실제 디코딩 성공 여부를 따른다"를 직접 확인한다
+(몽키패치가 아니라 진짜 인코딩+디코딩).
+
+## 테스트/문서
+
+`tests/test_colab_schema_check.py` 전면 재작성(16개), `tests/test_colab_batch_source.py`
+전면 재작성(10개), `tests/test_colab_eval_offline.py` 갱신(8개, 표준편차 테스트 추가),
+`tests/test_colab_video_backend_check.py` 신규(4개), `tests/test_colab_smoke.py`의
+JSON 스키마 검증을 새 필드(`num_points`/`num_episodes`/`mean`+`std`)에 맞게 갱신.
+`pytest tests/`(**233개 전부 통과** — 기존 219 + 이번 라운드 순증 14). `docs/
+colab_free_tier.md`의 "알려진 한계"/"예상 실패 지점" 두 섹션을 이번 네 가지 변경
+내용으로 갱신(영상 디코딩 항목은 "미확인"→"확인됨"으로, 스키마/재개/평가 항목은
+새 동작으로 교체).
+
+## 검증한 것 / 못 한 것
+
+**검증함**: `schema_check`의 정확한 이름 완전 일치 + 첫 불일치 리포트(16개 테스트),
+`BatchSource.fast_forward`가 `load_batch`를 0번 호출하는지(직접 카운트), 재개 후
+첫 배치가 중단 없이 쭉 돌린 것과 정확히 같은지(에포크 경계를 넘는 경우 포함), 다중
+지점 평가의 평균/표준편차 계산이 수식과 일치하는지, **그리고 이 샌드박스에서
+`torchcodec`은 안 되고 `pyav`는 된다는 것 자체를 실제로 재현해 확인**(가장 확실한
+종류의 검증 — 추측이 아니라 실행 결과). `libsvtav1`이 디코딩 경로에 없다는 것도
+grep으로 직접 확인(코드 사실).
+
+**못 함(범위 밖, 미확인)**:
+- Colab 자체 환경에서 torchcodec/pyav 중 어느 쪽이 되는지는 이 샌드박스와 다를 수
+  있다 — `video_backend_check.py`가 Colab에서도 똑같이 사전 확인해주지만, 그 결과가
+  이 샌드박스와 같을지는 미확인.
+- `schema_check.py`의 44개/14개 기대 이름이 실제 RoCo info.json과 글자 단위로
+  일치하는지는 여전히 미확인(이번엔 정확한 비교로 바뀌었을 뿐, 그 "정확한 값"이
+  맞는지 자체는 실제 데이터셋을 열어봐야 안다).
+- `num_workers>0`일 때의 스레드풀 병렬 로드가 실제 영상 디코딩에서 유의미한 속도
+  이득을 주는지(GIL 영향 포함) 실측하지 않음.
+
+## 다음에 할 일
+
+- Colab에서 `--smoke` 1회 실행 → `video_backend` 단계 결과를 가장 먼저 확인.
+- 실제 데이터셋을 처음 받으면 `schema_check`가 던지는 에러(있다면) 그대로 보고 이름
+  규칙을 수정.

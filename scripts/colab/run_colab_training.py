@@ -55,7 +55,8 @@ import episode_split
 import eval_offline
 import norm_stats
 import schema_check
-from _smoke_data import build_smoke_batch, build_smoke_eval_samples, build_smoke_features, build_smoke_frames
+import video_backend_check
+from _smoke_data import build_smoke_eval_samples, build_smoke_features, build_smoke_frames, build_smoke_sample
 from _tiny_vlm import FAKE_MODEL_ID, tiny_smolvlm_patch
 
 ROCO_PRESET_PATH = Path(__file__).resolve().parents[2] / "configs" / "presets" / "roco_board.yaml"
@@ -263,6 +264,18 @@ def prepare_real_run(args: argparse.Namespace) -> dict:
 
     if args.drive_root is None:
         raise ValueError("--smoke가 아니면 --drive-root가 필요합니다(Drive 위 캐시/체크포인트 경로).")
+
+    # 영상이 수백 MB~GB 단위로 다 받힌 뒤에야 디코딩이 안 된다는 걸 알게 되면 낭비가
+    # 크다 — 다운로드 전에 먼저 작은 합성 h264 클립으로 실제 디코딩 가능 여부를 확인한다.
+    video_status = video_backend_check.check_video_backends()
+    logging.info("영상 디코딩 백엔드 확인: %s", video_status.detail)
+    if not video_status.any_backend_works:
+        raise RuntimeError(
+            f"torchcodec/pyav 둘 다 h264 영상을 디코딩할 수 없습니다({video_status.detail}) — "
+            "RoCo 영상(h264)을 읽을 수 없으므로 중단합니다. pip install av 등으로 pyav를 "
+            "설치/재설치해보세요."
+        )
+
     drive_root = Path(args.drive_root)
     drive_root.mkdir(parents=True, exist_ok=True)
     hf_cache_dir = drive_root / "hf_cache"
@@ -315,43 +328,62 @@ def prepare_real_run(args: argparse.Namespace) -> dict:
 
 
 def build_real_batch_source(bundle: dict, config, batch_size: int, data_seed: int, num_workers: int) -> batch_source.BatchSource:
-    from torch.utils.data import DataLoader
+    """인덱스 순열(`BatchSource`)로 "다음에 뭘 읽을지"만 결정하고, 실제 로드는
+    `load_batch(indices)`가 그 배치의 샘플만 읽는다 — 재시작(`fast_forward`)이 영상을
+    전혀 디코딩하지 않는 이유가 바로 이것이다(이전 버전은 `DataLoader` 이터레이터를
+    다시 만들어 그 자리에서 `next()`로 읽고 버렸다).
 
+    `num_workers`>0이면 그 배치 안에서만(배치 하나 분량) 스레드풀로 병렬 로드한다 —
+    매 배치마다 새 멀티프로세스 워커를 띄우는 건 오히려 손해라서(그 비용이 로드
+    자체보다 큼) 프로세스 기반 `DataLoader`를 영구적으로 쓰는 대신 가벼운 스레드풀을
+    쓴다(영상 디코딩은 I/O/네이티브 코드 비중이 커서 GIL에도 어느 정도 병렬 이득이
+    있다고 알려져 있음 — 이 샌드박스는 실제 영상 데이터가 없어 이 이득 자체는
+    미검증)."""
     delta_timestamps = bundle["resolve_delta_timestamps"](config, bundle["ds_meta"])
     train_dataset = bundle["LeRobotDataset"](
         bundle["ds_meta"].repo_id, episodes=bundle["split"].train_ids, delta_timestamps=delta_timestamps
     )
-    steps_per_epoch = len(train_dataset) // batch_size
 
-    def make_iter_for_epoch(epoch: int):
-        gen = torch.Generator()
-        gen.manual_seed(data_seed + epoch)
-        loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=gen, num_workers=num_workers, drop_last=True)
-        return iter(loader)
+    def load_batch(indices: list[int]) -> dict:
+        from torch.utils.data import default_collate
 
-    return batch_source.BatchSource(make_iter_for_epoch, steps_per_epoch)
+        if num_workers > 0:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                items = list(pool.map(lambda i: train_dataset[i], indices))
+        else:
+            items = [train_dataset[i] for i in indices]
+        return default_collate(items)
+
+    return batch_source.BatchSource(len(train_dataset), batch_size, data_seed, load_batch)
 
 
-def build_real_eval_samples(bundle: dict, config) -> list[eval_offline.EvalSample]:
-    """평가 에피소드마다 **중간 지점 청크 하나**를 대표 샘플로 쓴다(에피소드당 여러 청크를
-    전부 평가하는 게 더 철저하지만, 이 스크립트의 목표는 "베이스라인과 비교해 방향이
-    맞는지" 수준의 스모크/베이스라인 신호다). 맨 처음 프레임을 쓰면 "직전 action"이
-    존재하지 않아 `prev_action`을 근사해야 하므로, 대신 에피소드 중간 지점을 써서
-    `prev_action`(그 직전 실제 프레임의 action)을 진짜 값으로 둔다."""
+def build_real_eval_samples(bundle: dict, config, stride: int = 10) -> list[eval_offline.EvalSample]:
+    """평가 에피소드마다 **`stride`프레임 간격으로 여러 지점**에서 청크를 뽑는다(기본
+    10프레임 간격) — 에피소드 하나당 청크 하나만 보던 이전 버전보다 더 많은 지점에서
+    평균/표준편차를 낼 수 있다. 인덱스 0(에피소드 맨 처음)은 "직전 action"이 존재하지
+    않아 건너뛴다 — `range(stride, len(ep_dataset), stride)`로 항상 진짜 직전 프레임이
+    있는 지점만 쓴다."""
     from torch.utils.data import default_collate
 
     delta_timestamps = bundle["resolve_delta_timestamps"](config, bundle["ds_meta"])
     samples = []
     for ep_id in bundle["split"].eval_ids:
         ep_dataset = bundle["LeRobotDataset"](bundle["ds_meta"].repo_id, episodes=[ep_id], delta_timestamps=delta_timestamps)
-        mid_idx = max(1, len(ep_dataset) // 2)
-        # default_collate([item])로 "batch_size=1 DataLoader가 만들 배치"와 정확히 같은
-        # 형태를 만든다 — 직접 dict comprehension으로 unsqueeze하면 텐서가 아닌 필드
-        # (예: task 문자열)에서 깨진다.
-        collated = default_collate([ep_dataset[mid_idx]])
-        target_chunk = collated.pop("action").squeeze(0).clone()
-        prev_action = default_collate([ep_dataset[mid_idx - 1]])["action"].squeeze(0)[0].clone()
-        samples.append(eval_offline.EvalSample(batch=collated, target_chunk=target_chunk, prev_action=prev_action))
+        points = range(stride, len(ep_dataset), stride)
+        if not points:
+            points = [max(1, len(ep_dataset) // 2)]  # 에피소드가 stride보다 짧으면 중간 지점 하나만
+        for idx in points:
+            # default_collate([item])로 "batch_size=1 DataLoader가 만들 배치"와 정확히
+            # 같은 형태를 만든다 — 직접 dict comprehension으로 unsqueeze하면 텐서가 아닌
+            # 필드(예: task 문자열)에서 깨진다.
+            collated = default_collate([ep_dataset[idx]])
+            target_chunk = collated.pop("action").squeeze(0).clone()
+            prev_action = default_collate([ep_dataset[idx - 1]])["action"].squeeze(0)[0].clone()
+            samples.append(
+                eval_offline.EvalSample(batch=collated, target_chunk=target_chunk, prev_action=prev_action, episode_id=ep_id)
+            )
     return samples
 
 
@@ -369,6 +401,17 @@ def run_smoke(args: argparse.Namespace) -> dict:
         results[name] = {"ok": ok, "detail": detail}
         logging.info("[smoke] %-28s %s %s", name, "PASS" if ok else "FAIL", detail)
 
+    # 0) 영상 디코딩 백엔드 가용성 — RoCo 영상은 h264다. import 가능 여부만 보면 안
+    # 된다(실측: torchcodec은 import는 되는데 이 샌드박스에선 시스템 FFmpeg 공유
+    # 라이브러리가 없어 실제 디코딩 시점에 죽는다 — video_backend_check.py 모듈
+    # docstring 참고). 실제 RoCo 데이터셋 로드보다 먼저, 작은 합성 h264 클립으로
+    # 둘 다(torchcodec/pyav) 실제로 디코딩해보고 적어도 하나는 되는지 확인한다.
+    try:
+        video_status = video_backend_check.check_video_backends()
+        record("video_backend", video_status.any_backend_works, video_status.detail)
+    except Exception as e:  # noqa: BLE001
+        record("video_backend", False, str(e))
+
     # 1) GPU 감지
     try:
         env = env_setup.detect_compute_env(manual_batch_size=1, force_dtype=None if args.dtype == "auto" else args.dtype)
@@ -377,21 +420,12 @@ def run_smoke(args: argparse.Namespace) -> dict:
         record("gpu_detect", False, str(e))
         return results
 
-    # 2) 스키마 검증 (정상 케이스 + 비정상 케이스 둘 다 확인)
+    # 2) 스키마 검증 (정상 케이스 + 비정상 케이스 둘 다 확인) — schema_check.py가 정의한
+    # 정확한 기대 이름 목록을 "실제 info.json"처럼 그대로 쓴다(이름을 또 손으로
+    # 베껴 쓰면 둘이 따로 어긋날 위험이 있다).
     try:
-        raw_names = (
-            [f"left_ee_{c}" for c in ("pos_x", "pos_y", "pos_z", "quat_x", "quat_y", "quat_z", "quat_w")]
-            + [f"right_ee_{c}" for c in ("pos_x", "pos_y", "pos_z", "quat_x", "quat_y", "quat_z", "quat_w")]
-            + [f"left_joint_pos_{i}" for i in range(7)]
-            + [f"right_joint_pos_{i}" for i in range(7)]
-            + [f"left_joint_vel_{i}" for i in range(7)]
-            + [f"right_joint_vel_{i}" for i in range(7)]
-            + ["left_gripper", "right_gripper"]
-        )
-        action_names = [
-            "left_ee_x", "left_ee_y", "left_ee_z", "left_ee_rx", "left_ee_ry", "left_ee_rz", "left_gripper",
-            "right_ee_x", "right_ee_y", "right_ee_z", "right_ee_rx", "right_ee_ry", "right_ee_rz", "right_gripper",
-        ]
+        raw_names = list(schema_check.EXPECTED_STATE_NAMES)
+        action_names = list(schema_check.EXPECTED_ACTION_NAMES)
         info_ok = {"features": {"observation.state": {"names": raw_names}, "action": {"names": action_names}}}
         schema_check.validate_schema(info_ok)
 
@@ -455,12 +489,14 @@ def run_smoke(args: argparse.Namespace) -> dict:
             dtype_choice = env.dtype_choice
             scaler = make_scaler(dtype_choice)
 
-            pool = [build_smoke_batch(batch_size=2, chunk_size=8) for _ in range(4)]
+            from torch.utils.data import default_collate
 
-            def make_iter_for_epoch(_epoch: int):
-                return iter(pool)
+            smoke_samples = [build_smoke_sample(chunk_size=8) for _ in range(8)]  # "데이터셋" 역할
 
-            source = batch_source.BatchSource(make_iter_for_epoch, steps_per_epoch=len(pool))
+            def load_smoke_batch(indices: list[int]) -> dict:
+                return default_collate([smoke_samples[i] for i in indices])
+
+            source = batch_source.BatchSource(len(smoke_samples), batch_size=2, data_seed=0, load_batch=load_smoke_batch)
 
             half = args.smoke_steps // 2
             summary1 = run_training_loop(
@@ -476,7 +512,7 @@ def run_smoke(args: argparse.Namespace) -> dict:
             latest = ckpt_mod.find_latest_checkpoint(tmp_ckpt_dir)
             payload = ckpt_mod.load_checkpoint(latest, policy2, optimizer2, scheduler=scheduler2, scaler=scaler)
             resumed_step = payload["step"]
-            source2 = batch_source.BatchSource(make_iter_for_epoch, steps_per_epoch=len(pool))
+            source2 = batch_source.BatchSource(len(smoke_samples), batch_size=2, data_seed=0, load_batch=load_smoke_batch)
             source2.fast_forward(resumed_step)
 
             summary2 = run_training_loop(
@@ -498,7 +534,12 @@ def run_smoke(args: argparse.Namespace) -> dict:
             eval_result = eval_offline.run_offline_eval(policy2, preprocessor, postprocessor, eval_samples, train_mean_action, device="cpu")
             report_path = Path(args.output_dir or "outputs/colab_smoke") / "eval_report.json"
             eval_offline.save_eval_report(report_path, eval_result)
-            record("offline_eval", True, f"model_overall_l1={eval_result.model['overall']:.4f} report={report_path}")
+            record(
+                "offline_eval", True,
+                f"num_points={eval_result.num_points} "
+                f"model_overall_l1_mean={eval_result.model['overall']['mean']:.4f} "
+                f"std={eval_result.model['overall']['std']:.4f} report={report_path}",
+            )
     except Exception as e:  # noqa: BLE001
         logging.exception("스모크 학습/평가 단계 실패")
         record("train_and_resume_or_eval", False, str(e))
