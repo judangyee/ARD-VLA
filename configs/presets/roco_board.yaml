@@ -7,20 +7,27 @@
 #   overrides = yaml.safe_load(open("configs/presets/roco_board.yaml"))
 #   config = SmolVLAConfig(input_features=..., output_features=..., **overrides)
 #
-# **스키마 확인됨(2026-10-29, 사용자가 공식 데이터셋 meta/info.json을 직접 확인)**:
-# action 14차원 순서는
-#   left_ee_x, left_ee_y, left_ee_z, left_ee_rx, left_ee_ry, left_ee_rz, left_gripper,
-#   right_ee_x, right_ee_y, right_ee_z, right_ee_rx, right_ee_ry, right_ee_rz, right_gripper
-# 즉 팔별로 연속된 [엔드이펙터 pose 6(xyz+rxryrz) + 그리퍼 1] = 7채널 블록이 왼팔, 오른팔
-# 순서로 이어진다 — 아래 ard_arm_dim=7/ard_gripper_dim=1(마지막 1채널=그리퍼)과 정확히
-# 일치한다(이 샌드박스는 여전히 HF Hub에 직접 접근하지 못해서, 이 스키마는 사용자가 전달한
-# 값을 그대로 반영한 것이다 — 재확인은 사용자가 했음).
+# **전체 통계로 확인됨(2026-10-31, 사용자가 공식 시뮬 데이터셋 200 에피소드/121,454
+# 프레임 전체를 직접 집계)**:
+# - action 14차원 = 엔드이펙터 **절대** 목표(Euler XYZ, 라디안). 순서는
+#     left_ee_x, left_ee_y, left_ee_z, left_ee_rx, left_ee_ry, left_ee_rz, left_gripper,
+#     right_ee_x, right_ee_y, right_ee_z, right_ee_rx, right_ee_ry, right_ee_rz, right_gripper
+#   팔당 [pose 6(xyz+rxryrz) + 그리퍼 1] = 7채널 블록이 왼팔, 오른팔 순서로 이어진다 —
+#   아래 ard_arm_dim=7/ard_gripper_dim=1(마지막 1채널=그리퍼)과 정확히 일치.
+# - state 44차원 = EE 위치+쿼터니언 14(인덱스 0-13) + 관절 위치 14(14-27) + 관절 속도
+#   14(28-41) + 그리퍼 2(42-43).
+# - **각도는 이미 연속(에피소드 전체에서 ±pi 경계 점프 0건)이고, 값 자체가 ±pi 밖으로도
+#   나간다**(왼팔 rx 최대 4.10 rad, rz 최대 7.00 rad) — 데이터가 처음부터 "unwrap된"
+#   형태로 기록돼 있다는 뜻. 아래 angle_unwrap_dims 설명 참고.
+# - 오른팔 action은 사실상 상수(보조/고정 역할과 일치): pos_x 범위 1.6e-5m, pos_y 4cm,
+#   pos_z 3cm, rx∈[-3.22,-3.14]rad, ry·rz ≈ 1e-5~5e-4rad, gripper 항상 0.2256. 왼팔
+#   gripper 범위는 0.060~0.301.
 #
 # **아직 미확인**: per_timestep_norm_a/_s는 실제 데이터로 피팅하지 못해 항등(identity,
 # a=1,s=0)으로 둔다 —
 # scripts/fit_timestep_norm.py --dataset-repo-id rocochallenge2025/rocochallenge2026_Industrial_Assembly
 # --chunk-size 20 를 돌려서 갱신해야 한다. chunk_size=20/n_action_steps=5가 실제 과제에
-# 적절한지, 10fps/시연 200개 외 세부 통계도 미확인.
+# 적절한지는 미확인.
 
 use_ard: true  # 비대칭 역할 분리(Stabilizer/Actuator) 자체는 RoCo에서도 그대로 유효한 전제
 
@@ -42,12 +49,22 @@ ard_gripper_dim: 1
 # 무효화한다(lac_mode=none이라 당장은 영향 없지만, 나중에 LAC를 켜게 될 경우를 대비).
 action_space: ee
 
-# angle_unwrap_dims(rx/ry/rz 채널을 학습 전 시간축으로 펴고 추론 후 다시 [-pi,pi)로 감싸는
-# 전처리 옵션, processor_smolvla.py 참고)는 일단 꺼둔다(기본 None) — scripts/
-# check_rotation_range.py로 실제 데이터가 ±pi 경계를 넘는지 먼저 확인하고, rx/ry/rz가
-# 오일러각인지 회전벡터(axis-angle)인지도 아직 불확실하다(회전벡터면 이 전처리 자체가
-# 틀린 접근이다 — docs/configurable_ard.md 참고). 켜려면 angle_unwrap_dims: [3,4,5,10,11,12]
-# (왼팔+오른팔 rx,ry,rz, 절대 인덱스)로 명시해야 한다.
+# angle_unwrap_dims는 꺼둔다(기본 None, 명시 안 함) — 실측 결과(위 상단 주석) RoCo 시뮬
+# 액션은 이미 연속이라(±pi 경계 점프 0건, 대신 값 자체가 pi를 넘어감) unwrap할 불연속이
+# 없다. 오히려 추론 후 AngleRewrapProcessorStep으로 [-pi,pi)에 다시 가두면 데모에는
+# 없던 불연속을 "새로 만들게" 된다(예: rz=7.00을 보낼 자리에 0.717을 보내게 됨 — 로봇
+# API가 그 범위 밖 값을 원래부터 받아들인다는 뜻이므로 가둘 이유가 없음). rx/ry/rz가
+# 오일러각인지 회전벡터인지와 무관하게, 이 데이터셋에는 angle_unwrap_dims를 쓸 이유가
+# 없다는 결론이다(docs/configurable_ard.md 참고).
+
+# state_select: observation.state 44차원 중 관절 속도(인덱스 28-41)를 빼고 30차원만 쓴다
+# — EE 위치+쿼터니언(0-13) + 관절 위치(14-27) + 그리퍼(42-43). 30 <= max_state_dim(기본
+# 32)이라 패딩 에러 없이 들어가고, state_proj 입력 폭이 항상 max_state_dim으로 고정돼
+# 있어서(zero-padding만 더 늘어남) 사전학습 가중치를 그대로 쓸 수 있다. 관절 속도를
+# 빼는 이유는 데이터 사실 자체(위 주석)에는 없고 사용자 판단(불필요한 관측 축소)이다 —
+# 필요하면 list(range(28)) + [42, 43]에 28-41 구간을 다시 넣어 44차원 전체를 쓰면 된다
+# (이땐 max_state_dim도 44 이상으로 올려야 함).
+state_select: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 42, 43]
 
 # RoCo Challenge 1회 우승팀이 목표 근처에서 기울기가 사라지는 L2 대신 L1로 바꿔 끝까지
 # 정밀하게 밀어넣는 효과를 봤다고 보고함(arXiv 2603.15469).
@@ -63,6 +80,14 @@ n_action_steps: 5  # chunk_size보다 짧게 둬서 매 5스텝마다 재계획(
 per_timestep_norm: true
 per_timestep_norm_a: 1.0
 per_timestep_norm_s: 0.0
+
+# action_min_std: 오른팔(Stabilizer)이 사실상 상수라서(위 상단 주석 — pos_x 범위 1.6e-5m
+# 등) 그 채널들의 실측 std가 아주 작다. 표준 MEAN_STD 정규화를 그대로 쓰면 정규화 후
+# 값이 아주 작은 노이즈에도 크게 흔들린다 — std 하한을 둬서 막는다. 값은 위치 0.01m,
+# 회전 0.05rad, 그리퍼 0.05(둘 다 임시값, 튜닝 필요) — 왼팔(0-6)/오른팔(7-13) 구분 없이
+# 14채널 전체에 같은 패턴을 반복 적용(한쪽만 보호하면 왼팔 쪽 작은 std 채널도 안전하지
+# 않음). 실제 데이터로 재검토 필요(아래 docs 참고).
+action_min_std: [0.01, 0.01, 0.01, 0.05, 0.05, 0.05, 0.05, 0.01, 0.01, 0.01, 0.05, 0.05, 0.05, 0.05]
 
 # 비전 인코더는 고정(이미 SmolVLAConfig 기본값과 동일 — 명시적으로 박아서 프리셋만 봐도
 # 학습 범위가 드러나게 함), 액션 expert 전체 학습 + VLM은 LoRA(PEFT 설정은 프리셋 바깥,
