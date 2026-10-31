@@ -46,6 +46,26 @@ class SmolVLAConfig(PreTrainedConfig):
     max_state_dim: int = 32
     max_action_dim: int = 32
 
+    # `observation.state`의 절대 채널 인덱스 목록 — 지정하면 `prepare_state()`가 패딩 전에
+    # 이 인덱스들만 골라 쓴다(순서도 이 리스트 순서를 따름). `pad_vector()`는 입력 차원이
+    # `max_state_dim`보다 크면 그냥 에러를 내지(자동으로 자르지 않음) — 원본 state가
+    # `max_state_dim`보다 넓은 데이터셋(예: 관절 속도까지 포함해 44차원인 RoCo)에서, 필요한
+    # 채널만 추려 `max_state_dim` 이하로 줄이는 용도. 학습(forward)과 추론(predict_action_chunk
+    # 등) 양쪽 다 같은 `prepare_state()`를 거치므로 자동으로 동일하게 적용된다. 선택된 채널
+    # 수가 `max_state_dim`보다 많으면 여전히 패딩 단계에서 에러(아래 __post_init__ 검증 참고).
+    # None(기본)이면 기존과 완전히 동일(이 분기 자체가 없음).
+    state_select: list[int] | None = None
+
+    # ACTION 피처의 MEAN_STD 정규화에서 쓰는 차원별 표준편차 하한 — 정규화·역정규화 둘 다
+    # `std = max(std, min_std)`를 쓰게 만든다(processor_smolvla.py의
+    # make_smolvla_pre_post_processors 참고, dataset_stats 자체를 복사해서 한 번만 바꾸고
+    # Normalizer/Unnormalizer에 그 결과를 똑같이 넘기므로 두 방향이 항상 일치한다). 거의
+    # 상수인 채널(예: 보조 팔의 위치/자세)을 실제 std 그대로 정규화하면 아주 작은 노이즈가
+    # 정규화 후 값으로 크게 증폭되는 걸 막는다. 스칼라면 전체 채널에 동일 적용, 리스트면
+    # (실제 액션 차원,) 길이여야 한다(validate_features에서 검증). None(기본)이면 기존 std를
+    # 그대로 쓴다(완전히 동일).
+    action_min_std: float | list[float] | None = None
+
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
 
@@ -325,6 +345,26 @@ class SmolVLAConfig(PreTrainedConfig):
                     f"`angle_unwrap_dims`의 각 인덱스는 0 이상 `max_action_dim`({self.max_action_dim}) "
                     f"미만이어야 합니다. 현재 값: {self.angle_unwrap_dims}"
                 )
+        if self.state_select is not None:
+            if len(self.state_select) == 0:
+                raise ValueError("`state_select`가 리스트면 비어 있을 수 없습니다(None으로 끄세요).")
+            if len(set(self.state_select)) != len(self.state_select):
+                raise ValueError(f"`state_select`에 중복된 인덱스가 있습니다: {self.state_select}")
+            if any(i < 0 for i in self.state_select):
+                raise ValueError(f"`state_select`는 음수 인덱스를 포함할 수 없습니다: {self.state_select}")
+            if len(self.state_select) > self.max_state_dim:
+                raise ValueError(
+                    f"`state_select`로 고른 채널 수({len(self.state_select)})가 `max_state_dim`"
+                    f"({self.max_state_dim})보다 많습니다 — 패딩 단계에서 에러가 납니다."
+                )
+            # 상한(원본 observation.state의 실제 차원)은 실제 데이터셋 피처를 알아야 하므로
+            # validate_features()에서 검증한다.
+        if self.action_min_std is not None:
+            min_std_values = self.action_min_std if isinstance(self.action_min_std, list) else [self.action_min_std]
+            if len(min_std_values) == 0:
+                raise ValueError("`action_min_std`가 리스트면 비어 있을 수 없습니다(None으로 끄세요).")
+            if any(v <= 0 for v in min_std_values):
+                raise ValueError(f"`action_min_std`는 모두 양수여야 합니다. 현재 값: {self.action_min_std}")
         if self.vlm_layer_indices is not None:
             if len(self.vlm_layer_indices) == 0:
                 raise ValueError("`vlm_layer_indices`가 비어 있습니다 — 최소 1개 이상의 레이어 인덱스가 필요합니다.")
@@ -509,6 +549,24 @@ class SmolVLAConfig(PreTrainedConfig):
                     raise ValueError(
                         f"`{name}` 길이({len(value)})가 실제 액션 차원({real_action_dim})과 다릅니다."
                     )
+
+        if self.state_select is not None:
+            state_feat = self.input_features.get(OBS_STATE)
+            if state_feat is not None:
+                real_state_dim = state_feat.shape[0]
+                if any(i >= real_state_dim for i in self.state_select):
+                    raise ValueError(
+                        f"`state_select`의 인덱스가 실제 observation.state 차원({real_state_dim})을 "
+                        f"벗어납니다. 현재 값: {self.state_select}"
+                    )
+
+        if self.action_min_std is not None and isinstance(self.action_min_std, list) and self.action_feature is not None:
+            real_action_dim = self.action_feature.shape[0]
+            if len(self.action_min_std) != real_action_dim:
+                raise ValueError(
+                    f"`action_min_std` 길이({len(self.action_min_std)})가 실제 액션 차원"
+                    f"({real_action_dim})과 다릅니다."
+                )
 
         if self.ard_use_joint_torque:
             # 데이터셋이 observation.state와 관절 토크를 별도 feature로 제공하는 경우에만 미리

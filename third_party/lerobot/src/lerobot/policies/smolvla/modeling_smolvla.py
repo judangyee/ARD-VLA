@@ -774,10 +774,16 @@ class SmolVLAPolicy(PreTrainedPolicy):
         return actions
 
     def prepare_state(self, batch):
-        """Pad state. `config.ard_use_joint_torque=True`면 패딩 전에 관절 토크
+        """Pad state. `config.state_select`가 있으면 패딩/토크 concat보다 먼저 그 절대
+        인덱스들만 골라 쓴다(원본 observation.state가 `max_state_dim`보다 넓은 데이터셋에서
+        필요한 채널만 추리는 용도 — `pad_vector`는 입력이 `max_state_dim`보다 크면 자르지
+        않고 그냥 에러를 낸다). `config.ard_use_joint_torque=True`면 패딩 전에 관절 토크
         (`ARD_JOINT_TORQUE` 배치 키)를 state 뒤에 concat한다 — 학습/추론(predict_action_chunk)
         양쪽 다 이 메서드를 거치므로 별도 처리가 필요 없다."""
         state = batch[OBS_STATE][:, -1, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
+        if self.config.state_select is not None:
+            idx = torch.tensor(self.config.state_select, dtype=torch.long, device=state.device)
+            state = state.index_select(-1, idx)
         if self.config.ard_use_joint_torque:
             if ARD_JOINT_TORQUE not in batch:
                 raise ValueError(

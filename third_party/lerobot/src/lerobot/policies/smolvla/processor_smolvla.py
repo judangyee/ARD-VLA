@@ -38,7 +38,27 @@ from lerobot.processor import (
     UnnormalizerProcessorStep,
 )
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
-from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+from lerobot.utils.constants import ACTION, POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+
+
+def _apply_action_min_std(
+    dataset_stats: dict[str, dict[str, torch.Tensor]] | None,
+    min_std: float | list[float] | None,
+) -> dict[str, dict[str, torch.Tensor]] | None:
+    """`dataset_stats[ACTION]["std"]`를 `max(std, min_std)`로 교체한 새 dict를 반환한다
+    (원본 `dataset_stats`는 바꾸지 않음) — `Normalizer`/`UnnormalizerProcessorStep` 둘 다
+    이 결과를 받아야 정규화·역정규화가 항상 같은 std를 쓴다. `min_std=None`이거나
+    `dataset_stats`에 `ACTION` 통계가 없으면 그대로 돌려준다(이 경우 호출자가 원본
+    `dataset_stats`를 그대로 양쪽에 넘기므로 기존과 bit-exact)."""
+    if min_std is None or not dataset_stats or ACTION not in dataset_stats:
+        return dataset_stats
+    new_stats = dict(dataset_stats)
+    action_stats = dict(new_stats[ACTION])
+    std = torch.as_tensor(action_stats["std"], dtype=torch.float32)
+    floor = torch.as_tensor(min_std, dtype=torch.float32)
+    action_stats["std"] = torch.maximum(std, floor)
+    new_stats[ACTION] = action_stats
+    return new_stats
 
 
 def make_smolvla_pre_post_processors(
@@ -89,16 +109,21 @@ def make_smolvla_pre_post_processors(
     # 필드 주석 참고(회전벡터/오일러각 여부가 미확인이라 기본 꺼짐).
     if config.angle_unwrap_dims:
         input_steps.append(AngleUnwrapProcessorStep(angle_dims=tuple(config.angle_unwrap_dims)))
+    # action_min_std가 있으면(기본 None) ACTION 통계의 std를 max(std, min_std)로 한 번만
+    # 바꿔서 Normalizer/Unnormalizer 둘 다에 똑같이 넘긴다 — 정규화·역정규화가 항상 같은
+    # std를 쓰게 보장한다(원본 dataset_stats는 바꾸지 않음). None이면 원본 dataset_stats를
+    # 그대로 양쪽에 넘기므로 기존과 bit-exact.
+    normalization_stats = _apply_action_min_std(dataset_stats, config.action_min_std)
     input_steps.append(
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
-            stats=dataset_stats,
+            stats=normalization_stats,
         )
     )
     output_steps = [
         UnnormalizerProcessorStep(
-            features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
+            features=config.output_features, norm_map=config.normalization_mapping, stats=normalization_stats
         ),
     ]
     # Unwrap의 역연산 — 로봇에 보내기 직전(여기가 마지막 단계), 연속 표현으로 다루던 회전
