@@ -841,6 +841,8 @@ def test_ard_reg_time_weighting_one_minus_t():
 
 
 def test_gradnorm_lambdas():
+    """force_target이 없어서 force가 매 스텝 비활성인 기본 상황 — lambda_force는 전혀 갱신되지
+    않고 1.0에 고정되며, 활성 태스크(smooth/traj)끼리만 Ḡ/r_i/합 정규화에 들어가야 한다."""
     torch.manual_seed(0)
     gradnorm = GradNormLambdas(alpha=1.5, init_value=1.0)
     check(
@@ -871,7 +873,7 @@ def test_gradnorm_lambdas():
             lambda_smooth=1.0,
             lambda_force=1.0,
             lambda_traj=1.0,
-            force_target=None,  # GradNorm이 force처럼 shared와 연결 안 된(상수 0) task도 안 죽고 버텨야 함
+            force_target=None,  # force는 매 스텝 비활성 — GradNorm의 active 집합에서 빠져야 한다
             gradnorm=gradnorm,
             shared_activation=shared,
         )
@@ -881,20 +883,30 @@ def test_gradnorm_lambdas():
         out.grad_loss.backward(inputs=[gradnorm.weights], retain_graph=True)
         out.total.backward()
 
-        gradnorm_optimizer.step()
-        gradnorm.renormalize()
+        gradnorm.apply_update(gradnorm_optimizer, out.gradnorm_active)
 
     check("gradnorm=... 을 주면 compute_ard_losses가 grad_loss를 반환한다", out.grad_loss is not None)
     check("grad_loss는 유한한 스칼라값이다", torch.isfinite(out.grad_loss).item() and out.grad_loss.ndim == 0)
     check(
-        "5스텝 뒤 GradNorm weights가 초기값(1,1,1)에서 실제로 움직인다",
-        not torch.allclose(gradnorm.weights, weights_before),
+        "gradnorm_active는 (smooth=True, force=False, traj=True)다 (force_target 없음, chunk=10)",
+        out.gradnorm_active == (True, False, True),
+        detail=f"gradnorm_active={out.gradnorm_active}",
+    )
+    check(
+        "5스텝 뒤 lambda_smooth/lambda_traj는 초기값(1,1)에서 실제로 움직인다",
+        not torch.allclose(gradnorm.weights[[0, 2]], weights_before[[0, 2]]),
         detail=f"weights={gradnorm.weights.tolist()}",
     )
     check(
-        "renormalize() 이후에도 weights 합은 항상 3(task 개수)으로 유지된다",
-        abs(gradnorm.weights.sum().item() - 3.0) < 1e-4,
-        detail=f"sum={gradnorm.weights.sum().item()}",
+        "lambda_force는 매 스텝 비활성이었으므로 5스텝 뒤에도 초기값 1.0에서 정확히 그대로다",
+        gradnorm.weights[1].item() == 1.0,
+        detail=f"lambda_force={gradnorm.weights[1].item()}",
+    )
+    check(
+        "활성 태스크(smooth+traj)끼리의 lambda 합은 활성 태스크 수(2)로 재정규화된다 "
+        "(비활성 lambda_force는 이 합에 끼지 않는다)",
+        abs((gradnorm.weights[0] + gradnorm.weights[2]).item() - 2.0) < 1e-4,
+        detail=f"smooth+traj={(gradnorm.weights[0] + gradnorm.weights[2]).item()}",
     )
     check(
         "force_loss가 shared_activation과 연결 안 된(상수 0) 경우에도 crash 없이 동작한다",
@@ -915,6 +927,182 @@ def test_gradnorm_lambdas():
         lambda_traj=1.0,
     )
     check("gradnorm을 안 주면(기존 고정 lambda 방식) grad_loss는 None이다", fixed.grad_loss is None)
+    check("gradnorm을 안 주면 gradnorm_active도 None이다", fixed.gradnorm_active is None)
+
+
+def test_gradnorm_all_active():
+    """force_target+force_pred를 둘 다 주면 force도 active가 되어, 세 lambda 모두 갱신되고
+    셋의 합이 3(활성 태스크 수)으로 정규화되어야 한다."""
+    torch.manual_seed(1)
+    gradnorm = GradNormLambdas(alpha=1.5, init_value=1.0)
+    gradnorm_optimizer = torch.optim.Adam([gradnorm.weights], lr=0.05)
+    batch, chunk, arm_dim, hidden = 4, 10, 7, 16
+    actuator_is_first = resolve_actuator_is_first("right", batch_size=batch, device="cpu")
+    force_head = ForceHead(expert_hidden_size=hidden)
+
+    weights_before = gradnorm.weights.clone()
+    gradnorm_active = None
+    for _ in range(5):
+        shared = torch.randn(batch, chunk, hidden, requires_grad=True)
+        per_element_loss = shared[..., : 2 * arm_dim] ** 2
+        stabilizer_traj_pred = shared[..., :arm_dim] * 3.0
+        actuator_traj_pred = shared[..., arm_dim : 2 * arm_dim] * 0.1
+        force_pred = force_head(shared)
+        force_target = torch.randn(batch)
+
+        out = compute_ard_losses(
+            per_element_loss=per_element_loss,
+            stabilizer_traj_pred=stabilizer_traj_pred,
+            actuator_traj_pred=actuator_traj_pred,
+            actuator_is_first=actuator_is_first,
+            arm_dim=arm_dim,
+            alpha=0.3,
+            beta=0.7,
+            lambda_smooth=1.0,
+            lambda_force=1.0,
+            lambda_traj=1.0,
+            force_target=force_target,
+            force_pred=force_pred,
+            gradnorm=gradnorm,
+            shared_activation=shared,
+        )
+        gradnorm_active = out.gradnorm_active
+
+        gradnorm_optimizer.zero_grad()
+        out.grad_loss.backward(inputs=[gradnorm.weights], retain_graph=True)
+        out.total.backward()
+        gradnorm.apply_update(gradnorm_optimizer, gradnorm_active)
+
+    check(
+        "전부 active일 땐 gradnorm_active가 (True, True, True)다",
+        gradnorm_active == (True, True, True),
+    )
+    check(
+        "전부 active면 세 lambda 모두 초기값(1,1,1)에서 움직인다",
+        not torch.allclose(gradnorm.weights, weights_before),
+        detail=f"weights={gradnorm.weights.tolist()}",
+    )
+    check(
+        "전부 active일 때의 합 정규화는 3(전체 태스크 수)이다",
+        abs(gradnorm.weights.sum().item() - 3.0) < 1e-4,
+        detail=f"sum={gradnorm.weights.sum().item()}",
+    )
+
+
+def test_gradnorm_active_but_grad_none_raises():
+    """active=True로 표시한 태스크의 손실이 실제로는 shared_activation과 끊겨 있으면(= 과거
+    버그였던 상황을 호출자가 active 플래그로 잘못 보고한 경우), 조용히 0으로 때우지 않고
+    바로 에러를 내야 한다."""
+    gradnorm = GradNormLambdas(alpha=1.5, init_value=1.0)
+    shared = torch.randn(4, 10, 16, requires_grad=True)
+    smooth_loss = (shared[..., :7] ** 2).mean()
+    traj_loss = (shared[..., 7:14] ** 2).mean()
+    # force_loss는 shared와 아무 관계 없는 상수 — 실제로는 비활성인데 active=True로 잘못 넘긴다.
+    disconnected_force_loss = torch.zeros(())
+
+    raised = False
+    try:
+        gradnorm.compute_grad_loss(
+            [smooth_loss, disconnected_force_loss, traj_loss], shared, active=[True, True, True]
+        )
+    except RuntimeError:
+        raised = True
+    check(
+        "active=True인데 grad가 None이면 RuntimeError를 낸다(조용히 0으로 때우지 않는다)",
+        raised,
+    )
+
+
+def test_gradnorm_force_activates_mid_training():
+    """학습 중간에 force가 꺼져있다가 켜지는 경우: force가 처음 active가 되는 스텝에서
+    L_force(0)(초기 손실 기준값)을 그 시점 값으로 기록해야 한다(0이나 이전 스텝 값이 아니라)."""
+    torch.manual_seed(2)
+    gradnorm = GradNormLambdas(alpha=1.5, init_value=1.0)
+    gradnorm_optimizer = torch.optim.Adam([gradnorm.weights], lr=0.05)
+    batch, chunk, arm_dim, hidden = 4, 10, 7, 16
+
+    # --- 1~3스텝: force 비활성 ---
+    for _ in range(3):
+        shared = torch.randn(batch, chunk, hidden, requires_grad=True)
+        smooth_loss = (shared[..., :arm_dim] ** 2).mean()
+        traj_loss = (shared[..., arm_dim : 2 * arm_dim] ** 2).mean()
+        force_loss = torch.zeros(())  # force_target 없음 상황과 동일(연결 안 됨)
+        grad_loss = gradnorm.compute_grad_loss(
+            [smooth_loss, force_loss, traj_loss], shared, active=[True, False, True]
+        )
+        gradnorm_optimizer.zero_grad()
+        grad_loss.backward(inputs=[gradnorm.weights], retain_graph=True)
+        gradnorm.apply_update(gradnorm_optimizer, [True, False, True])
+
+    check(
+        "force가 한 번도 active였던 적이 없으면 initialized[force]는 여전히 False다",
+        bool(gradnorm.initialized[1].item()) is False,
+    )
+    check(
+        "force가 비활성이던 동안 lambda_force는 초기값 1.0 그대로다",
+        gradnorm.weights[1].item() == 1.0,
+    )
+
+    # --- 4번째 스텝: force 활성화 ---
+    force_head = ForceHead(expert_hidden_size=hidden)
+    shared = torch.randn(batch, chunk, hidden, requires_grad=True)
+    smooth_loss = (shared[..., :arm_dim] ** 2).mean()
+    traj_loss = (shared[..., arm_dim : 2 * arm_dim] ** 2).mean()
+    force_pred = force_head(shared)
+    force_target = torch.randn(batch)
+    force_loss = (force_pred - force_target.unsqueeze(-1)).abs().mean()
+
+    grad_loss = gradnorm.compute_grad_loss(
+        [smooth_loss, force_loss, traj_loss], shared, active=[True, True, True]
+    )
+    check(
+        "force가 처음 active가 된 스텝에서 initial_losses[force]가 그 스텝의 force_loss 값으로 기록된다",
+        abs(gradnorm.initial_losses[1].item() - force_loss.item()) < 1e-6,
+        detail=f"initial_losses[force]={gradnorm.initial_losses[1].item()} force_loss={force_loss.item()}",
+    )
+    check(
+        "force가 활성화된 뒤 initialized[force]는 True가 된다",
+        bool(gradnorm.initialized[1].item()) is True,
+    )
+
+    gradnorm_optimizer.zero_grad()
+    grad_loss.backward(inputs=[gradnorm.weights], retain_graph=True)
+    weights_before_activation_step = gradnorm.weights.clone()
+    gradnorm.apply_update(gradnorm_optimizer, [True, True, True])
+    check(
+        "force가 활성화된 스텝에는 lambda_force도 더 이상 고정되지 않고 갱신될 수 있다 "
+        "(이번 스텝 활성 태스크 3개 합=3으로 재정규화됨)",
+        abs(gradnorm.weights.sum().item() - 3.0) < 1e-4,
+        detail=f"sum={gradnorm.weights.sum().item()} before={weights_before_activation_step.tolist()} "
+        f"after={gradnorm.weights.tolist()}",
+    )
+
+    # --- 5번째 스텝: 다시 force 비활성. 4번째 스텝에서 force가 실제로 업데이트됐으므로(Adam
+    # 모멘텀이 생김) lambda_force가 "그냥 이번 스텝 grad=0이라 안 움직인다"가 아니라, 모멘텀이
+    # 있어도 apply_update()가 명시적으로 step-이전 값으로 되돌리는지까지 검증한다.
+    recorded_initial_force = gradnorm.initial_losses[1].item()
+    lambda_force_after_step4 = gradnorm.weights[1].item()
+    shared2 = torch.randn(batch, chunk, hidden, requires_grad=True)
+    smooth_loss2 = (shared2[..., :arm_dim] ** 2).mean()
+    traj_loss2 = (shared2[..., arm_dim : 2 * arm_dim] ** 2).mean()
+    force_loss2 = torch.zeros(())
+    grad_loss2 = gradnorm.compute_grad_loss(
+        [smooth_loss2, force_loss2, traj_loss2], shared2, active=[True, False, True]
+    )
+    check(
+        "다시 비활성으로 돌아가도 initial_losses[force]는 처음 활성화됐을 때 값으로 그대로 남는다(재기록 안 됨)",
+        gradnorm.initial_losses[1].item() == recorded_initial_force,
+    )
+
+    gradnorm_optimizer.zero_grad()
+    grad_loss2.backward(inputs=[gradnorm.weights], retain_graph=True)
+    gradnorm.apply_update(gradnorm_optimizer, [True, False, True])
+    check(
+        "4스텝째 force가 실제로 업데이트되어 Adam 모멘텀이 생긴 뒤에도, 5스텝째 다시 비활성이면 "
+        "lambda_force는 (모멘텀에 의해 흔들리지 않고) 4스텝째 끝난 값 그대로 고정된다",
+        gradnorm.weights[1].item() == lambda_force_after_step4,
+        detail=f"after_step4={lambda_force_after_step4} after_step5={gradnorm.weights[1].item()}",
+    )
 
 
 def test_gradnorm_force_head_connection():

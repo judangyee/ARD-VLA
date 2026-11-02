@@ -26,6 +26,7 @@ ARD는 선두 `2 * ard_arm_dim`개 액션 채널을 Stabilizer 블록과 Actuato
 """
 
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -318,7 +319,10 @@ class GradNormLambdas(nn.Module):
         self.task_names = ("smooth", "force", "traj")
         self.weights = nn.Parameter(torch.full((len(self.task_names),), float(init_value)))
         self.register_buffer("initial_losses", torch.zeros(len(self.task_names)))
-        self.register_buffer("initialized", torch.tensor(False))
+        # 과거엔 스칼라 하나(전역 "초기화됐는지")였다 — force처럼 학습 중간에 꺼졌다 켜질 수
+        # 있는 태스크는 "그 태스크가 처음 active가 된 시점"의 손실을 L_i(0)으로 따로 기록해야
+        # 해서, 태스크별(smooth/force/traj) bool 벡터로 바꿨다.
+        self.register_buffer("initialized", torch.zeros(len(self.task_names), dtype=torch.bool))
 
     @property
     def lambda_smooth(self) -> Tensor:
@@ -332,7 +336,9 @@ class GradNormLambdas(nn.Module):
     def lambda_traj(self) -> Tensor:
         return self.weights[2]
 
-    def compute_grad_loss(self, task_losses: list[Tensor], shared_activation: Tensor) -> Tensor:
+    def compute_grad_loss(
+        self, task_losses: list[Tensor], shared_activation: Tensor, active: Sequence[bool] | Tensor
+    ) -> Tensor:
         """GradNorm 손실(L_grad)을 계산한다 — `self.weights`에 대해서만 미분 가능하도록 만들어졌다
         (학습 루프에서 `grad_loss.backward(inputs=[self.weights], ...)`로 다른 파라미터는 건드리지
         않고 lambda만 업데이트한다).
@@ -342,47 +348,95 @@ class GradNormLambdas(nn.Module):
             거슬러 올라가는 계산 그래프가 아직 free되지 않은 상태여야 한다(즉 이 함수를 호출하는
             시점의 forward pass 도중 — retain_graph로 나중에 메인 loss.backward()도 그래프를
             재사용할 수 있게 해줘야 한다).
+        active: [smooth_active, force_active, traj_active] — 그 태스크가 이번 스텝에 실제로 의미
+            있는 신호인지(예: force_active = force_target is not None and force_pred is not None).
+            비활성 태스크는 그래디언트 norm 계산/Ḡ 평균/r_i 정규화에서 전부 제외한다 — 예전처럼
+            "비활성 태스크를 0으로 때워서 active 집합에 섞어 넣으면" Ḡ가 실제보다 작게, 나머지
+            활성 태스크의 r_i가 실제보다 크게 편향된다(force_loss가 데이터셋에 없어 항상 0인
+            경우가 정확히 이 상황이었다). `active=False`인 태스크의 lambda는 이 스텝에서 전혀
+            갱신되지 않는다(`apply_update()` 참고).
         """
         task_losses = list(task_losses)
         if len(task_losses) != len(self.weights):
             raise ValueError(
                 f"task_losses는 {len(self.weights)}개(smooth/force/traj)여야 합니다. 받은 개수: {len(task_losses)}"
             )
+        active_t = torch.as_tensor(list(active), dtype=torch.bool, device=self.weights.device)
+        if active_t.shape != self.weights.shape:
+            raise ValueError(
+                f"active는 {len(self.weights)}개(smooth/force/traj)여야 합니다. 받은 개수: {active_t.numel()}"
+            )
 
-        if not bool(self.initialized):
-            self.initial_losses = torch.stack([loss.detach() for loss in task_losses])
-            self.initialized.fill_(True)
+        # 비활성이었다가(또는 한 번도 활성화된 적 없다가) 이번 스텝에 처음 active가 된 태스크만
+        # L_i(0)을 기록한다 — 기존에 이미 초기화된 태스크는 덮어쓰지 않는다.
+        newly_active = active_t & ~self.initialized
+        if bool(newly_active.any()):
+            with torch.no_grad():
+                for i, is_new in enumerate(newly_active.tolist()):
+                    if is_new:
+                        self.initial_losses[i] = task_losses[i].detach()
+                self.initialized = self.initialized | newly_active
+
+        active_idx = active_t.nonzero(as_tuple=True)[0].tolist()
+        if not active_idx:
+            # 이번 스텝에 활성 태스크가 하나도 없음 — 업데이트할 신호 자체가 없다. weights와
+            # 연결되지 않은(그래서 backward해도 아무 lambda도 안 건드리는) 0을 반환한다.
+            return shared_activation.new_zeros(())
 
         grad_norms = []
-        for weight, loss in zip(self.weights, task_losses, strict=True):
-            weighted = weight * loss
-            # allow_unused=True: force_target이 없으면 force_loss는 shared_activation과 연결되지
-            # 않은 상수 0(actuator_traj_pred.new_zeros(()))이라 그래프에 아예 안 잡힌다 — 그럴 때
-            # autograd.grad는 기본적으로 에러를 내므로, "그 항은 그래디언트가 0"으로 명시적으로
-            # 처리한다 (실제로 그 항이 shared_activation에 아무 영향을 안 준다는 뜻이므로 맞는 처리).
+        for i in active_idx:
+            weighted = self.weights[i] * task_losses[i]
             (grad,) = torch.autograd.grad(
                 weighted, shared_activation, retain_graph=True, create_graph=True, allow_unused=True
             )
             if grad is None:
-                grad = torch.zeros_like(shared_activation)
+                # active=True로 넘어왔다는 건 "이 태스크가 이번 스텝에 실제로 의미 있다"는
+                # 호출자의 보장인데, 실제로는 shared_activation과 그래프가 끊겨 있다는 뜻 —
+                # 조용히 0으로 때우면 과거처럼 Ḡ/r_i가 소리 없이 편향된다. active 플래그 자체가
+                # 실제 상태와 어긋난 호출자 버그일 가능성이 높으므로 바로 에러를 낸다.
+                raise RuntimeError(
+                    f"GradNorm 태스크 '{self.task_names[i]}'가 active=True로 들어왔지만 손실이 "
+                    "shared_activation 계산 그래프와 연결되어 있지 않습니다(gradient=None). "
+                    "active 플래그가 실제 손실 상태와 어긋났을 가능성이 큽니다(예: force_target이 "
+                    "없는데 force를 active로 표시)."
+                )
             grad_norms.append(grad.norm(2))
-        grad_norms = torch.stack(grad_norms)  # self.weights에 대해 미분 가능
+        grad_norms = torch.stack(grad_norms)  # self.weights[active_idx]에 대해 미분 가능
 
         with torch.no_grad():
-            current_losses = torch.stack([loss.detach() for loss in task_losses])
-            loss_ratios = current_losses / self.initial_losses.clamp_min(1e-8)
+            current_losses = torch.stack([task_losses[i].detach() for i in active_idx])
+            initial_losses = self.initial_losses[active_idx]
+            loss_ratios = current_losses / initial_losses.clamp_min(1e-8)
             inverse_train_rates = loss_ratios / loss_ratios.mean().clamp_min(1e-8)
             target_grad_norms = grad_norms.mean().detach() * inverse_train_rates.pow(self.alpha)
 
         return (grad_norms - target_grad_norms).abs().sum()
 
-    def renormalize(self) -> None:
-        """GradNorm 논문의 표준 스텝: lambda 업데이트 뒤 합이 항상 태스크 개수(=3)가 되도록
-        재정규화한다 — 안 그러면 옵티마이저가 그냥 전부 줄여버려서 L_grad를 트리비얼하게
-        낮출 수 있다. `torch.optim.Optimizer.step()` 직후 학습 루프에서 호출해야 한다."""
+    def apply_update(self, optimizer: torch.optim.Optimizer, active: Sequence[bool] | Tensor) -> None:
+        """`compute_grad_loss(...)`의 결과로 `grad_loss.backward(inputs=[self.weights], ...)`까지
+        끝난 뒤, `optimizer.step()` 대신 이 메서드를 호출한다.
+
+        `optimizer.step()`은 `self.weights` 전체(3개)에 대해 호출하므로(Adam은 모멘텀을
+        갖고 있어서, 이번 스텝 gradient가 정확히 0이어도 과거 모멘텀 때문에 값이 계속
+        흔들릴 수 있다), active=False인 인덱스는 **step 이전 값으로 복원**해서 이번 스텝에
+        정말로 전혀 변하지 않도록 만든다. 그 다음 active 태스크끼리만 `clamp(min=1e-3)` +
+        합이 "활성 태스크 수"가 되도록 재정규화한다(GradNorm 논문의 표준 "합 보존" 스텝을
+        비활성 태스크가 끼지 않은 부분집합에 적용한 것) — 안 그러면 옵티마이저가 전체 lambda를
+        그냥 줄여서 L_grad를 트리비얼하게 낮출 수 있다."""
+        active_t = torch.as_tensor(list(active), dtype=torch.bool, device=self.weights.device)
+        if active_t.shape != self.weights.shape:
+            raise ValueError(
+                f"active는 {len(self.weights)}개(smooth/force/traj)여야 합니다. 받은 개수: {active_t.numel()}"
+            )
         with torch.no_grad():
-            self.weights.clamp_(min=1e-3)
-            self.weights.mul_(len(self.weights) / self.weights.sum())
+            pre_step = self.weights.detach().clone()
+        optimizer.step()
+        with torch.no_grad():
+            self.weights[~active_t] = pre_step[~active_t]
+            n_active = int(active_t.sum().item())
+            if n_active > 0:
+                active_w = self.weights[active_t].clamp(min=1e-3)
+                self.weights[active_t] = active_w * (n_active / active_w.sum())
 
 
 @dataclass
@@ -395,6 +449,10 @@ class ARDLossOutput:
     force_loss: Tensor
     traj_loss: Tensor
     grad_loss: Tensor | None = None  # GradNorm 활성화 시에만 채워짐 (ARD-VLA 학습 루프가 별도로 backward)
+    # GradNorm 활성화 시에만 채워짐: (smooth_active, force_active, traj_active). 학습 루프가
+    # optimizer.step() 뒤 `GradNormLambdas.apply_update(optimizer, active=...)`에 그대로 넘겨서
+    # 비활성 태스크의 lambda를 이번 스텝에 전혀 건드리지 않게 하는 데 쓴다.
+    gradnorm_active: tuple[bool, bool, bool] | None = None
 
 
 def _reduce_reg_loss(sq_diff: Tensor, time_weights: Tensor | None) -> Tensor:
@@ -583,7 +641,19 @@ def compute_ard_losses(
         force_loss = actuator_traj_pred.new_zeros(())
 
     grad_loss = None
+    gradnorm_active = None
     if gradnorm is not None:
+        # smooth_loss/traj_loss가 바로 위에서 0으로 폴백하는 조건(shape[1]<=1/<=2)과 force_loss가
+        # 0으로 폴백하는 조건(force_target/force_pred 부재)을 그대로 재사용한다 — "이 태스크가
+        # 이번 스텝에 실제로 의미 있는 신호인가"의 유일한 판단 기준이 두 군데서 따로 갈리지
+        # 않게 하기 위함이다. GradNorm은 이 active 플래그로 비활성 태스크를 Ḡ/r_i/재정규화에서
+        # 완전히 제외한다(GradNormLambdas.compute_grad_loss 참고) — 예전에는 force_loss가 데이터셋
+        # 부재로 거의 항상 0인데도 이 셋에 섞여 들어가 Ḡ·r_i를 편향시켰었다.
+        gradnorm_active = (
+            smooth_input.shape[1] > 1,
+            force_target is not None and force_pred is not None,
+            traj_input.shape[1] > 2,
+        )
         # GradNorm이 학습한 lambda로 total loss를 만든다 — 반드시 detach해서 쓴다: 안 그러면
         # total.backward()가 lambda 파라미터에도 직접 그래디언트를 흘려서(해당 항의 손실을
         # 줄이려고 lambda를 그냥 0으로 밀어버리는 방향), GradNorm의 "그래디언트 norm을
@@ -592,7 +662,9 @@ def compute_ard_losses(
         used_lambda_smooth = gradnorm.lambda_smooth.detach()
         used_lambda_force = gradnorm.lambda_force.detach()
         used_lambda_traj = gradnorm.lambda_traj.detach()
-        grad_loss = gradnorm.compute_grad_loss([smooth_loss, force_loss, traj_loss], shared_activation)
+        grad_loss = gradnorm.compute_grad_loss(
+            [smooth_loss, force_loss, traj_loss], shared_activation, active=gradnorm_active
+        )
     else:
         used_lambda_smooth, used_lambda_force, used_lambda_traj = lambda_smooth, lambda_force, lambda_traj
 
@@ -609,6 +681,7 @@ def compute_ard_losses(
         force_loss=force_loss.detach(),
         traj_loss=traj_loss.detach(),
         grad_loss=grad_loss,
+        gradnorm_active=gradnorm_active,
     )
 
 
@@ -696,15 +769,25 @@ def compute_symmetric_losses(
         force_loss = actuator_traj_pred.new_zeros(())
 
     grad_loss = None
+    gradnorm_active = None
     if gradnorm is not None:
         used_lambda_smooth = gradnorm.lambda_smooth.detach()
         used_lambda_force = gradnorm.lambda_force.detach()
         used_lambda_traj = gradnorm.lambda_traj.detach()
+        # _smooth/_traj 내부의 0-폴백 조건(shape[1]<=1/<=2)과 동일한 기준 — gripper 제외는
+        # 시간축(shape[1])에 영향이 없으므로 stabilizer_traj_pred.shape[1]을 그대로 쓴다.
+        gradnorm_active = (
+            stabilizer_traj_pred.shape[1] > 1,
+            force_target is not None and force_pred is not None,
+            stabilizer_traj_pred.shape[1] > 2,
+        )
         # 대칭 모드에서는 smooth/traj가 양팔 각각에 걸리므로, GradNorm에 넘기는 "대표" smooth/traj
         # 손실은 양팔 평균을 쓴다 — GradNormLambdas.task_names는 ("smooth", "force", "traj")
         # 3개 고정이라, ARD 모드와 동일한 인터페이스를 유지하기 위한 선택이다.
         grad_loss = gradnorm.compute_grad_loss(
-            [(smooth_stab + smooth_act) / 2, force_loss, (traj_stab + traj_act) / 2], shared_activation
+            [(smooth_stab + smooth_act) / 2, force_loss, (traj_stab + traj_act) / 2],
+            shared_activation,
+            active=gradnorm_active,
         )
     else:
         used_lambda_smooth, used_lambda_force, used_lambda_traj = lambda_smooth, lambda_force, lambda_traj
@@ -727,4 +810,5 @@ def compute_symmetric_losses(
         force_loss=force_loss.detach(),
         traj_loss=((traj_stab + traj_act) / 2).detach(),
         grad_loss=grad_loss,
+        gradnorm_active=gradnorm_active,
     )

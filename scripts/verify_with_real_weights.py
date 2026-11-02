@@ -288,8 +288,10 @@ def task_gradnorm(args, device, real_image_01, lang_tokens, lang_mask) -> None:
 
         loss, loss_dict = policy.forward(batch)
         grad_loss = loss_dict.pop("ard_grad_loss_tensor", None)
+        gradnorm_active = loss_dict.pop("ard_gradnorm_active", None)
+        do_gradnorm_step = grad_loss is not None and grad_loss.requires_grad
 
-        if grad_loss is not None:
+        if do_gradnorm_step:
             gradnorm_optimizer.zero_grad()
             grad_loss.backward(inputs=[policy.model.ard_gradnorm.weights], retain_graph=True)
 
@@ -298,9 +300,8 @@ def task_gradnorm(args, device, real_image_01, lang_tokens, lang_mask) -> None:
         torch.nn.utils.clip_grad_norm_(policy.parameters(), config.optimizer_grad_clip_norm)
         optimizer.step()
 
-        if grad_loss is not None:
-            gradnorm_optimizer.step()
-            policy.model.ard_gradnorm.renormalize()
+        if do_gradnorm_step:
+            policy.model.ard_gradnorm.apply_update(gradnorm_optimizer, gradnorm_active)
 
         rows.append(
             {

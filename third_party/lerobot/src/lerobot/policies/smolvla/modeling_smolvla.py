@@ -639,6 +639,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 # loss_dict 값들과 달리 .item()이 아니다. train_ard.py 참고.
                 loss_dict["ard_grad_loss"] = ard_out.grad_loss.item()
                 loss_dict["ard_grad_loss_tensor"] = ard_out.grad_loss
+                # 학습 루프가 optimizer.step() 뒤 GradNormLambdas.apply_update(optimizer, active=...)에
+                # 그대로 넘겨서, 이번 스텝에 비활성인 태스크의 lambda를 전혀 건드리지 않게 한다.
+                loss_dict["ard_gradnorm_active"] = ard_out.gradnorm_active
                 loss_dict["ard_lambda_smooth"] = self.model.ard_gradnorm.lambda_smooth.item()
                 loss_dict["ard_lambda_force"] = self.model.ard_gradnorm.lambda_force.item()
                 loss_dict["ard_lambda_traj"] = self.model.ard_gradnorm.lambda_traj.item()

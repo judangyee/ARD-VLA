@@ -376,12 +376,20 @@ def main() -> None:
         loss, loss_dict = policy.forward(batch)
 
         grad_loss = loss_dict.pop("ard_grad_loss_tensor", None)  # 살아있는 텐서라 로깅 전에 빼둔다
+        gradnorm_active = loss_dict.pop("ard_gradnorm_active", None)  # (smooth, force, traj) 활성 여부
+
+        # grad_loss.requires_grad가 False인 경우는 이번 스텝에 활성 태스크가 하나도 없었다는 뜻
+        # (GradNormLambdas.compute_grad_loss가 weights와 연결되지 않은 상수 0을 반환함) — 그럴 땐
+        # backward/step 자체를 건너뛴다(람다를 전부 그대로 둔다).
+        do_gradnorm_step = (
+            gradnorm_optimizer is not None and grad_loss is not None and grad_loss.requires_grad
+        )
 
         # 순서가 중요하다: GradNorm의 grad_loss.backward()와 메인 loss.backward()를 *둘 다*
-        # 먼저 끝낸 뒤에야 옵티마이저 step을 밟는다. gradnorm_optimizer.step()/renormalize()가
-        # lambda 파라미터를 in-place로 바꾸는데, 그게 먼저 일어나면 메인 loss의 그래프가
-        # (그 안에서 lambda를 detach해서 참조하고 있으므로) "in-place로 바뀐 값" 에러를 낸다.
-        if gradnorm_optimizer is not None and grad_loss is not None:
+        # 먼저 끝낸 뒤에야 옵티마이저 step을 밟는다. apply_update()가 lambda 파라미터를
+        # in-place로 바꾸는데, 그게 먼저 일어나면 메인 loss의 그래프가(그 안에서 lambda를
+        # detach해서 참조하고 있으므로) "in-place로 바뀐 값" 에러를 낸다.
+        if do_gradnorm_step:
             gradnorm_optimizer.zero_grad()
             grad_loss.backward(inputs=[policy.model.ard_gradnorm.weights], retain_graph=True)
 
@@ -392,9 +400,10 @@ def main() -> None:
         if scheduler is not None:
             scheduler.step()
 
-        if gradnorm_optimizer is not None and grad_loss is not None:
-            gradnorm_optimizer.step()
-            policy.model.ard_gradnorm.renormalize()
+        if do_gradnorm_step:
+            # 옵티마이저 step + 비활성 태스크 lambda 복원 + 활성 태스크끼리 합=활성 개수
+            # 재정규화까지 전부 apply_update() 하나가 한다(GradNormLambdas.apply_update 참고).
+            policy.model.ard_gradnorm.apply_update(gradnorm_optimizer, gradnorm_active)
 
         if step == 1 or step % args.log_every == 0:
             msg = f"step {step}/{args.steps}  loss={loss_dict['loss']:.4f}  grad_norm={float(grad_norm):.3f}"
