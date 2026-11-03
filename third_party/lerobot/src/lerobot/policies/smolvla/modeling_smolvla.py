@@ -449,12 +449,21 @@ class SmolVLAPolicy(PreTrainedPolicy):
         batch: dict[str, Tensor],
         selector_mask: Tensor | None = None,
         noise: Tensor | None = None,
+        track_role_split: bool = False,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """`predict_action_chunk`과 동일하지만 prefix forward를 정확히 한 번만 계산해서 Judge/
         Selector 판정(`decisions`)도 함께 반환한다 — 폐루프 러너(closed_loop.py)가 매 서브태스크
         종료 시점에 쓴다. `use_judge=use_selector=False`면 `decisions`는 빈 dict이고 액션은
-        `predict_action_chunk`와 수치적으로 동일하다."""
+        `predict_action_chunk`와 수치적으로 동일하다.
+
+        track_role_split: 기본 False(동작 완전히 그대로). True면(그리고 `use_ard=True`면)
+            `lac_mode="none"`이어도 ARD 공유/잔차 분해를 계산해서 `decisions["_lac_role_split"]`에
+            담아 반환한다 — LAC를 켜지 않고도 평가 로깅(예: 논문 Fig.4의 ||r_stab||/||r_act||)이
+            역할별 잔차에 접근할 수 있게 하는 순수 덧붙임 옵션이다(기본 False라 기존 호출자의
+            동작·반환값은 전혀 바뀌지 않는다). `lac_mode != "none"`이면 이미 항상 계산되므로
+            이 플래그는 무시된다. `use_ard=False`면 분해할 ARD 헤드 자체가 없으므로 조용히
+            무시하고 빈 `decisions`로 돌아간다(과거 동작과 동일)."""
         self.eval()
 
         batch = self._prepare_batch(batch)
@@ -469,8 +478,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        if self.config.lac_mode != "none":
-            # ARD-VLA 2.0 폐루프 경로: 공유/잔차 분해도 같은 prefix forward로 함께 받아서
+        want_role_split = self.config.lac_mode != "none" or (track_role_split and self.config.use_ard)
+        if want_role_split:
+            # ARD-VLA 2.0(LAC) 폐루프 경로, 또는 `track_role_split=True`로 평가 로깅만 원하는
+            # 경로 — 둘 다 같은 "공유/잔차 분해도 같은 prefix forward로 함께 받기"를 쓴다.
             # `decisions["_lac_role_split"]`에 담아둔다 — 러너가 실제 실행 스텝마다
             # `self.apply_lac_step()`을 거치게 하려는 것이라, 여기서는 **필터링하지 않고
             # raw 액션 그대로** 반환한다(요청 (2): "chunk 단위가 아니라 실제 실행 스텝마다").

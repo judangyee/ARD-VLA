@@ -159,8 +159,10 @@ iteration 1), 결정이 "경계"를 넘는 데 forward가 몇 번 쓰이는지�
   Judge 캘리브레이션 곡선을 보고 정해야 합니다.
 - Judge/Selector 학습 데이터(성공/실패 라벨, 실패 유형, 진행도, 복구 동작 타겟) 생성 자체가
   범위 밖이라, 실제 가중치로 Judge/Selector를 학습·평가해본 적이 없습니다.
-- `pre_chunk`(사전 청크 검증)/`per_step`(상시 Stabilizer 모니터링) 콜백은 호출 지점만 있고
-  실제 로직은 구현하지 않았습니다.
+- `pre_chunk`(사전 청크 검증) 콜백은 호출 지점만 있고 실제 로직은 구현하지 않았습니다.
+  `per_step`(실행 스텝마다 호출)은 이제 평가 로깅(논문 Fig.4용 `||r_stab||`/`||r_act||` 등)이
+  붙는 실제 자리로 쓰입니다 — `run_closed_loop(..., track_role_split=True, per_step=...)` 참고
+  (모듈 docstring, `paper/scripts/` 쪽 로깅 유틸).
 - `closed_loop.py`의 러너는 액션 청크를 큐에 쌓지 않고 한 번에 다 실행합니다 — 실시간
   스트리밍 실행(select_action류의 큐 기반, 또는 RTC와의 조합)으로 바꾸는 건 범위 밖입니다.
 - `RECOVER`의 실제 복구 동작(`env.run_recovery()`)은 환경 쪽에서 구현해야 합니다 — 이 러너는

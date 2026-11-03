@@ -44,9 +44,18 @@ iteration 수로 환산된다:
 - ADVANCE(다음 노드) 또는 RECOVER(복구 실행): 지시문/환경이 바뀌므로 다음 iteration에서 다시
   관측+forward해야 한다(경계당 2회 — 판정한 iteration + 다시 forward하는 iteration).
 
-`pre_chunk`/`per_step`은 미래 기능(사전 청크 검증/상시 Stabilizer 모니터링)을 위한 자리만
-만들어둔 콜백이다 — 기본 `None`이고, 실제 검증/모니터링 로직은 이번 작업 범위 밖이라 구현하지
-않는다(호출부만 있다).
+`pre_chunk`는 미래 기능(사전 청크 검증)을 위한 자리만 만들어둔 콜백이다 — 기본 `None`이고,
+실제 검증 로직은 호출부 몫이다.
+
+`per_step(step, step_action, state, role_split_t)`는 `env.execute()` 직전에 실행 스텝마다
+불린다 — 평가 로깅(논문 Fig.4 등)이 이 자리에 붙는다. `role_split_t`는 `track_role_split=True`
+(또는 `lac_mode != "none"`)일 때만 그 스텝의 `{"shared_left","shared_right","residual_left",
+"residual_right"}`(각 (batch, ard_arm_dim))이고, 아니면 `None`이다 —
+`residual_left`/`residual_right`가 바로 ARD의 Stabilizer/Actuator 잔차(기본 역할 매핑에서
+left=Stabilizer, right=Actuator)라서 `.norm()`을 뜨면 ||r_stab||/||r_act||가 된다. 물리적
+관측(관절/엔드이펙터/물체 위치 등)은 `per_step`이 직접 받지 않는다 — `env`를 클로저로 캡처해서
+`env.observe()`를 호출하는 건 호출자(로깅 유틸) 몫이다(이 러너는 `env`를 그대로 콜백에
+넘기지 않는다 — duck-typed 환경 세부사항과 거리를 두는 기존 설계를 유지).
 
 ## LAC(ARD-VLA 2.0) — 실제 실행 스텝마다, 리셋 규칙과 함께
 
@@ -129,9 +138,10 @@ def run_closed_loop(
     # 다른 예산이 필요해지면 그때 TaskGraphNode에 필드를 추가하면 된다(지금은 YAGNI).
     max_subtask_steps: int | None = None,
     pre_chunk: Callable[[torch.Tensor, dict, EpisodeState], None] | None = None,
-    per_step: Callable[[int, torch.Tensor, EpisodeState], None] | None = None,
+    per_step: Callable[[int, torch.Tensor, EpisodeState, dict[str, torch.Tensor] | None], None] | None = None,
     post_decision: Callable[[Any, dict, EpisodeState], None] | None = None,
     log_lac_events: bool = False,
+    track_role_split: bool = False,
 ) -> dict[str, Any]:
     """하나의 에피소드를 끝까지(종료 노드 도달 또는 STOP) 돈다. 맨 처음 `policy.reset()`을
     불러서 큐/LAC 상태를 포함해 완전히 새 에피소드로 시작한다(모듈 docstring의 "LAC" 절 참고).
@@ -165,7 +175,9 @@ def run_closed_loop(
 
         selector_mask = _selector_mask_tensor(decision_logic.allowed_mask(state))
         with torch.no_grad():
-            actions, decisions = policy.predict_action_chunk_with_decisions(batch, selector_mask=selector_mask)
+            actions, decisions = policy.predict_action_chunk_with_decisions(
+                batch, selector_mask=selector_mask, track_role_split=track_role_split
+            )
         # Judge/Selector의 진짜 판정이 아닌 LAC 내부 배관이라, decide()/로깅이 보기 전에 꺼낸다
         # (요청 (4): "Judge/Selector의 입력과 판정 로직은 건드리지 마라").
         role_split = decisions.pop("_lac_role_split", None)
@@ -292,12 +304,16 @@ def _execute_chunk(
     steps_run = 0
     for step in range(n_steps):
         step_action = actions[:, step]
+        role_split_t = None
         if role_split is not None:
             role_split_t = {key: value[:, step] for key, value in role_split.items()}
+            # no-op when policy._lac is None (lac_mode="none") -- apply_lac_step() itself handles
+            # that, so computing role_split_t purely for per_step logging (track_role_split=True
+            # without LAC) never changes the executed action.
             step_action = policy.apply_lac_step(step_action, role_split_t)
         step_action = step_action[0]
         if per_step is not None:
-            per_step(step, step_action, state)
+            per_step(step, step_action, state, role_split_t)
         env.execute(step_action)
         steps_run += 1
         if env.subtask_finished():
