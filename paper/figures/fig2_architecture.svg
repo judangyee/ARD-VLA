@@ -1,107 +1,111 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1610" height="735" viewBox="0 0 1610 735">
-<rect x="0" y="0" width="1610" height="735" fill="#FFFFFF"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="8556" height="2418" viewBox="0 0 8556 2418">
+<rect x="0" y="0" width="8556" height="2418" fill="#FFFFFF"/>
 <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#1A1A1A"/></marker><marker id="arrowb" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#0072B2"/></marker><marker id="arrowo" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#E69F00"/></marker></defs>
-<rect x="20" y="25" width="170" height="70" fill="#FFFFFF" stroke="#1A1A1A" stroke-width="1" rx="6"/>
-<text x="105.0" y="53.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Camera</text>
-<text x="105.0" y="81.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">image(s)</text>
-<rect x="20" y="110" width="170" height="70" fill="#FFFFFF" stroke="#1A1A1A" stroke-width="1" rx="6"/>
-<text x="105.0" y="138.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Language</text>
-<text x="105.0" y="166.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">instruction</text>
-<rect x="20" y="195" width="170" height="70" fill="#FFFFFF" stroke="#1A1A1A" stroke-width="1" rx="6"/>
-<text x="105.0" y="223.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Robot</text>
-<text x="105.0" y="251.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">state</text>
-<rect x="20" y="350" width="170" height="70" fill="#FFFFFF" stroke="#1A1A1A" stroke-width="1" rx="6"/>
-<text x="105.0" y="378.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Noisy action</text>
-<text x="105.0" y="406.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">x_t</text>
-<rect x="230" y="15" width="340" height="440" fill="#FFFFFF" stroke="#1A1A1A" stroke-width="1" rx="6"/>
-<text x="400.0" y="45.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">SmolVLM2 + Action-Expert</text>
-<text x="400.0" y="73.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">(joint, interleaved transformer)</text>
-<rect x="248" y="90" width="304" height="130" fill="#EDEDED" stroke="#1A1A1A" stroke-width="1" rx="6"/>
-<text x="400.0" y="120.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Prefix stream (VLM)</text>
-<text x="400.0" y="148.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">width = 960</text>
-<text x="400.0" y="176.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">frozen (train_expert_only)</text>
-<rect x="248" y="280" width="304" height="150" fill="#EDEDED" stroke="#1A1A1A" stroke-width="1" rx="6"/>
-<text x="400.0" y="310.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Suffix stream</text>
-<text x="400.0" y="338.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">(action-expert)</text>
-<text x="400.0" y="366.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">width = 720</text>
-<text x="400.0" y="394.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">fine-tuned, not LoRA</text>
-<rect x="680" y="185" width="110" height="110" fill="#EDEDED" stroke="#1A1A1A" stroke-width="1" rx="6"/>
-<text x="735.0" y="205.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">W_out</text>
-<text x="735.0" y="233.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Linear</text>
-<text x="735.0" y="261.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">720→32</text>
-<text x="735.0" y="289.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">v_t (base)</text>
-<rect x="820" y="60" width="160" height="170" fill="#D6E8F5" stroke="#0072B2" stroke-width="4" rx="6"/>
-<text x="900.0" y="96.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Stabilizer head</text>
-<text x="900.0" y="124.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">720→360</text>
-<text x="900.0" y="152.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">GELU</text>
-<text x="900.0" y="180.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">360→8</text>
-<text x="900.0" y="208.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">(zero-init)</text>
-<rect x="820" y="250" width="160" height="170" fill="#FBE6C7" stroke="#E69F00" stroke-width="4" rx="6"/>
-<text x="900.0" y="286.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Actuator head</text>
-<text x="900.0" y="314.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">720→360</text>
-<text x="900.0" y="342.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">GELU</text>
-<text x="900.0" y="370.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">360→8</text>
-<text x="900.0" y="398.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">(zero-init)</text>
-<rect x="1040" y="155" width="130" height="180" fill="#FFFFFF" stroke="#1A1A1A" stroke-width="4" rx="6"/>
-<text x="1105.0" y="210.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">ρ role→arm</text>
-<text x="1105.0" y="238.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">(config)</text>
-<text x="1105.0" y="266.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">left=Stab</text>
-<text x="1105.0" y="294.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">right=Act</text>
-<rect x="1220" y="10" width="190" height="565" fill="#FFFFFF" stroke="#1A1A1A" stroke-width="4" rx="6"/>
-<text x="1315.0" y="40.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Combine</text>
-<rect x="1230" y="55" width="170" height="160" fill="#D6E8F5" stroke="#0072B2" stroke-width="2" rx="6"/>
-<text x="1315.0" y="114.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">v_t[0:8]</text>
-<text x="1315.0" y="142.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">⊕ r_L</text>
-<text x="1315.0" y="170.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">→ left arm</text>
-<rect x="1230" y="225" width="170" height="160" fill="#FBE6C7" stroke="#E69F00" stroke-width="2" rx="6"/>
-<text x="1315.0" y="284.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">v_t[8:16]</text>
-<text x="1315.0" y="312.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">⊕ r_R</text>
-<text x="1315.0" y="340.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">→ right arm</text>
-<rect x="1230" y="395" width="170" height="160" fill="#EDEDED" stroke="#555555" stroke-width="1" stroke-dasharray="10,6" rx="6"/>
-<text x="1315.0" y="454.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">v_t[16:32]</text>
-<text x="1315.0" y="482.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">pass-through</text>
-<text x="1315.0" y="510.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">(unused dims)</text>
-<text x="1505.0" y="128.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Left arm</text>
-<text x="1505.0" y="156.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">action</text>
-<text x="1505.0" y="298.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Right arm</text>
-<text x="1505.0" y="326.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">action</text>
-<text x="1505.0" y="482.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">(discarded)</text>
-<polyline points="190,60 215,60 215,150 248,150" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
-<polyline points="190,150 215,150 215,150 248,150" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
-<polyline points="190,230 215,230 215,150 248,150" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
-<polyline points="190,385 215,385 215,355 248,355" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
-<polyline points="552,355 590,355 590,240 680,240" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
-<rect x="555.0" y="270.0" width="120.0" height="54" fill="#FFFFFF" opacity="0.85"/>
-<text x="615" y="290.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">suffix_out</text>
-<text x="615" y="316.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">(B×T×720)</text>
-<polyline points="552,355 590,355 590,145 820,145" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
-<polyline points="552,355 590,355 590,335 820,335" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
-<polyline points="790,240 790,18 1315.0,18 1315.0,10" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
-<rect x="862.0" y="-7.0" width="276.0" height="28" fill="#FFFFFF" opacity="0.85"/>
-<text x="1000" y="13.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">v_t (B×T×32) → all rows</text>
-<polyline points="980,145 1010,145 1010,210 1040,210" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
-<rect x="974.0" y="110.0" width="72.0" height="28" fill="#FFFFFF" opacity="0.85"/>
-<text x="1010" y="130.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">h_stab</text>
-<polyline points="980,335 1010,335 1010,290 1040,290" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
-<rect x="980.0" y="360.0" width="60.0" height="28" fill="#FFFFFF" opacity="0.85"/>
-<text x="1010" y="380.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">h_act</text>
-<polyline points="1170,220 1200,220 1200,135.0 1230,135.0" fill="none" stroke="#0072B2" stroke-width="2.2" marker-end="url(#arrowb)"/>
-<rect x="1182.0" y="155.0" width="36.0" height="28" fill="#FFFFFF" opacity="0.85"/>
-<text x="1200" y="175.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#0072B2" text-anchor="middle">r_L</text>
-<polyline points="1170,280 1200,280 1200,305.0 1230,305.0" fill="none" stroke="#E69F00" stroke-width="2.2" marker-end="url(#arrowo)"/>
-<rect x="1182.0" y="335.0" width="36.0" height="28" fill="#FFFFFF" opacity="0.85"/>
-<text x="1200" y="355.0" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#E69F00" text-anchor="middle">r_R</text>
-<polyline points="1400,135.0 1415.0,135.0 1415.0,135.0 1430,135.0" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
-<polyline points="1400,305.0 1415.0,305.0 1415.0,305.0 1430,305.0" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
-<polyline points="1400,475.0 1415.0,475.0 1415.0,475.0 1430,475.0" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
-<line x1="0" y1="570" x2="1610" y2="570" stroke="#CCCCCC" stroke-width="1.5"/>
-<rect x="20" y="585" width="24" height="18" fill="#0072B2"/>
-<text x="52" y="600" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A">Stabilizer path (left arm, default)</text>
-<rect x="430" y="585" width="24" height="18" fill="#E69F00"/>
-<text x="462" y="600" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A">Actuator path (right arm, default)</text>
-<rect x="850" y="585" width="24" height="18" fill="#555555"/>
-<text x="882" y="600" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A">Shared / base path (v_t, W_out)</text>
-<text x="20" y="640" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A">Bold border = new ARD module (trainable).</text>
-<text x="20" y="668" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A">Thin border = pre-existing SmolVLA module</text>
-<text x="20" y="696" font-size="20" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A">(VLM prefix frozen by default; action-expert suffix + W_out fully fine-tuned, not frozen/LoRA).</text>
+<rect x="20.0" y="370.0" width="1015.6" height="308.0" fill="#FFFFFF" stroke="#1A1A1A" stroke-width="1" rx="6"/>
+<text x="527.8" y="499.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Camera</text>
+<text x="527.8" y="645.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">image(s)</text>
+<rect x="20.0" y="700.0" width="1015.6" height="308.0" fill="#FFFFFF" stroke="#1A1A1A" stroke-width="1" rx="6"/>
+<text x="527.8" y="829.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Language</text>
+<text x="527.8" y="975.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">instruction</text>
+<rect x="20.0" y="1030.0" width="1015.6" height="308.0" fill="#FFFFFF" stroke="#1A1A1A" stroke-width="1" rx="6"/>
+<text x="527.8" y="1159.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Robot</text>
+<text x="527.8" y="1305.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">state</text>
+<rect x="20.0" y="1360.0" width="1015.6" height="308.0" fill="#FFFFFF" stroke="#1A1A1A" stroke-width="1" rx="6"/>
+<text x="527.8" y="1489.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Noisy action</text>
+<text x="527.8" y="1635.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">x_t, time t</text>
+<rect x="1389.4" y="814.0" width="684.4" height="308.0" fill="#EDEDED" stroke="#1A1A1A" stroke-width="1" rx="6"/>
+<text x="1731.6" y="962.0" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Prefix</text>
+<text x="1731.6" y="1108.0" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">(VLM)</text>
+<rect x="1389.4" y="1330.0" width="684.4" height="308.0" fill="#EDEDED" stroke="#1A1A1A" stroke-width="1" rx="6"/>
+<text x="1731.6" y="1478.0" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Suffix</text>
+<text x="1731.6" y="1624.0" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">(expert)</text>
+<rect x="1077.6" y="360.0" width="1308.0" height="1136.0" fill="none" stroke="#1A1A1A" stroke-width="1" rx="6"/>
+<text x="1731.6" y="508.0" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">SmolVLM2 +</text>
+<text x="1731.6" y="654.0" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Action-Expert</text>
+<text x="1731.6" y="800.0" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">(interleaved)</text>
+<rect x="3035.6" y="973.0" width="850.0" height="600.0" fill="#EDEDED" stroke="#1A1A1A" stroke-width="1" rx="6"/>
+<text x="3460.6" y="1102.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">W_out</text>
+<text x="3460.6" y="1248.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Linear</text>
+<text x="3460.6" y="1394.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">720→32</text>
+<text x="3460.6" y="1540.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">v_t (base)</text>
+<rect x="3927.6" y="370.0" width="850.0" height="892.0" fill="#D6E8F5" stroke="#0072B2" stroke-width="4" rx="6"/>
+<text x="4352.6" y="499.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Stabilizer</text>
+<text x="4352.6" y="645.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">head</text>
+<text x="4352.6" y="791.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">720→360</text>
+<text x="4352.6" y="937.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">GELU</text>
+<text x="4352.6" y="1083.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">360→8</text>
+<text x="4352.6" y="1229.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">(0-init)</text>
+<rect x="3927.6" y="1284.0" width="850.0" height="892.0" fill="#FBE6C7" stroke="#E69F00" stroke-width="4" rx="6"/>
+<text x="4352.6" y="1413.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Actuator</text>
+<text x="4352.6" y="1559.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">head</text>
+<text x="4352.6" y="1705.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">720→360</text>
+<text x="4352.6" y="1851.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">GELU</text>
+<text x="4352.6" y="1997.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">360→8</text>
+<text x="4352.6" y="2143.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">(0-init)</text>
+<rect x="5187.6" y="973.0" width="850.0" height="600.0" fill="#FFFFFF" stroke="#1A1A1A" stroke-width="4" rx="6"/>
+<text x="5612.6" y="1102.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">ρ role→arm</text>
+<text x="5612.6" y="1248.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">(config)</text>
+<text x="5612.6" y="1394.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">left=Stab</text>
+<text x="5612.6" y="1540.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">right=Act</text>
+<rect x="6281.6" y="370.0" width="850.0" height="454.0" fill="#D6E8F5" stroke="#0072B2" stroke-width="2" rx="6"/>
+<text x="6706.6" y="499.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">v_t[0:8]</text>
+<text x="6706.6" y="645.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">⊕ r_L</text>
+<text x="6706.6" y="791.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">→ left</text>
+<rect x="6281.6" y="846.0" width="850.0" height="454.0" fill="#FBE6C7" stroke="#E69F00" stroke-width="2" rx="6"/>
+<text x="6706.6" y="975.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">v_t[8:16]</text>
+<text x="6706.6" y="1121.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">⊕ r_R</text>
+<text x="6706.6" y="1267.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">→ right</text>
+<rect x="6281.6" y="1322.0" width="850.0" height="454.0" fill="#EDEDED" stroke="#555555" stroke-width="1" stroke-dasharray="10,6" rx="6"/>
+<text x="6706.6" y="1524.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">v_t[16:32]</text>
+<text x="6706.6" y="1670.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">unchanged</text>
+<rect x="6267.6" y="208.0" width="878.0" height="1568.0" fill="none" stroke="#1A1A1A" stroke-width="4" rx="6"/>
+<text x="6706.6" y="356.0" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">Combine</text>
+<text x="7529.8" y="572.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">v_t</text>
+<text x="7529.8" y="718.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">(left)</text>
+<text x="7529.8" y="1048.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">v_t</text>
+<text x="7529.8" y="1194.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">(right)</text>
+<text x="7529.8" y="1597.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">(unused)</text>
+<text x="8234.8" y="737.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">N-step</text>
+<text x="8234.8" y="883.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">denoise</text>
+<text x="8234.8" y="1029.3" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">→ chunk</text>
+<polyline points="1035.6,524.0 1056.6,524.0 1056.6,968.0 1389.3999999999999,968.0" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
+<polyline points="1035.6,854.0 1056.6,854.0 1056.6,968.0 1389.3999999999999,968.0" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
+<polyline points="1035.6,1184.0 1056.6,1184.0 1056.6,968.0 1389.3999999999999,968.0" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
+<polyline points="1035.6,1514.0 1056.6,1514.0 1056.6,1484.0 1389.3999999999999,1484.0" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
+<polyline points="1731.6,1122 1731.6,1122 1731.6,1330 1731.6,1330" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
+<rect x="1472.8" y="1088.0" width="1242.0" height="146" fill="#FFFFFF" opacity="0.85"/>
+<text x="2093.8" y="1226.0" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">cross-attention</text>
+<polyline points="2073.7999999999997,1484.0 2398.7999999999997,1484.0 2398.7999999999997,1273.0 3035.6,1273.0" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
+<rect x="1984.8" y="1491.8" width="828.0" height="146" fill="#FFFFFF" opacity="0.85"/>
+<text x="2398.8" y="1629.8" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">suffix_out</text>
+<polyline points="2073.7999999999997,1484.0 2398.7999999999997,1484.0 2398.7999999999997,816.0 3927.6,816.0" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
+<polyline points="2073.7999999999997,1484.0 2398.7999999999997,1484.0 2398.7999999999997,1730.0 3927.6,1730.0" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
+<polyline points="3885.6,1273.0 3885.6,20 6706.6,20 6706.6,208" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
+<rect x="4343.9" y="44.0" width="1904.4" height="146" fill="#FFFFFF" opacity="0.85"/>
+<text x="5296.1" y="182.0" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">v_t (B×T×32) → all rows</text>
+<polyline points="4777.6,816.0 4982.6,816.0 4982.6,1153.0 5187.6,1153.0" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
+<rect x="4734.2" y="668.0" width="496.8" height="146" fill="#FFFFFF" opacity="0.85"/>
+<text x="4982.6" y="806.0" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">h_stab</text>
+<polyline points="4777.6,1730.0 4982.6,1730.0 4982.6,1393.0 5187.6,1393.0" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
+<rect x="4775.6" y="1616.0" width="414.0" height="146" fill="#FFFFFF" opacity="0.85"/>
+<text x="4982.6" y="1754.0" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A" text-anchor="middle">h_act</text>
+<polyline points="6037.6,1153.0 6152.6,1153.0 6152.6,597.0 6281.6,597.0" fill="none" stroke="#0072B2" stroke-width="2.2" marker-end="url(#arrowb)"/>
+<rect x="6028.4" y="1005.0" width="248.4" height="146" fill="#FFFFFF" opacity="0.85"/>
+<text x="6152.6" y="1143.0" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#0072B2" text-anchor="middle">r_L</text>
+<polyline points="6037.6,1393.0 6152.6,1393.0 6152.6,1073.0 6281.6,1073.0" fill="none" stroke="#E69F00" stroke-width="2.2" marker-end="url(#arrowo)"/>
+<rect x="6028.4" y="1279.0" width="248.4" height="146" fill="#FFFFFF" opacity="0.85"/>
+<text x="6152.6" y="1417.0" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#E69F00" text-anchor="middle">r_R</text>
+<polyline points="7131.6,597.0 7152.6,597.0 7152.6,597.0 7187.6,597.0" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
+<polyline points="7131.6,1073.0 7152.6,1073.0 7152.6,1073.0 7187.6,1073.0" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
+<polyline points="7131.6,1549.0 7152.6,1549.0 7152.6,1549.0 7187.6,1549.0" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
+<polyline points="7872.0,597.0 7893.0,597.0 7893.0,835.0 7914.0,835.0" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
+<polyline points="7872.0,1073.0 7893.0,1073.0 7893.0,835.0 7914.0,835.0" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
+<polyline points="7914.0,835.0 7934.0,835.0" fill="none" stroke="#1A1A1A" stroke-width="2.2" marker-end="url(#arrow)"/>
+<line x1="0" y1="2212.0" x2="8556" y2="2212.0" stroke="#CCCCCC" stroke-width="1.5"/>
+<rect x="20.0" y="2226.0" width="156.0" height="156.0" fill="#0072B2"/>
+<text x="186.0" y="2350.8" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A">Stabilizer (left arm)</text>
+<rect x="1982.8" y="2226.0" width="156.0" height="156.0" fill="#E69F00"/>
+<text x="2148.8" y="2350.8" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A">Actuator (right arm)</text>
+<rect x="3862.8" y="2226.0" width="156.0" height="156.0" fill="#555555"/>
+<text x="4028.8" y="2350.8" font-size="138" font-family="Arial,Helvetica,sans-serif" fill="#1A1A1A">Shared / base (v_t, W_out)</text>
 </svg>
