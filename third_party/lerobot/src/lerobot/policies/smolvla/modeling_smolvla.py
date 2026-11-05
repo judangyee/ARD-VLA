@@ -70,8 +70,8 @@ from lerobot.policies.smolvla.ard import (
     AsymmetricResidualHeads,
     ForceHead,
     GradNormLambdas,
+    apply_ard_residual,
     apply_timestep_norm,
-    combine_by_role,
     compute_ard_losses,
     compute_symmetric_losses,
     compute_timestep_norm_sigma,
@@ -1245,17 +1245,8 @@ class VLAFlowMatching(nn.Module):
                 self.config.ard_default_actuator_arm, batch_size=v_t.shape[0], device=v_t.device
             )
 
-            stabilizer_residual, actuator_residual = self.ard_heads(suffix_out, bridge_kv_layers=bridge_kv_layers)
-            left_residual, right_residual = combine_by_role(
-                stabilizer_residual, actuator_residual, actuator_is_first
-            )
-            v_t = torch.cat(
-                [
-                    v_t[..., :arm_dim] + left_residual,
-                    v_t[..., arm_dim : 2 * arm_dim] + right_residual,
-                    v_t[..., 2 * arm_dim :],
-                ],
-                dim=-1,
+            v_t, _left_residual, _right_residual = apply_ard_residual(
+                v_t, suffix_out, self.ard_heads, arm_dim, actuator_is_first, bridge_kv_layers
             )
 
         # pos_loss_type="l2"(기본)는 기존과 완전히 동일한 MSE. "l1"/"smooth_l1"은 목표 근처에서
@@ -1760,20 +1751,11 @@ class VLAFlowMatching(nn.Module):
 
         if self.config.use_ard and actuator_is_first is not None:
             arm_dim = self.config.ard_arm_dim
-            stabilizer_residual, actuator_residual = self.ard_heads(suffix_out, bridge_kv_layers=bridge_kv_layers)
-            left_residual, right_residual = combine_by_role(
-                stabilizer_residual, actuator_residual, actuator_is_first
+            v_t, left_residual, right_residual = apply_ard_residual(
+                v_t, suffix_out, self.ard_heads, arm_dim, actuator_is_first, bridge_kv_layers
             )
             if role_split_sink is not None:
                 role_split_sink["left_residual"] = left_residual
                 role_split_sink["right_residual"] = right_residual
-            v_t = torch.cat(
-                [
-                    v_t[..., :arm_dim] + left_residual,
-                    v_t[..., arm_dim : 2 * arm_dim] + right_residual,
-                    v_t[..., 2 * arm_dim :],
-                ],
-                dim=-1,
-            )
 
         return v_t

@@ -484,3 +484,136 @@ def test_reset_rebuilds_lac_filter_state(build_tiny_policy, build_tiny_batch):
     policy.reset()
     assert policy._lac is not None
     assert policy._lac._q_prev_j is None
+
+
+# --- apply_ard_residual 공유화(학습 forward / denoise_step 중복 제거) 이후의 등가성 검증.
+# 공유 함수 자체의 단위 테스트는 tests/test_ard.py::test_apply_ard_residual_matches_manual_combine.
+
+
+def test_train_forward_and_denoise_step_agree_on_v_t(build_tiny_policy, build_tiny_batch):
+    """학습 forward 경로(prefix+suffix 조인트 attention, KV 캐시 없음)와 추론 denoise_step
+    경로(prefix KV 캐시 + suffix만 재계산)는, apply_ard_residual()을 공유하긴 하지만 그
+    입력인 suffix_out을 얻는 attention 계산 자체는 서로 다른 코드 경로다. 같은 x_t/time을
+    주면 두 경로가 같은 v_t를 내야 한다(KV 캐시는 수학적으로 정확한 재구성이어야 하므로) —
+    이걸 직접 확인한다. fp32 CPU 연산이라 완전한 bit-exact는 기대하지 않고, 1e-4(절대오차)
+    이내를 허용오차로 둔다."""
+    from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
+
+    arm_dim = 4
+    policy = build_tiny_policy(arm_dim=arm_dim, ard_arm_dim=arm_dim, use_ard=True, num_steps=2, chunk_size=6)
+    policy.eval()
+    batch = build_tiny_batch(batch_size=2, arm_dim=arm_dim, chunk=6, lang_len=6)
+
+    images, img_masks = policy.prepare_images(dict(batch))
+    state = policy.prepare_state(dict(batch))
+    lang_tokens = batch[OBS_LANGUAGE_TOKENS]
+    lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
+    actions = policy.prepare_action(dict(batch))
+
+    torch.manual_seed(0)
+    noise = policy.model.sample_noise(actions.shape, actions.device)
+    time = torch.full((actions.shape[0],), 0.37, dtype=torch.float32)  # 임의의 고정 중간 timestep
+
+    # ---- Path A: 학습 forward가 실제로 쓰는 조인트 attention 경로 (production 코드, 그대로 호출) ----
+    with torch.no_grad():
+        _losses, ard_extras = policy.model.forward(
+            images, img_masks, lang_tokens, lang_masks, state, actions, noise=noise, time=time
+        )
+    suffix_out_train = ard_extras["shared_activation"]
+    actuator_is_first = ard_extras["actuator_is_first"]
+    v_t_train, _, _ = apply_ard_residual_ref(
+        policy.model.action_out_proj(suffix_out_train), suffix_out_train, policy.model.ard_heads,
+        arm_dim, actuator_is_first,
+    )
+
+    # ---- Path B: denoise_step이 쓰는 prefix-KV-캐시 경로. sample_actions()가 prefix 캐시를
+    # 만드는 것과 정확히 같은 방식으로 직접 구성한다(modeling_smolvla.py의 sample_actions 참고).
+    from lerobot.policies.smolvla.modeling_smolvla import make_att_2d_masks
+
+    prefix_embs, prefix_pad_masks, prefix_att_masks = policy.model.embed_prefix(
+        images, img_masks, lang_tokens, lang_masks, state=state
+    )
+    prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+    prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+    with torch.no_grad():
+        _, past_key_values = policy.model.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks, position_ids=prefix_position_ids, past_key_values=None,
+            inputs_embeds=[prefix_embs, None], use_cache=policy.config.use_cache, fill_kv_cache=True,
+        )
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        v_t_denoise = policy.model.denoise_step(
+            prefix_pad_masks=prefix_pad_masks, past_key_values=past_key_values, x_t=x_t, timestep=time,
+            actuator_is_first=actuator_is_first,
+        )
+
+    diff = (v_t_train - v_t_denoise).abs()
+    assert torch.isfinite(diff).all()
+    assert diff.max().item() < 1e-4, (
+        f"학습 forward와 denoise_step의 v_t가 1e-4를 넘게 갈린다(max_abs_diff={diff.max().item():.3e}) — "
+        "조인트 attention과 KV 캐시 경로가 실제로 다른 결과를 낸다는 뜻이라 원인 분석이 필요하다."
+    )
+
+
+def apply_ard_residual_ref(v_t, suffix_out, ard_heads, arm_dim, actuator_is_first):
+    """apply_ard_residual()을 그대로 재노출 — 테스트 파일 상단에서 매번 import 블록을
+    늘리지 않으려고 지연 import로 감싼다(이 파일의 다른 테스트들과 같은 지연-import 관례)."""
+    from lerobot.policies.smolvla.ard import apply_ard_residual
+
+    return apply_ard_residual(v_t, suffix_out, ard_heads, arm_dim, actuator_is_first)
+
+
+def test_ard_off_sample_actions_matches_manual_action_out_proj_only_denoise(build_tiny_policy, build_tiny_batch):
+    """use_ard=False면 ard_heads 자체가 없다(apply_ard_residual이 아예 호출되지 않는다) —
+    sample_actions()의 출력이, denoise 루프를 "action_out_proj만"(ARD 없이) 수동으로 직접
+    적분한 결과와 bit-for-bit 동일한지 확인한다. 즉 ARD를 껐을 때 "원래(ARD 도입 전) SmolVLA"와
+    동일한 숫자가 나오는지에 대한 회귀 테스트."""
+    from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
+
+    arm_dim = 4
+    policy = build_tiny_policy(arm_dim=arm_dim, use_ard=False, num_steps=3, chunk_size=6)
+    policy.eval()
+    assert policy.model.ard_heads is None
+
+    batch = build_tiny_batch(batch_size=2, arm_dim=arm_dim, chunk=6, lang_len=6)
+    images, img_masks = policy.prepare_images(dict(batch))
+    state = policy.prepare_state(dict(batch))
+    lang_tokens = batch[OBS_LANGUAGE_TOKENS]
+    lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
+
+    torch.manual_seed(0)
+    actions_shape = (2, policy.config.chunk_size, policy.config.max_action_dim)
+    noise = policy.model.sample_noise(actions_shape, torch.device("cpu"))
+
+    with torch.no_grad():
+        x_t_policy = policy.model.sample_actions(images, img_masks, lang_tokens, lang_masks, state, noise=noise.clone())
+
+    # 수동 재적분: action_out_proj(suffix_out)만 쓰고 ARD는 아예 참조하지 않는다.
+    from lerobot.policies.smolvla.modeling_smolvla import make_att_2d_masks
+
+    prefix_embs, prefix_pad_masks, prefix_att_masks = policy.model.embed_prefix(
+        images, img_masks, lang_tokens, lang_masks, state=state
+    )
+    prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+    prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+    with torch.no_grad():
+        _, past_key_values = policy.model.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks, position_ids=prefix_position_ids, past_key_values=None,
+            inputs_embeds=[prefix_embs, None], use_cache=policy.config.use_cache, fill_kv_cache=True,
+        )
+        num_steps = policy.config.num_steps
+        dt = -1.0 / num_steps
+        x_t_manual = noise.clone()
+        for step in range(num_steps):
+            time = 1.0 + step * dt
+            time_tensor = torch.tensor(time, dtype=torch.float32).expand(x_t_manual.shape[0])
+            v_t = policy.model.denoise_step(
+                prefix_pad_masks=prefix_pad_masks, past_key_values=past_key_values, x_t=x_t_manual,
+                timestep=time_tensor, actuator_is_first=None,
+            )
+            x_t_manual = x_t_manual + dt * v_t
+
+    assert torch.allclose(x_t_policy, x_t_manual, atol=1e-5), (
+        "use_ard=False일 때 sample_actions()가 action_out_proj-only 수동 재적분과 달라졌다 — "
+        "ARD 리팩터가 use_ard=False 경로에 영향을 주면 안 된다."
+    )

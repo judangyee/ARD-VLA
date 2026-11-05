@@ -21,6 +21,7 @@ from lerobot.policies.smolvla.ard import (
     BridgeAttention,
     ForceHead,
     GradNormLambdas,
+    apply_ard_residual,
     combine_by_role,
     compute_ard_losses,
     compute_symmetric_losses,
@@ -1153,3 +1154,43 @@ def test_gradnorm_force_head_connection():
         "force_loss의 shared_activation(suffix_out)에 대한 그래디언트가 0이 아니다 (ForceHead가 suffix_out과 연결되어 있음)",
         force_grad is not None and force_grad.abs().sum().item() > 0,
     )
+
+
+def test_apply_ard_residual_matches_manual_combine():
+    """apply_ard_residual()이 학습 forward/denoise_step에 있던 기존 인라인 코드(ard_heads 호출
+    -> combine_by_role -> v_t의 선두 2*arm_dim 채널에 role별로 더하기)와 정확히 같은 결과를
+    내는지, 그 인라인 계산을 이 테스트에서 직접 재현해 비교한다 — 모델링 레이어 공유 함수로
+    옮긴 뒤에도(modeling_smolvla.py의 두 호출부) 숫자가 안 바뀌었는지 확인하는 단위 테스트."""
+    torch.manual_seed(0)
+    batch, chunk, arm_dim, hidden = 3, 5, 4, 16
+    heads = AsymmetricResidualHeads(expert_hidden_size=hidden, arm_dim=arm_dim)
+    # 0-init 상태로는 잔차가 항상 0이라 "더하기가 진짜 적용됐는지"를 가릴 수 있으므로,
+    # 마지막 레이어를 비-0으로 다시 초기화해서 의미 있는 잔차가 나오게 한다.
+    torch.nn.init.normal_(heads.stabilizer_head[-1].weight, std=0.1)
+    torch.nn.init.normal_(heads.stabilizer_head[-1].bias, std=0.1)
+    torch.nn.init.normal_(heads.actuator_head[-1].weight, std=0.1)
+    torch.nn.init.normal_(heads.actuator_head[-1].bias, std=0.1)
+
+    suffix_out = torch.randn(batch, chunk, hidden)
+    v_t = torch.randn(batch, chunk, 2 * arm_dim + 3)  # +3: 더해지면 안 되는 패딩 채널 흉내
+    actuator_is_first = torch.tensor([True, False, True])
+
+    v_t_out, left_residual, right_residual = apply_ard_residual(
+        v_t, suffix_out, heads, arm_dim, actuator_is_first
+    )
+
+    stabilizer_residual, actuator_residual = heads(suffix_out)
+    expected_left, expected_right = combine_by_role(stabilizer_residual, actuator_residual, actuator_is_first)
+    expected_v_t = torch.cat(
+        [v_t[..., :arm_dim] + expected_left, v_t[..., arm_dim : 2 * arm_dim] + expected_right, v_t[..., 2 * arm_dim :]],
+        dim=-1,
+    )
+
+    check("apply_ard_residual의 left_residual이 수동 combine_by_role과 일치한다", torch.equal(left_residual, expected_left))
+    check("apply_ard_residual의 right_residual이 수동 combine_by_role과 일치한다", torch.equal(right_residual, expected_right))
+    check("apply_ard_residual의 v_t가 수동 계산과 일치한다", torch.equal(v_t_out, expected_v_t))
+    check(
+        "뒤쪽 패딩 채널(2*arm_dim 이후)은 그대로 통과한다(변형 없음)",
+        torch.equal(v_t_out[..., 2 * arm_dim :], v_t[..., 2 * arm_dim :]),
+    )
+    check("잔차가 실제로 0이 아니다(테스트가 trivial하게 통과하는 게 아님을 확인)", left_residual.abs().sum().item() > 0)

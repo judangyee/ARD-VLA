@@ -94,7 +94,9 @@ pos_loss_type: l1
 # 공개 스펙 기준(시연 200개, 10fps)으로 조립처럼 긴 호흡의 작업에 맞춘 값 — 매 회차 과제가
 # 바뀌면 재튜닝이 필요한 숫자라 프리셋에 명시적으로 박아둔다.
 chunk_size: 20
-n_action_steps: 5  # chunk_size보다 짧게 둬서 매 5스텝마다 재계획(replan) — 폐루프 피드백 반영 빈도
+n_action_steps: 5  # chunk_size보다 짧게 둬서 매 5스텝마다 재계획(replan) — 폐루프 피드백 반영 빈도.
+# run_closed_loop()(closed_loop.py의 "재계획 간격" 절 참고)와 select_action() 둘 다 이 값을
+# 재계획/큐 길이로 실제로 쓴다 — 설정만 해두고 코드가 참조 안 하는 값이 아니다.
 
 # LeHome 우승 보고서(arXiv 2606.27163)식 "먼 미래일수록 분산이 커진다"는 가정을 켠다 —
 # a/s는 아직 실제 데이터로 피팅 못해 항등값(위 상단 주석 참고).

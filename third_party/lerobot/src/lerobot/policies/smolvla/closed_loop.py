@@ -38,7 +38,8 @@ RECOVER 결정을 실제로 실행할 수 있다.
 매 iteration은 `predict_action_chunk_with_decisions()`를 **정확히 한 번** 부른다(로그의
 `forward_calls`가 항상 1인 이유) — 그래서 "경계"를 넘는 데 몇 번의 forward가 쓰이는지는
 iteration 수로 환산된다:
-- 서브태스크 진행 중(청크 경계, 판정 없음): 청크당 1회.
+- 서브태스크 진행 중(재계획 경계, 판정 없음): **`config.n_action_steps`만큼 실행할 때마다 1회**
+  (아래 "재계획 간격" 참고 — 과거엔 전체 chunk를 다 쓸 때까지 1회였다).
 - RETRY(같은 지시문으로 재시도): 이번 forward의 `actions`를 그대로 재사용 — 추가 forward 없음
   (경계당 1회, 판정 iteration과 재시도 실행 iteration이 같다).
 - ADVANCE(다음 노드) 또는 RECOVER(복구 실행): 지시문/환경이 바뀌므로 다음 iteration에서 다시
@@ -47,6 +48,24 @@ iteration 수로 환산된다:
 `pre_chunk`/`per_step`은 미래 기능(사전 청크 검증/상시 Stabilizer 모니터링)을 위한 자리만
 만들어둔 콜백이다 — 기본 `None`이고, 실제 검증/모니터링 로직은 이번 작업 범위 밖이라 구현하지
 않는다(호출부만 있다).
+
+## 재계획 간격: `config.n_action_steps`
+
+매 iteration이 새로 계산한 청크(`chunk_size`개 스텝)를 **전부** 실행하고 나서야 다음 iteration이
+다시 관측+forward하면, `n_action_steps`가 `chunk_size`보다 작아도(예: RoCo 프리셋
+`chunk_size=20`/`n_action_steps=5`) 매 20스텝에 한 번만 재계획하게 된다 — 폐루프 피드백을
+의도한 빈도로 반영하지 못한다. 그래서 `run_closed_loop`의 실행 단계는 매 iteration마다 최대
+`policy.config.n_action_steps`스텝만 실행하고(그보다 청크가 먼저 끝나거나
+`env.subtask_finished()`가 먼저 True가 되면 그쪽이 우선), 다음 iteration에서 새로
+`env.observe()`+forward를 한다. `select_action()`의 내부 큐(`modeling_smolvla.py`의
+`_queues[ACTION]`, `n_action_steps`만큼만 채움)와 같은 간격 개념을 폐루프 러너에도 그대로
+맞춘 것이다.
+
+`max_subtask_steps`는 **독립적인 다른 상한**이다 — "이 서브태스크 전체(여러 번의 재계획에
+걸쳐)에 쓸 수 있는 총 스텝 예산"이고, `n_action_steps`는 "재계획 한 번에 몇 스텝을 쓸지"다. 두
+값을 `min()`으로 같이 적용한다 — 서브태스크 예산이 `n_action_steps`보다 적게 남았으면 그
+남은 만큼만 실행하고, 그렇지 않으면 `n_action_steps`만큼 실행한다. `max_subtask_steps=None`
+(기본값)이어도 `n_action_steps` 상한은 항상 적용된다.
 
 ## LAC(ARD-VLA 2.0) — 실제 실행 스텝마다, 리셋 규칙과 함께
 
@@ -244,11 +263,16 @@ def run_closed_loop(
             pre_chunk(actions, decisions, state)
         exec_actions = postprocessor(actions) if postprocessor is not None else actions
 
-        remaining_budget = None
+        # config.n_action_steps는 재계획 간격이다 — 매 iteration이 새로 계획한 청크(chunk_size)
+        # 전체를 실행하는 대신, 그중 n_action_steps만큼만 실행하고 다음 iteration에서 새로
+        # 관측+forward한다(청크가 먼저 끝나면 그만큼만). max_subtask_steps는 독립적인 "서브태스크
+        # 전체 예산"이라 두 상한을 min()으로 같이 적용한다 — 어느 쪽이든 먼저 닿으면 멈춘다.
+        step_cap = policy.config.n_action_steps
         if max_subtask_steps is not None:
             remaining_budget = max(max_subtask_steps - subtask_step_count, 0)
+            step_cap = min(step_cap, remaining_budget)
         steps_run, finished_by_env = _execute_chunk(
-            policy, env, exec_actions, role_split, per_step, state, remaining_budget
+            policy, env, exec_actions, role_split, per_step, state, step_cap
         )
         subtask_step_count += steps_run
 

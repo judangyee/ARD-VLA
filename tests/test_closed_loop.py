@@ -356,3 +356,30 @@ def test_closed_loop_subtask_step_budget_exceeded_triggers_judgment(build_tiny_p
     assert env.execute_count == 2  # 예산(2) 정확히 소진된 뒤 멈춤
     assert env.settled == 1
     assert log["termination_reason"] == "task_graph_end"
+
+
+def test_closed_loop_replans_every_n_action_steps(build_tiny_policy, monkeypatch):
+    """n_action_steps(재계획 간격)가 chunk_size보다 작으면, run_closed_loop은 매 iteration마다
+    새로 계획한 청크 전체(chunk_size)가 아니라 n_action_steps만큼만 실행하고 다음 iteration에서
+    새로 forward해야 한다(closed_loop.py의 "재계획 간격" 절 참고) — RoCo 프리셋
+    (chunk_size=20/n_action_steps=5)이 실제로 기대하는 동작."""
+    policy = build_tiny_policy(use_judge=True, num_steps=2, chunk_size=10, n_action_steps=3)
+    policy.eval()
+    assert policy.config.n_action_steps == 3
+    assert policy.config.chunk_size == 10
+
+    # 매번 10스텝짜리 청크를 반환한다 -- n_action_steps(3)보다 훨씬 길다.
+    stub, call_count = _make_stub(default_prob=0.95, action_shape=(1, 10, 1))
+    monkeypatch.setattr(policy, "predict_action_chunk_with_decisions", stub)
+
+    decision_logic = DecisionLogic(task_graph=SINGLE_NODE_GRAPH, tau_success=0.7, tau_fail=0.3)
+    env = FakeEnv(finish_after=None)  # 환경이 스스로 안 끝나게 해서 순수 재계획 간격만 확인
+
+    run_closed_loop(
+        policy, env, decision_logic, goal="g", start_node="only", max_iterations=4,
+    )
+
+    # iteration마다: forward 1회 + env.execute() n_action_steps(3)회 -- 청크 전체(10)가 아니다.
+    assert call_count["n"] == 4
+    assert env.execute_count == 4 * 3
+    assert env.settled == 0  # subtask_finished()도 max_subtask_steps도 없으니 settle은 안 불림

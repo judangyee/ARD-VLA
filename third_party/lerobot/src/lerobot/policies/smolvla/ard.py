@@ -293,6 +293,37 @@ def combine_by_role(stabilizer: Tensor, actuator: Tensor, actuator_is_first: Ten
     return left, right
 
 
+def apply_ard_residual(
+    v_t: Tensor,
+    suffix_out: Tensor,
+    ard_heads: "AsymmetricResidualHeads",
+    arm_dim: int,
+    actuator_is_first: Tensor,
+    bridge_kv_layers: list[Tensor] | None = None,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """`v_t`(`action_out_proj` 출력)의 선두 `2*arm_dim` 채널에 ARD 잔차를 더한다.
+
+    학습 forward(`VLAFlowMatching.forward`)와 추론 `denoise_step`이 이 함수를 공유한다 —
+    이전에는 두 곳에 완전히 같은 코드가 따로 복붙돼 있었다(수정 시 한쪽만 고치고 다른 쪽을
+    잊으면 학습/추론이 조용히 갈라질 위험이 있었다). 두 호출부 모두 `use_ard=True`일 때만
+    호출하며(그 바깥 분기는 그대로 각자 유지), 이 함수 자체는 그 조건을 검사하지 않는다.
+
+    반환: (잔차가 더해진 v_t, left_residual, right_residual). `left_residual`/`right_residual`은
+    `denoise_step`이 LAC용 `role_split_sink`에 채워 넣을 때만 쓰고, 학습 forward는 무시해도
+    된다 — 둘 다 `v_t`에는 이미 반영돼 있다."""
+    stabilizer_residual, actuator_residual = ard_heads(suffix_out, bridge_kv_layers=bridge_kv_layers)
+    left_residual, right_residual = combine_by_role(stabilizer_residual, actuator_residual, actuator_is_first)
+    v_t = torch.cat(
+        [
+            v_t[..., :arm_dim] + left_residual,
+            v_t[..., arm_dim : 2 * arm_dim] + right_residual,
+            v_t[..., 2 * arm_dim :],
+        ],
+        dim=-1,
+    )
+    return v_t, left_residual, right_residual
+
+
 class GradNormLambdas(nn.Module):
     """GradNorm(Chen et al., 2018)으로 lambda_smooth/force/traj를 학습 중에 자동 조정한다.
 

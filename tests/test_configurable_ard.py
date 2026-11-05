@@ -810,3 +810,101 @@ def test_roco_preset_tiny_model_trains_and_infers(build_tiny_policy, build_tiny_
     # angle_unwrap_dims를 설정하지 않았으니(프리셋 off) 액션이 변형(unwrap/rewrap)되지 않는다
     # — 이 자체는 모델 출력이라 직접 비교할 수 없지만, 설정값이 정말 비어 있는지는 확인한다.
     assert policy.config.angle_unwrap_dims is None
+
+
+def _build_offline_tokenizer(vocab_extra: dict[str, int] | None = None):
+    """네트워크 없이 로컬에서 즉석으로 만드는 작은 WordLevel 토크나이저 — `tokenizers`
+    라이브러리(순수 로컬 연산, Hub 접근 없음)로 짓고 `transformers.PreTrainedTokenizerFast`로
+    감싼다. `AutoTokenizer.from_pretrained`가 실제로 호출됐을 때와 같은 인터페이스
+    (`__call__(text, padding=..., truncation=..., max_length=..., return_tensors="pt")` ->
+    `{"input_ids": ..., "attention_mask": ...}`)를 제공한다."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    vocab = {
+        "[UNK]": 0, "[PAD]": 1, "insert": 2, "the": 3, "bolt": 4, "into": 5, "board": 6,
+        "pick": 7, "up": 8, "part": 9, "twist": 10, "cap": 11, "place": 12,
+    }
+    vocab.update(vocab_extra or {})
+    tok = Tokenizer(WordLevel(vocab=vocab, unk_token="[UNK]"))
+    tok.pre_tokenizer = Whitespace()
+    return PreTrainedTokenizerFast(tokenizer_object=tok, unk_token="[UNK]", pad_token="[PAD]")
+
+
+def test_make_smolvla_pre_post_processors_runs_with_offline_tokenizer(monkeypatch):
+    """`make_smolvla_pre_post_processors()`가 실제로 쓰이는 걸 처음부터 끝까지 확인한다 —
+    기존 `test_angle_unwrap_dims_inserted_into_pipeline_only_when_set`은
+    `AutoTokenizer.from_pretrained`를 호출하면 바로 깨지는 더미 `object()`로 몽키패치해서
+    파이프라인을 "만들기만" 했지, 실제 `preprocessor(batch)` 호출(텍스트 토큰화 포함)은 한
+    번도 안 했다(model_completion_audit.md 5절 참고). 이 테스트는 네트워크 없이 로컬에서
+    실제로 동작하는 토크나이저를 주입해서 `preprocessor(batch)`를 실제 task 문자열로 호출까지
+    끝까지 통과시킨다."""
+    import transformers
+
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+    from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors
+    from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+
+    offline_tokenizer = _build_offline_tokenizer()
+    monkeypatch.setattr(
+        transformers.AutoTokenizer, "from_pretrained", staticmethod(lambda *a, **k: offline_tokenizer)
+    )
+
+    config = SmolVLAConfig(
+        input_features={OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(16,))},
+        output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(16,))},
+        max_state_dim=16, max_action_dim=16, device="cpu",
+    )
+    preprocessor, _postprocessor = make_smolvla_pre_post_processors(config)
+
+    raw_obs = {OBS_STATE: torch.randn(16), "task": "insert the bolt into the board"}
+    processed = preprocessor(raw_obs)
+
+    assert OBS_LANGUAGE_TOKENS in processed
+    assert OBS_LANGUAGE_ATTENTION_MASK in processed
+    tokens = processed[OBS_LANGUAGE_TOKENS]
+    mask = processed[OBS_LANGUAGE_ATTENTION_MASK]
+    assert tokens.shape == mask.shape
+    assert tokens.ndim == 2 and tokens.shape[0] == 1  # AddBatchDimensionProcessorStep이 배치 차원 추가
+    # 더미 object()로는 절대 확인할 수 없던 것: 실제로 토큰화됐는지, 그리고 그 결과가 vocab과
+    # 맞는지(순서대로 insert/the/bolt/into/the/board -> 2,3,4,5,3,6, 그 뒤는 패딩).
+    expected_prefix = torch.tensor([2, 3, 4, 5, 3, 6])
+    assert torch.equal(tokens[0, : len(expected_prefix)], expected_prefix)
+    assert mask[0, : len(expected_prefix)].all()
+    assert processed[OBS_STATE].shape == (1, 16)  # 패딩 없이 그대로(16==max_state_dim)
+
+
+def test_make_smolvla_pre_post_processors_offline_tokenizer_with_roco_preset(monkeypatch):
+    """위 테스트를 RoCo 프리셋(state_select=30채널, action_space="ee" 등) 그대로 돌려본다 —
+    실제 토큰화 + RoCo 전처리 설정이 동시에 걸렸을 때도 안 깨지는지."""
+    import transformers
+    import yaml
+
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+    from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors
+    from lerobot.utils.constants import ACTION, OBS_LANGUAGE_TOKENS, OBS_STATE
+
+    offline_tokenizer = _build_offline_tokenizer()
+    monkeypatch.setattr(
+        transformers.AutoTokenizer, "from_pretrained", staticmethod(lambda *a, **k: offline_tokenizer)
+    )
+
+    overrides = yaml.safe_load(ROCO_PRESET_PATH.read_text())
+    config = SmolVLAConfig(
+        input_features={OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(44,))},
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(14,))},
+        max_action_dim=14, device="cpu", **overrides,
+    )
+    preprocessor, _postprocessor = make_smolvla_pre_post_processors(config)
+
+    raw_obs = {OBS_STATE: torch.randn(44), "task": "pick up the part"}
+    processed = preprocessor(raw_obs)
+
+    assert OBS_LANGUAGE_TOKENS in processed
+    assert processed[OBS_STATE].shape == (1, 44)  # state_select는 정책 prepare_state() 안에서
+    # 적용된다(processor_smolvla.py가 아니라 modeling_smolvla.py) -- 전처리 파이프라인
+    # 자체는 raw 44차원을 그대로 통과시킨다. docs/model_completion_audit.md 2.2절/5절 참고.
