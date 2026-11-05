@@ -250,3 +250,70 @@ def test_closed_loop_lac_applied_exactly_once_per_step(build_tiny_policy, monkey
 
     assert torch.equal(env.executed[0], expected_step1[0])
     assert torch.equal(env.executed[1], expected_step2[0])
+
+
+def test_closed_loop_lac_state_persists_across_iterations_within_same_subtask(build_tiny_policy, monkeypatch):
+    """`config.n_action_steps`로 재계획 간격이 청크보다 짧아져서(여기서는 1) 같은 서브태스크
+    안에서 여러 iteration/forward가 걸쳐도, LAC(EMA) 상태가 iteration 사이에 끊기지 않고
+    이어지는지 — 그리고 리셋은 서브태스크 전환에서만 일어나는지. `lac.py`의 `first_step`
+    분기(상태가 없으면 q̃=q, 필터링 없이 그대로 통과 — lac.py:198-211/230-231)를 "리셋 여부"의
+    직접적인 증거로 쓴다: 상태가 안 끊겼다면 2번째 스텝부터는 raw q와 달라야 하고(EMA 블렌딩),
+    리셋이 일어난 바로 다음 스텝은 다시 raw q와 정확히 같아야 한다."""
+    arm_dim = 2
+    policy = build_tiny_policy(
+        use_judge=True, use_ard=True, ard_arm_dim=arm_dim, ard_gripper_dim=0, arm_dim=arm_dim,
+        num_steps=2, lac_mode="covla", n_action_steps=1,
+    )
+    policy.eval()
+
+    shared = torch.tensor([[1.0, 0.0]])
+    residuals = [torch.tensor([[0.0, 0.1]]), torch.tensor([[0.0, 0.2]]), torch.tensor([[0.0, 0.3]])]
+    raw_qs = [
+        torch.tensor([[5.0, 5.0, 5.0, 5.0]]),
+        torch.tensor([[7.0, 7.0, 7.0, 7.0]]),
+        torch.tensor([[9.0, 9.0, 9.0, 9.0]]),
+    ]
+    call_count = {"n": 0}
+
+    def stub(batch, selector_mask=None, **kwargs):
+        i = min(call_count["n"], len(raw_qs) - 1)
+        call_count["n"] += 1
+        role_split = {
+            "shared_left": shared.unsqueeze(1), "shared_right": shared.unsqueeze(1),
+            "residual_left": residuals[i].unsqueeze(1), "residual_right": residuals[i].unsqueeze(1),
+        }
+        # n_action_steps=1이라 chunk_size=1짜리 청크를 매번 새로 계획하는 것처럼 준다.
+        return raw_qs[i].unsqueeze(1), {"success_prob": torch.tensor([0.95]), "_lac_role_split": role_split}
+
+    monkeypatch.setattr(policy, "predict_action_chunk_with_decisions", stub)
+
+    # finish_after=3: pick이 3번째 execute()에서 끝난다 -> iter0~2는 판정 없이 pick을 계속
+    # 실행(매 iteration마다 forward, n_action_steps=1 재계획 확인), iter3에서 판정=SUCCESS
+    # ->ADVANCE to place(reset "subtask", 이번 iteration엔 실행 없음), iter4에서 place의
+    # 1차 시도를 forward+실행(리셋 직후라 first_step).
+    env = FakeEnv(finish_after=3)
+    decision_logic = DecisionLogic(task_graph=TWO_NODE_GRAPH, tau_success=0.7, tau_fail=0.3)
+    log = run_closed_loop(
+        policy, env, decision_logic, goal="g", start_node="pick", max_iterations=5, log_lac_events=True,
+    )
+
+    assert call_count["n"] == 5  # 매 iteration마다 새로 forward했다(큐에서 그냥 꺼낸 게 아니라)
+    assert len(env.executed) == 4
+
+    # 리셋이 전혀 없었다면 pick의 2/3번째 스텝도 raw q와 그대로 같을 것이다 — 블렌딩됐다는 건
+    # 직전 iteration의 LAC 상태가 이어졌다는 뜻.
+    assert not torch.equal(env.executed[1], raw_qs[1][0])
+    assert not torch.equal(env.executed[2], raw_qs[2][0])
+    # 서브태스크 전환(reset) 직후의 첫 스텝은 다시 first_step이라 raw q와 정확히 같아야 한다.
+    assert torch.equal(env.executed[3], raw_qs[2][0])
+
+    reference_lac = LatentAwareController(LACConfig(role_aware=False), joint_dim=2, gripper_dim=0)
+    expected = [
+        reference_lac.step(shared, shared, residuals[i], residuals[i], raw_qs[i], stabilizer_is_left=True)[0]
+        for i in range(3)
+    ]
+    for i in range(3):
+        assert torch.equal(env.executed[i], expected[i][0])
+
+    reasons = [(r["iteration"], r["reason"]) for r in log["lac_resets"]]
+    assert reasons == [(-1, "episode"), (3, "subtask")]
