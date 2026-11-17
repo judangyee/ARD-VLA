@@ -1504,3 +1504,128 @@ grep으로 직접 확인(코드 사실).
 - Colab에서 `--smoke` 1회 실행 → `video_backend` 단계 결과를 가장 먼저 확인.
 - 실제 데이터셋을 처음 받으면 `schema_check`가 던지는 에러(있다면) 그대로 보고 이름
   규칙을 수정.
+
+---
+
+# 모델 완성도 감사 (학습 제외) (branch: configurable-ard, 후속)
+
+학습(실제 데이터로 돌리는 학습 실행)은 범위 밖으로 두고, `configurable-ard` 브랜치의
+코드/테스트/브랜치 상태만 감사해달라는 요청. 모든 서술에 `파일:줄번호` 인용 또는 직접
+실행 결과만 쓰고, 추측이 필요한 지점은 전부 "미확인"으로 표시했다
+(`docs/model_completion_audit.md`, 신규).
+
+핵심 발견:
+- ARD head 출력을 `action_out_proj` 출력에 더하는 "잔차 결합" 로직이 학습
+  `VLAFlowMatching.forward()`와 추론 `denoise_step()` 두 곳에 똑같이 복붙돼 있었다
+  (동작은 맞지만 중복).
+- role 배정은 전부 설정(config) 기반이고, 언어 지시 기반 role classifier는 실제로
+  존재하지 않는다.
+- `main`/`closed-loop-structure`/`lac-inference`/`lac-closed-loop`/`configurable-ard`
+  다섯 브랜치가 머지 충돌 없는 하나의 선형 조상 체인을 이룬다(브랜치 지도로 확인).
+- 기능/테스트 커버리지 표.
+- RoCo 프리셋 + tiny 합성 백본으로 "관측→전처리→forward→loss→select_action→폐루프
+  러너" 전체를 실제로 끝까지 돌려봤고, 그 과정에서 실제 결함 두 가지를 발견: (1)
+  `make_smolvla_pre_post_processors()`가 오프라인(네트워크 없는) 토크나이저를 주입할
+  경로가 없어서 실제 토큰화가 end-to-end로 테스트된 적이 없었다, (2)
+  `config.n_action_steps`가 `closed_loop.py`의 실행 길이 어디에도 안 쓰이고 있었다
+  (RoCo 프리셋의 "n_action_steps마다 재계획" 주석이 무시되고 있었음).
+- RoCo 평가 인터페이스 초안, 우선순위가 매겨진 남은 작업 목록, 논문 제목-구현
+  어긋남 점검(비교할 논문 초고 자체가 레포에 없음).
+
+코드 변경 없음(순수 조사+문서, push 안 함). 이 감사의 "남은 작업 목록"이 바로 다음
+섹션의 5개 항목이 됐다.
+
+---
+
+# 감사에서 나온 남은 작업 5건 처리 (branch: configurable-ard, 후속)
+
+위 감사의 "남은 작업 목록"에서 5개를 순서대로 처리해달라는 요청 — 각 단계 후 전체
+테스트, 마지막에 커밋(push는 안 함).
+
+## 1. ARD 잔차 결합 로직 통합
+
+`ard.py`에 `apply_ard_residual()`을 새로 뽑아내서, 학습 `VLAFlowMatching.forward()`와
+추론 `denoise_step()`에 똑같이 복붙돼 있던 "ARD head 출력을 `action_out_proj` 출력에
+더하는" 코드를 하나로 합쳤다(동작 변화 없음). 신규 테스트: 공유 함수 자체의 단위
+테스트, 같은 noise/time으로 두 경로의 `v_t`가 **bit-for-bit 동일**한지(실측 최대
+절대오차 0.0, 허용치 1e-4보다 훨씬 작음) 직접 비교하는 테스트, ARD를 끈 상태에서
+`sample_actions()`가 `action_out_proj`만 쓰는 수동 denoise 적분과 일치하는지 확인하는
+회귀 테스트.
+
+## 2. `n_action_steps`를 폐루프 러너에 실제로 연결
+
+`closed_loop.py`가 `config.n_action_steps`를 어디서도 참조하지 않아서, 매 iteration이
+`predict_action_chunk_with_decisions()`가 뽑은 청크 전체(또는
+`env.subtask_finished()`/`max_subtask_steps`가 멈출 때까지)를 실행하고 있었다 —
+RoCo 프리셋의 "n_action_steps마다 재계획" 주석이 무시되는 상태. iteration당 실행
+스텝 수를 `min(n_action_steps, max_subtask_steps 남은 예산)`으로 캡해서 문서화된
+간격대로 재계획하게 고쳤다(모듈 docstring도 이 관계를 설명하도록 재작성). 기존
+폐루프 테스트 17개는 전부 `n_action_steps == chunk_size`만 썼어서 무사히 통과했지만
+(이전의 "무제한 실행" 버그를 전혀 건드리지 않았다는 뜻), 실제로 그 경로를 타는
+신규 테스트를 추가했다.
+
+## 3. 오프라인 토크나이저 end-to-end 테스트
+
+`make_smolvla_pre_post_processors()`가 실제 토큰화까지 거치는 end-to-end 테스트가
+레포에 하나도 없었다(기존 유일한 테스트는 `AutoTokenizer.from_pretrained`를 더미
+`object()`로 몽키패치하고 파이프라인 스텝 타입만 검사). 네트워크 없는 실제 WordLevel
+토크나이저(`tokenizers` 라이브러리)를 만들어 `preprocessor(batch)`를 실제 task
+문자열로 끝까지 돌리는 테스트 2개 추가(일반 설정 1개 + RoCo 프리셋 1개).
+
+## 4. main이 configurable-ard의 조상인지 확인
+
+`git merge-base --is-ancestor main HEAD`는 `false`였다 — main의 tip이 GitHub UI 머지
+커밋이라 두 번째 부모(빈 최초 커밋)가 configurable-ard 쪽 계보에 없기 때문. 그런데
+`git merge-base main HEAD`는 그 머지 커밋의 **다른** 부모로 resolve되고, 그 부모는
+이미 HEAD의 조상이며 빈 커밋 쪽은 내용이 전혀 없다 — 즉 main의 내용은
+configurable-ard의 부분집합이지만, 그래프상의 기술적 이유로 `git merge --ff-only`는
+거부된다(실제 발산은 없음). 보고만 하고 브랜치는 건드리지 않음.
+
+## 5. RoCo 평가용 정책 실행 인터페이스
+
+`scripts/policy_interface.py`(`RoCoPolicyAdapter`, `replay_episode`) +
+`docs/policy_interface.md` 신규. `policy.select_action()`을 그대로 감싸는 순수
+파이썬 어댑터(state_select/정규화/n_action_steps 큐/역정규화/LAC을 이미 구현하고
+있어서 재구현하지 않음) + uint8→float 이미지 변환만 새로 함. `reset()`은
+`policy.reset()`에 위임. 오프라인 리플레이 하네스가 LeRobot 포맷 프레임으로 정답
+액션과의 차원별 L1을 계산한다. 공식 RoCo 환경 API는 이 세션에서 끝까지 미확인 —
+모든 가정을 `policy_interface.md`의 "미확인 항목" 표에 모았다(사실로 단정하지 않음).
+
+## 테스트
+
+`pytest tests/`(**247개 전부 통과** — 기존 236 + 이번 5건 신규 11개). push 안 함.
+
+---
+
+# n_action_steps 재계획 후 LAC 상태 유지 검증 (branch: configurable-ard, 후속)
+
+위 2번 항목(n_action_steps를 폐루프 러너에 연결)이 LAC(Latent-Aware Controller)
+상태를 의도치 않게 매 iteration 리셋하는 회귀를 만들지 않았는지 확인해달라는
+요청. 리셋은 에피소드 시작/서브태스크 전환/재시도에서만 일어나야 한다.
+
+`closed_loop.py` 코드를 직접 읽어서 확인: `_reset_lac()` 호출 지점은 정확히 4곳 —
+에피소드 시작(루프 진입 전), RECOVER, ADVANCE(서브태스크 전환), RETRY — 뿐이고,
+"같은 서브태스크의 다음 청크로 계속" 경로(판정도 `settle()`도 없이 지나가는 분기)에는
+리셋 호출이 전혀 없다. 2번 항목이 바꾼 건 `step_cap`(iteration당 실행 스텝 수)뿐이고
+리셋 로직은 손대지 않았으며, `predict_action_chunk_with_decisions()` 자체도
+`policy._lac`를 전혀 건드리지 않는다(LAC 필터링은 `_execute_chunk` 안의
+`apply_lac_step()`에서만 일어남) — **코드 수정 불필요**라는 결론.
+
+이를 tiny 합성 백본으로 실증하는 테스트
+(`test_closed_loop_lac_state_persists_across_iterations_within_same_subtask`,
+`tests/test_lac_closed_loop.py`)를 추가했다: `n_action_steps=1`로 강제해 서브태스크
+하나 안에서 매 iteration마다 새로 forward하게 만들고, LAC의 `first_step`(상태 없으면
+`q̃=q`, 필터링 없이 그대로 통과) 성질을 "리셋 여부"의 직접적인 증거로 썼다 —
+서브태스크 안의 2/3번째 스텝은 raw q와 달라야(이전 상태와 블렌딩됨) 하고, 서브태스크
+전환 직후 첫 스텝은 다시 raw q와 정확히 같아야 한다. 둘 다 확인됐고, 연속으로
+스텝한 독립 참조 `LatentAwareController`와도 수치까지 정확히 일치했다.
+`log["lac_resets"]`도 `[(-1, "episode"), (3, "subtask")]`로 예상과 정확히 일치.
+
+`pytest tests/`(**248개 전부 통과** — 기존 247 + 신규 1). 커밋 후 사용자 지시로
+origin에 push됨(`045cfd0..ffda081`).
+
+## 다음에 할 일
+
+- Colab에서 `--smoke` 1회 실행(이전 라운드부터 이어지는 미해결 항목, 이번 세션에서도
+  로컬/GPU가 없어 실행하지 못함) — 특히 `video_backend`/`schema_check` 단계부터
+  확인. 돌릴 셀 순서는 채팅 세션에만 있고 아직 레포에 파일로 저장하지 않았음.
