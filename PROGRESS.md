@@ -1629,3 +1629,65 @@ origin에 push됨(`045cfd0..ffda081`).
 - Colab에서 `--smoke` 1회 실행(이전 라운드부터 이어지는 미해결 항목, 이번 세션에서도
   로컬/GPU가 없어 실행하지 못함) — 특히 `video_backend`/`schema_check` 단계부터
   확인. 돌릴 셀 순서는 채팅 세션에만 있고 아직 레포에 파일로 저장하지 않았음.
+
+---
+
+# 지연/메모리 벤치마크 + 정밀 구간 오프라인 지표 (branch: configurable-ard, 후속)
+
+`scripts/`/`scripts/colab/*`의 기존 스타일을 따라 두 스크립트를 새로 추가해달라는 요청
+— 기존 코드는 최소 수정(실제로 건드린 기존 파일은 없음, 전부 신규 파일).
+
+## 1. `scripts/benchmark_latency.py`
+
+RoCo 프리셋 기준 배치 1 `select_action()` 지연(ms, warmup 제외 중앙값/p95)/피크 GPU
+메모리/파라미터 수를 측정하고, denoise 스텝 수(`policy.config.num_steps`, 기본
+`[1,2,5,10]`)를 바꿔가며 지연 곡선을 뽑아 JSON 하나로 저장한다. 새로 구현하지 않고
+이번 세션 앞서 만든 `policy_interface.RoCoPolicyAdapter`를 그대로 재사용했다(ponytail)
+— "청크당 지연"은 매 측정 전에 `adapter.reset()`으로 액션 큐를 비워서 매번 강제로
+새 forward가 일어나게 만드는 방식으로 쟀다(큐 pop 지연이 아니라 청크 생성 지연 자체).
+`--checkpoint-path`(`SmolVLAPolicy.from_pretrained()`) 또는 `--random-init`(preset
+override + `load_vlm_weights=False`, `count_params.py`와 동일한 전제) 중 하나를 받는다.
+
+## 2. `scripts/eval_precision.py`
+
+검증 에피소드에서 "접촉 직전 구간"을 자동으로 잘라 정밀도를 따로 본다. 구간 분리
+기준은 그리퍼 값이 가장 크게 바뀌는 프레임 중심(`gripper_change`, 기본값) 또는 끝점
+높이 최저 프레임 중심(`min_height`) 둘 중 선택(코드에 기본값 명시). 접촉 팔은
+그리퍼 총 변화량이 더 큰 쪽을 자동 선택(`--contact-arm auto`, 기본). L1 계산 자체는
+다시 만들지 않고 이번 세션의 `policy_interface.replay_episode()` +
+`scripts/colab/eval_offline.py`의 `ACTION_DIM_GROUPS`(left/right × pos/rot/gripper
+슬라이스)를 그대로 재사용 — 그 위에 구간 자동 분리 + mm 환산 + 팔별 분리 출력만
+얹었다. 위치 오차만 mm로 환산(`*1000`), 회전/그리퍼는 원 단위(rad/무차원) 그대로.
+
+## 검증됨 / 미검증 (README 스타일)
+
+**검증됨**(이 샌드박스에서 tiny 합성 백본 + CPU로 직접 실행 확인):
+- `benchmark_latency.build_policy()`가 `--random-init`으로 실제
+  `configs/presets/roco_board.yaml`을 그대로 적용하는지(chunk_size=20/n_action_steps=5/
+  ard_arm_dim=7/action_dim=14).
+- `count_params()`가 `freeze_vision_encoder=true`로 trainable < total이 되는 걸 반영.
+- `measure_latency_for_num_steps()`가 끝까지 돌고 median<=p95, CPU에서
+  `peak_gpu_mem_gb=None`, 스윕이 `policy.config.num_steps`를 실제로 바꿔놓는지.
+- `--checkpoint-path`: `save_pretrained()`로 저장한 체크포인트를 다시
+  `from_pretrained()`로 불러와도 같은 구조가 나오는지(왕복 테스트).
+- `eval_precision`의 구간 탐지 함수(`detect_gripper_change_frame`/
+  `detect_min_height_frame`/`select_contact_arm`/`select_contact_window`, 경계값
+  포함)와 `arm_errors()`의 mm 환산/팔별 분리가 손계산과 일치하는지.
+- `compute_precision_report()`가 tiny 합성 정책 + 합성 프레임으로 끝까지 돌아 JSON
+  직렬화까지 되는지(두 window_criterion 모두).
+- `pytest tests/`(**261개 전부 통과** — 기존 248 + 신규 13: benchmark_latency 6 +
+  eval_precision 7). push 안 함.
+
+**미검증**(이 샌드박스에 GPU/Hugging Face Hub 접근이 둘 다 없어 실행 못함):
+- 실제 GPU에서의 지연/피크 메모리 수치 자체(로직만 검증, 숫자의 타당성은 미확인).
+- `--random-init`의 실제 `vlm_model_name`(`HuggingFaceTB/SmolVLM2-500M-Video-Instruct`)
+  구조를 Hub에서 실제로 받아오는 경로.
+- `eval_precision.load_episode_frames()`의 실제 `LeRobotDataset` 로딩 — 특히
+  이미지 텐서가 정말 CHW float [0,1]이라는 `_tensor_to_hwc_uint8`의 전제.
+- `--window-frames`/`gripper_change` 기본값이 실제 RoCo 접촉 이벤트 폭에 맞는
+  크기인지(합성 데이터로는 로직만 확인, 실제 과제 스케일은 미확인).
+
+## 다음에 할 일
+
+- 둘 다 실제 체크포인트/실제 RoCo 데이터셋으로 한 번 돌려서 숫자가 말이 되는지
+  확인(Hub/GPU 접근이 되는 환경에서).
